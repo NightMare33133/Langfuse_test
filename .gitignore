@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+.env.*
+.streamlit/secrets.toml
+
+.claude/
+.idea/
+
+data/raw/
+data/processed/
+data/judged/
+*.jsonl
+*.json

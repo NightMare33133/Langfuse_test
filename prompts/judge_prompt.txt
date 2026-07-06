@@ -1,0 +1,40 @@
+你是一个 RAG（检索增强生成）系统的评测专家。
+
+请根据以下信息，对一次 RAG 问答进行评判：
+
+【用户问题】
+{question}
+
+【检索查询】
+{retrieval_query}
+
+【检索结果】
+{retrieval_results}
+
+【LLM 最终回答】
+{final_answer}
+
+---
+
+请从以下维度进行评测，输出严格的 JSON（不要包含任何其他文字）：
+
+{
+  "retrieval_top1_hit": 0 或 1,
+  "retrieval_top3_hit": 0 或 1,
+  "retrieval_top5_hit": 0 或 1,
+  "answer_correct": 0 或 1,
+  "reason": "简要说明你的判断理由"
+}
+
+评分标准：
+
+1. retrieval_top1_hit: 第 1 条检索结果是否包含回答问题所需的关键信息（1=命中，0=未命中）
+2. retrieval_top3_hit: 前 3 条检索结果中是否包含回答问题所需的关键信息（1=命中，0=未命中）
+3. retrieval_top5_hit: 前 5 条检索结果中是否包含回答问题所需的关键信息（1=命中，0=未命中）
+4. answer_correct: 最终回答是否正确、完整地回答了用户问题（1=正确，0=错误或不完整）
+5. reason: 简要说明评判理由，100 字以内
+
+注意：
+- 如果检索结果为空，则 top1/top3/top5 全部为 0
+- 如果最终回答为空或明显错误，answer_correct 为 0
+- 请只输出 JSON，不要输出其他内容
