@@ -52,7 +52,7 @@ def parse_judge_response(text):
     return json.loads(match.group(0))
 
 
-def call_llm(prompt, api_key, base_url, model, timeout=60):
+def call_llm(prompt, api_key, base_url, model, timeout=30):
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -63,10 +63,28 @@ def call_llm(prompt, api_key, base_url, model, timeout=60):
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"请求超时 ({timeout}s): {url}")
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(f"连接失败: {url}\n{e}")
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {resp.status_code} | URL: {url}\nResponse: {resp.text[:1000]}"
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"JSON 解析失败 | Response: {resp.text[:1000]}")
+
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"响应结构异常 | Response: {json.dumps(data, ensure_ascii=False)[:1000]}")
 
 
 def judge_sample(sample, api_key, base_url, model, prompt_template=None):
@@ -76,7 +94,9 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None):
 
     try:
         prompt = build_judge_prompt(sample, prompt_template)
+        result["_prompt"] = prompt
         response_text = call_llm(prompt, api_key, base_url, model)
+        result["_raw_response"] = response_text
         scores = parse_judge_response(response_text)
         result.update(scores)
     except Exception as e:
