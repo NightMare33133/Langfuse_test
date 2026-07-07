@@ -2,13 +2,17 @@ import streamlit as st
 from pathlib import Path
 import json
 import io
+import os
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
 from judge import judge_all, compute_metrics, call_llm
+
+load_dotenv(Path(__file__).parent / ".env")
 
 RAW_DIR = Path(__file__).parent / "data" / "raw"
 PROCESSED_DIR = Path(__file__).parent / "data" / "processed"
@@ -162,6 +166,32 @@ if uploaded is not None:
     st.sidebar.success(f"已保存: {uploaded.name}")
     st.rerun()
 
+# API fetch section
+st.sidebar.divider()
+st.sidebar.subheader("从 Langfuse API 拉取")
+langfuse_host = st.sidebar.text_input("Langfuse 地址", value=os.getenv("LANGFUSE_HOST", "http://localhost:3000"))
+langfuse_pk = st.sidebar.text_input("Public Key", value=os.getenv("LANGFUSE_PUBLIC_KEY", ""))
+langfuse_sk = st.sidebar.text_input("Secret Key", value=os.getenv("LANGFUSE_SECRET_KEY", ""), type="password")
+fetch_limit = st.sidebar.number_input("每页 trace 数", min_value=1, max_value=500, value=50)
+
+if st.sidebar.button("拉取 Traces"):
+    if not langfuse_pk or not langfuse_sk:
+        st.sidebar.error("请填写 Langfuse Public Key 和 Secret Key")
+    else:
+        from fetch_traces import fetch_all
+        output_path = RAW_DIR / "langfuse_api_export.jsonl"
+        with st.spinner(f"正在从 {langfuse_host} 拉取 Traces..."):
+            try:
+                count = 0
+                with output_path.open("w", encoding="utf-8") as f:
+                    for row in fetch_all(langfuse_host, langfuse_pk, langfuse_sk, limit=fetch_limit):
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        count += 1
+                st.sidebar.success(f"拉取完成！共 {count} 行，已保存为 langfuse_api_export.jsonl")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"拉取失败: {e}")
+
 raw_files = sorted(RAW_DIR.glob("*.jsonl"))
 if not raw_files:
     st.sidebar.warning("data/raw 目录下没有找到 .jsonl 文件，请上传")
@@ -202,9 +232,13 @@ if "samples" not in st.session_state:
 st.sidebar.divider()
 st.sidebar.header("Judge 评测")
 
-judge_api_key = st.sidebar.text_input("API Key", type="password")
-judge_base_url = st.sidebar.text_input("Base URL", value="https://token-plan-cn.xiaomimimo.com/v1")
-judge_model = st.sidebar.text_input("Model", value="mimo-v2.5-pro")
+judge_api_key = st.sidebar.text_input("API Key", type="password", value=os.getenv("JUDGE_API_KEY", ""))
+judge_base_url = st.sidebar.text_input("Base URL", value=os.getenv("JUDGE_API_BASE", "https://token-plan-cn.xiaomimimo.com/v1"))
+judge_model = st.sidebar.text_input("Model", value=os.getenv("JUDGE_MODEL", "mimo-v2.5-pro"))
+judge_timeout = st.sidebar.number_input(
+    "请求超时时间（秒）", min_value=10, max_value=180, value=60, step=10,
+    help="单次 LLM 请求的最大等待时间，建议 60 秒以上"
+)
 
 # Test connection
 if st.sidebar.button("测试 Judge 连接"):
@@ -231,6 +265,17 @@ else:
     total_available = len(st.session_state.get("samples") or [])
     max_samples = st.sidebar.number_input("最多评测样本数", min_value=1, max_value=max(total_available, 1), value=min(10, total_available))
 show_debug = st.sidebar.checkbox("显示 Judge Prompt 和原始响应")
+
+# Skip existing & retry options
+st.sidebar.divider()
+st.sidebar.markdown("**评测策略**")
+skip_existing = st.sidebar.checkbox(
+    "跳过已有成功结果",
+    value=True,
+    help="如果 data/judged/eval_results.jsonl 里已有某条 trace_id 的成功结果，重新运行时跳过它，避免重复消耗 token"
+)
+retry_failed = st.sidebar.button("只重试失败样本")
+force_rerun = st.sidebar.checkbox("强制重新评测（忽略已有结果）", value=False)
 
 # --- Main content ---
 samples = st.session_state.get("samples")
@@ -319,97 +364,179 @@ with tab_samples:
 
 # ========== Tab: 评测结果 ==========
 with tab_judge:
-    # Run judge if button pressed
+    # ---------- 已有结果加载 & 索引 ----------
+    existing_results_map = {}  # trace_id -> result dict
+    if JUDGED_FILE.exists():
+        with JUDGED_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                    tid = r.get("trace_id")
+                    if tid:
+                        existing_results_map[tid] = r
+                except json.JSONDecodeError:
+                    pass
+
+    def _load_existing_for_session():
+        if "judge_results" not in st.session_state and existing_results_map:
+            st.session_state["judge_results"] = list(existing_results_map.values())
+
+    def _compute_samples_to_judge(all_samples, limit, skip, force):
+        """根据策略筛选需要评测的样本列表。返回 (samples_to_judge, skipped_count)"""
+        candidates = all_samples[:limit]
+        if force or not skip:
+            return candidates, 0
+        need_judge = []
+        for s in candidates:
+            tid = s.get("trace_id")
+            existing = existing_results_map.get(tid)
+            if existing and "error" not in existing:
+                continue  # 已有成功结果，跳过
+            need_judge.append(s)
+        return need_judge, len(candidates) - len(need_judge)
+
+    def _merge_and_save(new_results):
+        """按 trace_id 合并：新结果覆盖旧结果，未重跑的成功结果保留。"""
+        merged = dict(existing_results_map)
+        for r in new_results:
+            tid = r.get("trace_id")
+            if tid:
+                merged[tid] = {
+                    k: v for k, v in r.items()
+                    if k not in ("_prompt", "_raw_response")
+                }
+        JUDGED_DIR.mkdir(parents=True, exist_ok=True)
+        with JUDGED_FILE.open("w", encoding="utf-8") as f:
+            for r in merged.values():
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        st.session_state["judge_results"] = list(merged.values())
+        return merged
+
+    def _run_judge_ui(samples_to_judge, label="Judge 评测"):
+        """通用的评测执行 + 进度 UI。返回新结果列表。"""
+        if not samples_to_judge:
+            st.info("没有需要评测的样本（全部已有成功结果）")
+            return []
+
+        st.info(f"💡 本次将评测 **{len(samples_to_judge)}** 条样本，预计消耗 **{len(samples_to_judge)}** 次 LLM 请求。")
+
+        with st.status(f"正在运行 {label}...", expanded=True) as eval_status:
+            progress_bar = st.progress(0, text="准备开始评测...")
+            status_text = st.empty()
+            question_text = st.empty()
+            live_result_area = st.container()
+            status_text.write("⏳ 状态：准备开始")
+
+            def on_progress(done, total, result):
+                progress_bar.progress(
+                    done / total,
+                    text=f"评测进度: {done}/{total}",
+                )
+                question_text.caption(
+                    f"当前问题: {(result.get('question') or '')[:80]}"
+                )
+                if "error" in result:
+                    status_text.error(
+                        f"⏳ 状态：正在评测第 {done}/{total} 条 — 出错: "
+                        f"{result['error'][:120]}"
+                    )
+                else:
+                    status_text.success(
+                        f"⏳ 状态：正在评测第 {done}/{total} 条 — 完成"
+                    )
+
+            new_results = []
+            for result in judge_all(
+                samples_to_judge, judge_api_key, judge_base_url,
+                judge_model, on_progress, timeout=judge_timeout,
+            ):
+                new_results.append(result)
+                with live_result_area:
+                    _r = result
+                    if "error" in _r:
+                        st.warning(
+                            f"❌ [{len(new_results)}] {(_r.get('question') or '')[:40]} — "
+                            f"{_r['error'][:100]}"
+                        )
+                    else:
+                        t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
+                        t3 = "✓" if _r.get("retrieval_top3_hit") else "✗"
+                        ans = "✓" if _r.get("answer_correct") else "✗"
+                        st.write(
+                            f"✅ [{len(new_results)}] {(_r.get('question') or '')[:40]} — "
+                            f"Top1:{t1} Top3:{t3} Answer:{ans}"
+                        )
+                if show_debug:
+                    with st.expander(
+                        f"调试 - 第 {len(new_results)} 条: "
+                        f"{(result.get('question') or '')[:40]}"
+                    ):
+                        st.markdown("**Judge Prompt**")
+                        st.code(result.get("_prompt", "(未记录)"), language=None)
+                        st.markdown("**原始响应**")
+                        st.code(
+                            result.get("_raw_response", "(未记录)"), language=None
+                        )
+                        if "error" in result:
+                            st.error(result["error"])
+
+        return new_results
+
+    # ---------- 按钮 1: 运行 Judge 评测 ----------
     if run_judge:
         if not judge_api_key:
             st.error("请在左侧输入 API Key")
         elif not judge_model:
             st.error("请在左侧输入 Model 名称")
         else:
-            judge_samples = samples[:max_samples]
-            st.session_state["judge_results"] = []
+            if force_rerun:
+                _load_existing_for_session()
+                samples_to_judge = samples[:max_samples]
+                skipped = 0
+            else:
+                samples_to_judge, skipped = _compute_samples_to_judge(
+                    samples, max_samples, skip_existing, force_rerun
+                )
+            if skipped > 0:
+                st.info(f"⏭️ 跳过 {skipped} 条已有成功结果的样本（可在侧边栏取消「跳过已有成功结果」或勾选「强制重新评测」）")
 
-            with st.status("正在运行 Judge 评测...", expanded=True) as eval_status:
-                progress_bar = st.progress(0, text="准备开始评测...")
-                status_text = st.empty()
-                question_text = st.empty()
-                live_result_area = st.container()
-                status_text.write("⏳ 状态：准备开始")
-
-                def on_progress(done, total, result):
-                    progress_bar.progress(
-                        done / total,
-                        text=f"评测进度: {done}/{total}",
-                    )
-                    question_text.caption(
-                        f"当前问题: {(result.get('question') or '')[:80]}"
-                    )
-                    if "error" in result:
-                        status_text.error(
-                            f"⏳ 状态：正在评测第 {done}/{total} 条 — 出错: "
-                            f"{result['error'][:120]}"
-                        )
-                    else:
-                        status_text.success(
-                            f"⏳ 状态：正在评测第 {done}/{total} 条 — 完成"
-                        )
-
-                results = []
-                for result in judge_all(
-                    judge_samples, judge_api_key, judge_base_url,
-                    judge_model, on_progress,
-                ):
-                    results.append(result)
-                    # 实时刷新当前结果预览
-                    with live_result_area:
-                        _r = result
-                        if "error" in _r:
-                            st.warning(
-                                f"❌ [{len(results)}] {(_r.get('question') or '')[:40]} — "
-                                f"{_r['error'][:100]}"
-                            )
-                        else:
-                            t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
-                            t3 = "✓" if _r.get("retrieval_top3_hit") else "✗"
-                            ans = "✓" if _r.get("answer_correct") else "✗"
-                            st.write(
-                                f"✅ [{len(results)}] {(_r.get('question') or '')[:40]} — "
-                                f"Top1:{t1} Top3:{t3} Answer:{ans}"
-                            )
-                    if show_debug:
-                        with st.expander(
-                            f"调试 - 第 {len(results)} 条: "
-                            f"{(result.get('question') or '')[:40]}"
-                        ):
-                            st.markdown("**Judge Prompt**")
-                            st.code(result.get("_prompt", "(未记录)"), language=None)
-                            st.markdown("**原始响应**")
-                            st.code(
-                                result.get("_raw_response", "(未记录)"), language=None
-                            )
-                            if "error" in result:
-                                st.error(result["error"])
-
-            st.session_state["judge_results"] = results
-
-            # Save to disk (strip debug fields before saving)
-            JUDGED_DIR.mkdir(parents=True, exist_ok=True)
-            with JUDGED_FILE.open("w", encoding="utf-8") as f:
-                for r in results:
-                    save_r = {
-                        k: v for k, v in r.items()
-                        if k not in ("_prompt", "_raw_response")
-                    }
-                    f.write(json.dumps(save_r, ensure_ascii=False) + "\n")
-
+            new_results = _run_judge_ui(samples_to_judge)
+            _merge_and_save(new_results)
             st.success(f"评测完成，结果已保存到 {JUDGED_FILE.name}")
 
+    # ---------- 按钮 2: 只重试失败样本 ----------
+    if retry_failed:
+        if not judge_api_key:
+            st.error("请在左侧输入 API Key")
+        elif not judge_model:
+            st.error("请在左侧输入 Model 名称")
+        elif not existing_results_map:
+            st.warning("没有找到已有评测结果，请先运行一次 Judge 评测")
+        else:
+            # 从已有结果中找 error 样本
+            failed_trace_ids = {
+                tid for tid, r in existing_results_map.items() if "error" in r
+            }
+            if not failed_trace_ids:
+                st.success("没有失败的样本，所有评测均已成功！")
+            else:
+                # 从原始 samples 中找回对应的 sample
+                failed_samples = [
+                    s for s in samples if s.get("trace_id") in failed_trace_ids
+                ]
+                st.info(
+                    f"🔄 找到 {len(failed_samples)} 条失败样本，"
+                    f"预计消耗 **{len(failed_samples)}** 次 LLM 请求。"
+                )
+                new_results = _run_judge_ui(failed_samples, label="失败样本重试")
+                if new_results:
+                    _merge_and_save(new_results)
+                    st.success(f"重试完成！结果已合并保存到 {JUDGED_FILE.name}")
+
     # Load existing judge results if not in session
-    if "judge_results" not in st.session_state and JUDGED_FILE.exists():
-        with JUDGED_FILE.open("r", encoding="utf-8") as f:
-            st.session_state["judge_results"] = [
-                json.loads(line) for line in f if line.strip()
-            ]
+    _load_existing_for_session()
 
     judge_results = st.session_state.get("judge_results") or []
 

@@ -87,7 +87,7 @@ def call_llm(prompt, api_key, base_url, model, timeout=30):
         raise RuntimeError(f"响应结构异常 | Response: {json.dumps(data, ensure_ascii=False)[:1000]}")
 
 
-def judge_sample(sample, api_key, base_url, model, prompt_template=None):
+def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout=60):
     """Judge a single sample. Returns a dict with scores or error info."""
     trace_id = sample.get("trace_id", "unknown")
     result = {"trace_id": trace_id, "question": sample.get("question") or ""}
@@ -95,7 +95,7 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None):
     try:
         prompt = build_judge_prompt(sample, prompt_template)
         result["_prompt"] = prompt
-        response_text = call_llm(prompt, api_key, base_url, model)
+        response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
         result["_raw_response"] = response_text
         scores = parse_judge_response(response_text)
         result.update(scores)
@@ -105,11 +105,11 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None):
     return result
 
 
-def judge_all(samples, api_key, base_url, model, progress_callback=None):
+def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout=60):
     """Judge all samples sequentially. Yields results one by one."""
     template = load_prompt_template()
     for i, sample in enumerate(samples):
-        result = judge_sample(sample, api_key, base_url, model, template)
+        result = judge_sample(sample, api_key, base_url, model, template, timeout=timeout)
         if progress_callback:
             progress_callback(i + 1, len(samples), result)
         yield result
