@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
-from judge import judge_all, compute_metrics, call_llm
+from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -179,7 +179,10 @@ if st.sidebar.button("拉取 Traces"):
         st.sidebar.error("请填写 Langfuse Public Key 和 Secret Key")
     else:
         from fetch_traces import fetch_all
-        output_path = RAW_DIR / "langfuse_api_export.jsonl"
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"langfuse_api_export_{ts}.jsonl"
+        output_path = RAW_DIR / filename
         with st.spinner(f"正在从 {langfuse_host} 拉取 Traces..."):
             try:
                 count = 0
@@ -187,7 +190,7 @@ if st.sidebar.button("拉取 Traces"):
                     for row in fetch_all(langfuse_host, langfuse_pk, langfuse_sk, limit=fetch_limit):
                         f.write(json.dumps(row, ensure_ascii=False) + "\n")
                         count += 1
-                st.sidebar.success(f"拉取完成！共 {count} 行，已保存为 langfuse_api_export.jsonl")
+                st.sidebar.success(f"拉取完成！共 {count} 行，已保存为 {filename}")
                 st.rerun()
             except Exception as e:
                 st.sidebar.error(f"拉取失败: {e}")
@@ -232,6 +235,7 @@ if "samples" not in st.session_state:
 st.sidebar.divider()
 st.sidebar.header("Judge 评测")
 
+# 1. API 配置
 judge_api_key = st.sidebar.text_input("API Key", type="password", value=os.getenv("JUDGE_API_KEY", ""))
 judge_base_url = st.sidebar.text_input("Base URL", value=os.getenv("JUDGE_API_BASE", "https://token-plan-cn.xiaomimimo.com/v1"))
 judge_model = st.sidebar.text_input("Model", value=os.getenv("JUDGE_MODEL", "mimo-v2.5-pro"))
@@ -240,7 +244,6 @@ judge_timeout = st.sidebar.number_input(
     help="单次 LLM 请求的最大等待时间，建议 60 秒以上"
 )
 
-# Test connection
 if st.sidebar.button("测试 Judge 连接"):
     if not judge_api_key:
         st.sidebar.error("请先输入 API Key")
@@ -254,28 +257,39 @@ if st.sidebar.button("测试 Judge 连接"):
                 status.update(label="连接失败", state="error")
                 st.sidebar.error(str(e))
 
-run_judge = st.sidebar.button("运行 Judge 评测")
+# 2. 选择评测范围
+st.sidebar.divider()
+st.sidebar.subheader("评测范围")
 
-# Debug options
-st.sidebar.markdown("**调试选项**")
-debug_limit = st.sidebar.checkbox("只评测前 1 条样本", value=True)
+total_available = len(st.session_state.get("samples") or [])
+debug_limit = st.sidebar.checkbox("只评前 1 条（快速测试）", value=True)
 if debug_limit:
     max_samples = 1
 else:
-    total_available = len(st.session_state.get("samples") or [])
-    max_samples = st.sidebar.number_input("最多评测样本数", min_value=1, max_value=max(total_available, 1), value=min(10, total_available))
-show_debug = st.sidebar.checkbox("显示 Judge Prompt 和原始响应")
+    max_samples = st.sidebar.number_input(
+        "评测样本数", min_value=1, max_value=max(total_available, 1),
+        value=min(10, total_available),
+        help="从样本列表中取前 N 条进行评测"
+    )
 
-# Skip existing & retry options
-st.sidebar.divider()
-st.sidebar.markdown("**评测策略**")
 skip_existing = st.sidebar.checkbox(
     "跳过已有成功结果",
     value=True,
-    help="如果 data/judged/eval_results.jsonl 里已有某条 trace_id 的成功结果，重新运行时跳过它，避免重复消耗 token"
+    help="已有评测结果的样本不会重复调用 LLM"
 )
-retry_failed = st.sidebar.button("只重试失败样本")
-force_rerun = st.sidebar.checkbox("强制重新评测（忽略已有结果）", value=False)
+
+# 3. 预览 & 运行
+st.sidebar.divider()
+st.sidebar.subheader("执行评测")
+
+preview_optimization = st.sidebar.button("预览优化策略", use_container_width=True, help="先看看有多少样本需要调 LLM，不会消耗 token")
+run_judge = st.sidebar.button("运行 Judge 评测", type="primary", use_container_width=True)
+
+# 4. 高级选项（折叠）
+with st.sidebar.expander("高级选项"):
+    show_debug = st.sidebar.checkbox("显示 Judge Prompt 和原始响应")
+    force_rerun = st.sidebar.checkbox("强制重新评测（忽略所有缓存）", value=False)
+    retry_failed = st.sidebar.button("只重试失败样本")
 
 # --- Main content ---
 samples = st.session_state.get("samples")
@@ -290,6 +304,10 @@ tab_samples, tab_judge = st.tabs(["样本列表", "评测结果"])
 
 # ========== Tab: 样本列表 ==========
 with tab_samples:
+    input_file = summary.get("input_file") or selected_name
+    output_file = summary.get("output_file") or ""
+    st.caption(f"数据来源: `{Path(input_file).name}`" + (f" → 解析结果: `{Path(output_file).name}`" if output_file else ""))
+
     # Stats
     trace_count = summary.get("trace_count") or len(samples)
     bad_line_count = summary.get("bad_line_count") or 0
@@ -364,6 +382,8 @@ with tab_samples:
 
 # ========== Tab: 评测结果 ==========
 with tab_judge:
+    st.caption(f"评测结果文件: `{JUDGED_FILE.name}`")
+
     # ---------- 已有结果加载 & 索引 ----------
     existing_results_map = {}  # trace_id -> result dict
     if JUDGED_FILE.exists():
@@ -399,20 +419,31 @@ with tab_judge:
 
     def _merge_and_save(new_results):
         """按 trace_id 合并：新结果覆盖旧结果，未重跑的成功结果保留。"""
+        from datetime import datetime
         merged = dict(existing_results_map)
         for r in new_results:
             tid = r.get("trace_id")
             if tid:
                 merged[tid] = {
                     k: v for k, v in r.items()
-                    if k not in ("_prompt", "_raw_response")
+                    if k not in ("_prompt", "_raw_response", "_prescreened", "_content_cached")
                 }
         JUDGED_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 保存当前工作文件（页面读取用）
         with JUDGED_FILE.open("w", encoding="utf-8") as f:
             for r in merged.values():
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        # 保存带时间戳的历史快照
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        history_file = JUDGED_DIR / f"eval_results_{ts}.jsonl"
+        with history_file.open("w", encoding="utf-8") as f:
+            for r in merged.values():
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
         st.session_state["judge_results"] = list(merged.values())
-        return merged
+        return merged, history_file.name
 
     def _run_judge_ui(samples_to_judge, label="Judge 评测"):
         """通用的评测执行 + 进度 UI。返回新结果列表。"""
@@ -420,7 +451,7 @@ with tab_judge:
             st.info("没有需要评测的样本（全部已有成功结果）")
             return []
 
-        st.info(f"💡 本次将评测 **{len(samples_to_judge)}** 条样本，预计消耗 **{len(samples_to_judge)}** 次 LLM 请求。")
+        st.info(f"💡 本次共 **{len(samples_to_judge)}** 条样本，经规则预筛选和内容去重后，实际 LLM 请求数可能更少。")
 
         with st.status(f"正在运行 {label}...", expanded=True) as eval_status:
             progress_bar = st.progress(0, text="准备开始评测...")
@@ -448,17 +479,27 @@ with tab_judge:
                     )
 
             new_results = []
+            llm_call_count = 0
             for result in judge_all(
                 samples_to_judge, judge_api_key, judge_base_url,
                 judge_model, on_progress, timeout=judge_timeout,
             ):
                 new_results.append(result)
+                is_prescreened = result.get("_prescreened", False)
+                is_cached = result.get("_content_cached", False)
+                if not is_prescreened and not is_cached:
+                    llm_call_count += 1
                 with live_result_area:
                     _r = result
+                    tag = ""
+                    if is_prescreened:
+                        tag = " [规则判定]"
+                    elif is_cached:
+                        tag = " [内容复用]"
                     if "error" in _r:
                         st.warning(
                             f"❌ [{len(new_results)}] {(_r.get('question') or '')[:40]} — "
-                            f"{_r['error'][:100]}"
+                            f"{_r['error'][:100]}{tag}"
                         )
                     else:
                         t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
@@ -466,7 +507,7 @@ with tab_judge:
                         ans = "✓" if _r.get("answer_correct") else "✗"
                         st.write(
                             f"✅ [{len(new_results)}] {(_r.get('question') or '')[:40]} — "
-                            f"Top1:{t1} Top3:{t3} Answer:{ans}"
+                            f"Top1:{t1} Top3:{t3} Answer:{ans}{tag}"
                         )
                 if show_debug:
                     with st.expander(
@@ -482,7 +523,108 @@ with tab_judge:
                         if "error" in result:
                             st.error(result["error"])
 
+        prescreened_count = sum(1 for r in new_results if r.get("_prescreened"))
+        cached_count = sum(1 for r in new_results if r.get("_content_cached"))
+        if prescreened_count or cached_count:
+            eval_status.update(label=f"{label}完成 — "
+                f"共 {len(new_results)} 条, "
+                f"LLM 调用 {llm_call_count} 次, "
+                f"规则判定 {prescreened_count} 条, "
+                f"内容复用 {cached_count} 条")
+
         return new_results
+
+    # ---------- 预览优化策略 ----------
+    if preview_optimization:
+        candidates = samples[:max_samples]
+
+        prescreen_results = []   # (sample, prescreen_result)
+        need_llm = []
+        content_seen = {}        # hash -> sample
+        trace_skipped = 0
+        content_dup_count = 0
+
+        for s in candidates:
+            tid = s.get("trace_id")
+            existing = existing_results_map.get(tid)
+            if existing and "error" not in existing and skip_existing and not force_rerun:
+                trace_skipped += 1
+                continue
+
+            ps = pre_screen(s)
+            if ps is not None:
+                prescreen_results.append((s, ps))
+                continue
+
+            ch = compute_content_hash(s)
+            if ch in content_seen:
+                content_dup_count += 1
+                continue
+            content_seen[ch] = s
+            need_llm.append(s)
+
+        total = len(candidates)
+        skipped_total = total - len(need_llm)
+
+        # ===== 核心结论 =====
+        st.subheader(f"按下「运行 Judge 评测」后，实际需要调用 LLM **{len(need_llm)}** 次")
+        st.caption(f"（共 {total} 条候选样本，可节省 {skipped_total} 次请求）")
+
+        # ===== 跳过明细 =====
+        if skipped_total > 0:
+            st.markdown("#### 以下样本会被跳过，不消耗 token：")
+            if trace_skipped > 0:
+                st.markdown(f"**{trace_skipped} 条 — 已有成功评测结果**（trace_id 命中缓存）")
+                skipped_samples = [s for s in candidates
+                                   if existing_results_map.get(s.get("trace_id"))
+                                   and "error" not in existing_results_map.get(s.get("trace_id"), {})
+                                   and skip_existing and not force_rerun]
+                for s in skipped_samples[:5]:
+                    q = (s.get("question") or "(无问题)")[:60]
+                    st.caption(f"  - `{q}`")
+                if trace_skipped > 5:
+                    st.caption(f"  - ...还有 {trace_skipped - 5} 条")
+
+            if prescreen_results:
+                st.markdown(f"**{len(prescreen_results)} 条 — 规则直接判定**（无检索结果/无回答，结果确定，不需要 LLM）")
+                for s, ps in prescreen_results[:5]:
+                    q = (s.get("question") or "(无问题)")[:60]
+                    st.caption(f"  - `{q}` → {ps.get('reason', '')}")
+                if len(prescreen_results) > 5:
+                    st.caption(f"  - ...还有 {len(prescreen_results) - 5} 条")
+
+            if content_dup_count > 0:
+                st.markdown(f"**{content_dup_count} 条 — 内容重复**（question + 回答 完全相同，复用首次评测结果）")
+
+        # ===== 需要 LLM 的样本 =====
+        if need_llm:
+            st.markdown(f"#### 以下 {len(need_llm)} 条样本需要调用 LLM：")
+            for s in need_llm[:5]:
+                q = (s.get("question") or "(无问题)")[:60]
+                retrieval_count = len(s.get("retrieval_results", []))
+                answer_preview = (s.get("final_answer") or "(无)")[:40]
+                st.caption(f"  - `{q}` | 检索 {retrieval_count} 条 | 回答: {answer_preview}")
+            if len(need_llm) > 5:
+                st.caption(f"  - ...还有 {len(need_llm) - 5} 条")
+
+            # prompt 裁剪预览
+            st.markdown("#### Prompt 裁剪效果")
+            sample_preview = need_llm[0]
+            template = load_prompt_template()
+            full_prompt = build_judge_prompt(sample_preview, template, max_content_chars=999999)
+            trimmed_prompt = build_judge_prompt(sample_preview, template, max_content_chars=300)
+            save_chars = len(full_prompt) - len(trimmed_prompt)
+            pct = save_chars / len(full_prompt) * 100 if len(full_prompt) > 0 else 0
+            st.caption(
+                f"每条 prompt 从 {len(full_prompt)} 字符裁剪到 {len(trimmed_prompt)} 字符"
+                f"（省 {pct:.0f}%），主要裁剪检索结果正文"
+            )
+            with st.expander("查看裁剪后的 prompt 示例"):
+                st.code(trimmed_prompt, language=None)
+        else:
+            st.success("所有样本都已被跳过或规则判定，不需要调用 LLM！")
+
+        st.divider()
 
     # ---------- 按钮 1: 运行 Judge 评测 ----------
     if run_judge:
@@ -503,8 +645,8 @@ with tab_judge:
                 st.info(f"⏭️ 跳过 {skipped} 条已有成功结果的样本（可在侧边栏取消「跳过已有成功结果」或勾选「强制重新评测」）")
 
             new_results = _run_judge_ui(samples_to_judge)
-            _merge_and_save(new_results)
-            st.success(f"评测完成，结果已保存到 {JUDGED_FILE.name}")
+            _, history_name = _merge_and_save(new_results)
+            st.success(f"评测完成！结果已保存到 {JUDGED_FILE.name}，历史快照: {history_name}")
 
     # ---------- 按钮 2: 只重试失败样本 ----------
     if retry_failed:
@@ -532,8 +674,8 @@ with tab_judge:
                 )
                 new_results = _run_judge_ui(failed_samples, label="失败样本重试")
                 if new_results:
-                    _merge_and_save(new_results)
-                    st.success(f"重试完成！结果已合并保存到 {JUDGED_FILE.name}")
+                    _, history_name = _merge_and_save(new_results)
+                    st.success(f"重试完成！结果已合并保存到 {JUDGED_FILE.name}，历史快照: {history_name}")
 
     # Load existing judge results if not in session
     _load_existing_for_session()

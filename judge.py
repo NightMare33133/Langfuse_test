@@ -4,11 +4,26 @@ Judge LLM module - evaluates RAG samples using an LLM judge.
 Uses OpenAI-compatible chat completions API via requests.
 """
 
+import hashlib
 import json
 import re
 from pathlib import Path
 
 import requests
+
+
+def compute_content_hash(sample):
+    """基于 question + retrieval_query + final_answer 生成内容指纹。
+
+    同内容不同 trace 的样本会得到相同 hash，用于去重和缓存复用。
+    """
+    parts = [
+        (sample.get("question") or "").strip(),
+        (sample.get("retrieval_query") or "").strip(),
+        (sample.get("final_answer") or "").strip(),
+    ]
+    raw = "\n".join(parts)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "judge_prompt.txt"
 
@@ -17,7 +32,7 @@ def load_prompt_template():
     return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
 
 
-def build_judge_prompt(sample, template=None):
+def build_judge_prompt(sample, template=None, max_content_chars=300):
     if template is None:
         template = load_prompt_template()
 
@@ -31,6 +46,9 @@ def build_judge_prompt(sample, template=None):
             pos = r.get("position")
             prefix = f"[位置{pos}]" if pos is not None else ""
             score_str = f" (score: {score})" if score is not None else ""
+            # 裁剪过长的正文
+            if len(content) > max_content_chars:
+                content = content[:max_content_chars] + "..."
             lines.append(f"{prefix}{title}{score_str}: {content}")
         retrieval_text = "\n".join(lines)
     else:
@@ -106,13 +124,97 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
 
 
 def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout=60):
-    """Judge all samples sequentially. Yields results one by one."""
+    """Judge all samples sequentially. Yields results one by one.
+
+    内置规则预筛选和内容级去重：
+    - 预筛选：无检索结果/无回答的样本直接出结果，不调 LLM
+    - 去重：相同 question+retrieval_query+final_answer 的样本只评一次
+    """
     template = load_prompt_template()
+    content_cache = {}  # content_hash -> result dict (without trace_id/question)
+    total = len(samples)
+
     for i, sample in enumerate(samples):
+        # 规则预筛选
+        prescreened = pre_screen(sample)
+        if prescreened is not None:
+            result = {
+                "trace_id": sample.get("trace_id", "unknown"),
+                "question": sample.get("question") or "",
+                "_prescreened": True,
+                **prescreened,
+            }
+            if progress_callback:
+                progress_callback(i + 1, total, result)
+            yield result
+            continue
+
+        # 内容级去重
+        ch = compute_content_hash(sample)
+        if ch in content_cache:
+            cached = content_cache[ch]
+            result = {
+                "trace_id": sample.get("trace_id", "unknown"),
+                "question": sample.get("question") or "",
+                "_content_cached": True,
+                **cached,
+            }
+            if progress_callback:
+                progress_callback(i + 1, total, result)
+            yield result
+            continue
+
+        # 实际调用 LLM
         result = judge_sample(sample, api_key, base_url, model, template, timeout=timeout)
+        # 缓存成功结果（不含 trace_id/question，因为这些是样本特定的）
+        if "error" not in result:
+            content_cache[ch] = {
+                k: v for k, v in result.items()
+                if k not in ("trace_id", "question", "_prompt", "_raw_response")
+            }
         if progress_callback:
-            progress_callback(i + 1, len(samples), result)
+            progress_callback(i + 1, total, result)
         yield result
+
+
+def pre_screen(sample):
+    """规则预筛选：对结果确定的样本直接返回评分，不需要调用 LLM。
+
+    返回 None 表示无法用规则判定，需要走 LLM。
+    返回 dict 表示已有确定结果，可直接使用。
+    """
+    question = (sample.get("question") or "").strip()
+    final_answer = (sample.get("final_answer") or "").strip()
+    retrieval_results = sample.get("retrieval_results") or []
+
+    # 无问题 → 无法评测
+    if not question:
+        return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                "retrieval_top5_hit": 0, "answer_correct": 0,
+                "reason": "规则判定：无用户问题"}
+
+    # 无检索结果 → top 全 0
+    no_retrieval = len(retrieval_results) == 0
+
+    # 无最终回答 → answer 错误
+    no_answer = not final_answer
+
+    if no_retrieval and no_answer:
+        return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                "retrieval_top5_hit": 0, "answer_correct": 0,
+                "reason": "规则判定：无检索结果且无最终回答"}
+
+    if no_retrieval:
+        # 有回答但无检索，top 全 0，answer 需要 LLM 判断
+        return None
+
+    if no_answer:
+        # 有检索但无回答
+        return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                "retrieval_top5_hit": 0, "answer_correct": 0,
+                "reason": "规则判定：无最终回答"}
+
+    return None
 
 
 def compute_metrics(results):

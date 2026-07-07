@@ -1,12 +1,24 @@
 """
 Langfuse JSONL export parser - reusable functions for parsing Langfuse traces.
 
-Extracted from main.py to enable reuse by Streamlit app and other consumers.
+Supports both of the Langfuse export shapes currently seen in this project:
+1. Events export: one observation per line, `input`/`output` often stored as JSON strings.
+2. API export: one trace root plus child observations, `input`/`output` already parsed.
 """
 
 import json
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+_TIMESTAMP_FORMATS = (
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+)
 
 
 def safe_json_loads(value):
@@ -25,6 +37,95 @@ def safe_json_loads(value):
         return value
 
 
+
+def normalize_timestamp(value):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo == timezone.utc:
+            return dt.isoformat().replace("+00:00", "Z")
+        return dt.isoformat()
+    except ValueError:
+        pass
+
+    for fmt in _TIMESTAMP_FORMATS:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if text.endswith("Z"):
+                dt = dt.replace(tzinfo=timezone.utc)
+                return dt.isoformat().replace("+00:00", "Z")
+            return dt.isoformat()
+        except ValueError:
+            continue
+
+    return text
+
+
+
+def normalize_observation_row(row):
+    """Normalize a raw observation row to a consistent internal format.
+
+    - Parses `input`/`output`/`metadata` from JSON strings to Python objects.
+    - Normalizes timestamp strings to ISO-8601 format.
+    - Maps TRACE type to SPAN (preserving original in `rawType`).
+    - Backfills `sessionId`/`userId`/`traceName` from metadata when missing.
+
+    Returns a new dict; the original `row` is not modified.
+    """
+    parsed_input = safe_json_loads(row.get("input"))
+    parsed_output = safe_json_loads(row.get("output"))
+    parsed_metadata = safe_json_loads(row.get("metadata")) or {}
+
+    normalized = dict(row)
+    raw_type = row.get("type")
+
+    normalized["input"] = parsed_input
+    normalized["output"] = parsed_output
+    normalized["metadata"] = parsed_metadata
+    normalized["startTime"] = normalize_timestamp(row.get("startTime"))
+    normalized["endTime"] = normalize_timestamp(row.get("endTime"))
+    normalized["completionStartTime"] = normalize_timestamp(
+        row.get("completionStartTime")
+    )
+    normalized["rawType"] = raw_type
+    normalized["isTraceRoot"] = raw_type == "TRACE"
+
+    # API export includes a TRACE root record. We normalize it to SPAN so that
+    # downstream code (observation_sort_key, build_trace_sample) treats it like
+    # any other observation.  The original type is preserved in `rawType` and
+    # flagged via `isTraceRoot` for callers that need to distinguish it.
+    if raw_type == "TRACE":
+        normalized["type"] = "SPAN"
+
+    if not normalized.get("traceName"):
+        normalized["traceName"] = row.get("name")
+
+    if not normalized.get("sessionId"):
+        normalized["sessionId"] = (
+            parsed_metadata.get("conversation_id")
+            or parsed_metadata.get("session_id")
+            or parsed_metadata.get("sessionId")
+        )
+
+    if not normalized.get("userId"):
+        normalized["userId"] = parsed_metadata.get("user_id") or parsed_metadata.get(
+            "userId"
+        )
+        if not normalized.get("userId") and isinstance(parsed_input, dict):
+            normalized["userId"] = parsed_input.get("sys.user_id")
+
+    return normalized
+
+
+
 def simplify_retrieval_item(item):
     metadata = item.get("metadata", {}) or {}
     return {
@@ -39,12 +140,16 @@ def simplify_retrieval_item(item):
     }
 
 
+
 def observation_sort_key(obs):
+    root_priority = 0 if obs.get("isTraceRoot") else 1
     return (
         obs.get("startTime") or "",
+        root_priority,
         obs.get("name") or "",
         obs.get("id") or "",
     )
+
 
 
 def build_trace_sample(trace_id, observations):
@@ -69,9 +174,9 @@ def build_trace_sample(trace_id, observations):
     }
 
     for obs in observations:
-        parsed_input = safe_json_loads(obs.get("input"))
-        parsed_output = safe_json_loads(obs.get("output"))
-        parsed_metadata = safe_json_loads(obs.get("metadata")) or {}
+        parsed_input = obs.get("input")
+        parsed_output = obs.get("output")
+        parsed_metadata = obs.get("metadata") or {}
 
         name = obs.get("name")
         node_type = parsed_metadata.get("node_type")
@@ -83,11 +188,15 @@ def build_trace_sample(trace_id, observations):
         sample["workflow_run_id"] = sample["workflow_run_id"] or parsed_metadata.get(
             "workflow_run_id"
         )
+        if not sample["workflow_run_id"] and isinstance(parsed_input, dict):
+            sample["workflow_run_id"] = parsed_input.get("sys.workflow_run_id")
 
         sample["observations"].append(
             {
                 "id": obs.get("id"),
                 "type": obs_type,
+                "raw_type": obs.get("rawType"),
+                "is_trace_root": obs.get("isTraceRoot", False),
                 "name": name,
                 "node_type": node_type,
                 "start_time": obs.get("startTime"),
@@ -102,14 +211,25 @@ def build_trace_sample(trace_id, observations):
             if question and not sample["question"]:
                 sample["question"] = question
 
-        if name == "message" and sample["root_input"] is None and parsed_input:
-            sample["root_input"] = parsed_input
-        if name == "message" and sample["root_output"] is None and parsed_output:
-            sample["root_output"] = parsed_output
+        is_root_candidate = (
+            obs.get("isTraceRoot")
+            or name == "message"
+            or (
+                obs_type == "SPAN"
+                and sample["root_input"] is None
+                and isinstance(parsed_output, dict)
+                and "answer" in parsed_output
+            )
+        )
+        if is_root_candidate:
+            if sample["root_input"] is None and parsed_input is not None:
+                sample["root_input"] = parsed_input
+            if sample["root_output"] is None and parsed_output is not None:
+                sample["root_output"] = parsed_output
             if isinstance(parsed_output, dict) and parsed_output.get("answer"):
-                sample["final_answer"] = parsed_output["answer"]
+                sample["final_answer"] = sample["final_answer"] or parsed_output["answer"]
 
-        if node_type == "knowledge-retrieval" or "知识" in (name or ""):
+        if node_type == "knowledge-retrieval" or "??" in (name or ""):
             if isinstance(parsed_input, dict):
                 sample["retrieval_query"] = parsed_input.get("query") or sample[
                     "retrieval_query"
@@ -123,25 +243,30 @@ def build_trace_sample(trace_id, observations):
                         if isinstance(item, dict)
                     ]
 
-        if obs_type == "GENERATION" or node_type == "llm" or name == "LLM":
-            sample["llm_model"] = obs.get("providedModelName") or sample["llm_model"]
+        if obs.get("rawType") == "GENERATION" or node_type == "llm" or name == "LLM":
+            sample["llm_model"] = (
+                obs.get("providedModelName")
+                or parsed_metadata.get("model")
+                or sample["llm_model"]
+            )
             sample["llm_input"] = parsed_input
             sample["llm_output"] = parsed_output
             if isinstance(parsed_output, dict) and parsed_output.get("text"):
                 sample["final_answer"] = sample["final_answer"] or parsed_output["text"]
 
-        if node_type == "answer" or "回复" in (name or ""):
+        if node_type == "answer" or "??" in (name or ""):
             if isinstance(parsed_output, dict) and parsed_output.get("answer"):
                 sample["final_answer"] = parsed_output["answer"]
 
     return sample
 
 
+
 def load_jsonl(path):
     traces = defaultdict(list)
     bad_lines = []
 
-    with path.open("r", encoding="utf-8") as f:
+    with Path(path).open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -155,21 +280,14 @@ def load_jsonl(path):
             if not trace_id:
                 bad_lines.append({"line": idx, "error": "missing traceId"})
                 continue
-            traces[trace_id].append(row)
+            traces[trace_id].append(normalize_observation_row(row))
 
     return traces, bad_lines
 
 
+
 def parse_langfuse_jsonl(input_path):
-    """Parse a Langfuse JSONL export file and return samples + summary.
-
-    Args:
-        input_path: Path to the Langfuse export JSONL file.
-
-    Returns:
-        Tuple of (samples, summary) where samples is a list of trace dicts
-        and summary contains parsing statistics.
-    """
+    """Parse a Langfuse JSONL export file and return samples + summary."""
     input_path = Path(input_path)
     traces, bad_lines = load_jsonl(input_path)
     samples = [build_trace_sample(trace_id, obs) for trace_id, obs in traces.items()]
@@ -188,6 +306,7 @@ def parse_langfuse_jsonl(input_path):
     return samples, summary
 
 
+
 def write_jsonl(path, rows):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,15 +315,9 @@ def write_jsonl(path, rows):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def save_results(samples, summary, output_path, summary_path):
-    """Save parsed samples and summary to disk.
 
-    Args:
-        samples: List of trace sample dicts.
-        summary: Summary dict with parsing statistics.
-        output_path: Path for the samples JSONL output.
-        summary_path: Path for the summary JSON output.
-    """
+def save_results(samples, summary, output_path, summary_path):
+    """Save parsed samples and summary to disk."""
     write_jsonl(output_path, samples)
 
     summary_path = Path(summary_path)
