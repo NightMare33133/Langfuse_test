@@ -13,6 +13,7 @@ __pycache__/
 data/raw/
 data/processed/
 data/judged/
+data/questions/
 *.jsonl
 *.json
 
