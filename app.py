@@ -21,6 +21,7 @@ PROCESSED_DIR = Path(__file__).parent / "data" / "processed"
 JUDGED_DIR = Path(__file__).parent / "data" / "judged"
 JUDGED_FILE = JUDGED_DIR / "eval_results.jsonl"
 BATCH_DIR = Path(__file__).parent / "data" / "batch"
+QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
 
 
 # ---------- 评测结果可视化 / 导出辅助函数 ----------
@@ -437,7 +438,24 @@ with tab_qgen:
                 mime="text/csv",
             )
 
-        st.caption("生成的题目保存在 `data/questions/` 目录下，可作为批量提问 Dify 的输入来源。")
+        with st.expander("输出说明", expanded=False):
+            st.markdown("""
+**自动保存位置**：`data/questions/questions_<时间戳>.jsonl`
+
+每行一道题，JSONL 格式，字段如下：
+
+| 字段 | 说明 |
+|------|------|
+| `question` | 题目文本 |
+| `reference_answer` | 参考答案 |
+| `source_excerpt` | 来源摘录（原文片段） |
+| `difficulty` | 难度：基础 / 理解 / 综合 |
+| `topic` | 题目主题 |
+
+生成完成后也可点击上方按钮下载 JSONL 或 CSV 副本。
+这些题目可直接用于「批量提问」tab → 选择「使用已生成的题目」。
+""")
+
 
 # ========== Tab: 批量提问 ==========
 with tab_batch:
@@ -448,10 +466,35 @@ with tab_batch:
     with st.expander("问题来源", expanded=True):
         q_source = st.radio(
             "选择问题来源",
-            ["使用已生成的题目", "手动输入问题", "从文件加载"],
+            ["使用已生成的题目", "手动输入问题", "从文件加载", "从历史记录加载"],
             horizontal=True,
             key="batch_q_source",
         )
+
+        with st.expander("输入文件格式说明", expanded=False):
+            st.markdown("**推荐格式：JSONL**（与题目生成结果直接兼容）")
+            st.markdown("""
+| 格式 | 解析规则 | 示例 |
+|------|---------|------|
+| **JSONL** | 逐行读取，每行一个 JSON 对象；优先取 `question`，其次取 `query` | `{"question": "什么是AISP?"}` |
+| **TXT** | 每行一个问题，空行自动忽略 | `什么是AISP?` |
+| **CSV** | 自动检测表头（识别 `question` / `query` / `问题` 列）；无表头则读第一列 | 见下方示例 |
+
+**CSV 示例（有表头）**：
+```
+question,reference_answer
+什么是AISP?,AISP是账户信息服务提供商
+PISP和AISP的区别?,PISP发起支付，AISP仅查看
+```
+
+**CSV 示例（无表头，直接每行一个问题）**：
+```
+什么是AISP?
+PISP和AISP的区别?
+```
+
+> 如果只是临时测试几个问题，TXT 最方便；如果需要批量管理题目和参考答案，建议用 JSONL。
+""")
 
         questions_list = []
 
@@ -519,6 +562,42 @@ with tab_batch:
                 else:
                     questions_list = [line.strip() for line in content.strip().split("\n") if line.strip()]
                 st.success(f"从文件加载了 {len(questions_list)} 个问题")
+
+        elif q_source == "从历史记录加载":
+            # Scan data/questions/ and data/batch/ for JSONL files
+            history_files = []
+            for d in [QUESTIONS_DIR, BATCH_DIR]:
+                if d.exists():
+                    for f in sorted(d.glob("*.jsonl"), reverse=True):
+                        history_files.append(f)
+
+            if not history_files:
+                st.warning("暂无历史记录，请先在「题目生成」或「批量提问」中生成/保存过结果")
+            else:
+                file_labels = [f"{f.parent.name}/{f.name}" for f in history_files]
+                selected_idx = st.selectbox(
+                    "选择历史文件",
+                    range(len(file_labels)),
+                    format_func=lambda i: file_labels[i],
+                    key="batch_history_file",
+                )
+                selected_file = history_files[selected_idx]
+                try:
+                    raw_lines = selected_file.read_text(encoding="utf-8").strip().split("\n")
+                    for line in raw_lines:
+                        try:
+                            obj = json.loads(line)
+                            q = obj.get("question") or obj.get("query") or ""
+                            if q.strip():
+                                questions_list.append(q.strip())
+                        except json.JSONDecodeError:
+                            continue
+                    st.success(f"从 {selected_file.name} 加载了 {len(questions_list)} 个问题")
+                    with st.expander("预览题目", expanded=False):
+                        for i, q in enumerate(questions_list, 1):
+                            st.write(f"{i}. {q}")
+                except Exception as e:
+                    st.error(f"读取文件失败: {e}")
 
     # --- Dify API config ---
     with st.expander("Dify API 配置", expanded=False):
@@ -643,6 +722,17 @@ with tab_batch:
         # --- Export & Push ---
         st.divider()
         st.subheader("导出与推送")
+
+        with st.expander("输出文件说明", expanded=False):
+            st.markdown("""
+| 操作 | 保存位置 | 用途 |
+|------|---------|------|
+| 自动保存完整结果 | `data/batch/batch_results_<时间戳>.jsonl` | 包含每条问题的原始响应、成功/失败状态，用于排查 |
+| 下载 JSONL / CSV | 本地下载 | 离线备份或分享 |
+| 推送到样本列表 | `data/raw/batch_qa_<时间戳>.jsonl` | 仅含成功结果，格式兼容后续「样本解析」和「Judge 评测」 |
+
+> 推送后请切换到「样本列表」tab，选择该文件并点击「解析」即可进入后续评测流程。
+""")
 
         exp_col1, exp_col2, exp_col3 = st.columns(3)
 
