@@ -219,7 +219,25 @@ with tab_qgen:
                 ["自动", "极速", "标准", "深度"],
                 index=0,
                 key="qgen_strategy",
-                help="极速：1次调用，适合快速预览\n标准：3-5次调用，平衡速度和覆盖\n深度：多次调用，覆盖更完整\n自动：根据文档自动选择",
+            )
+            st.caption("四种策略的区别在于文档切分粒度和 LLM 调用次数")
+
+        with st.expander("策略说明", expanded=False):
+            st.markdown("""
+| 模式 | 切分方式 | LLM 调用次数 | 适合场景 |
+|------|---------|-------------|---------|
+| **极速** | 单 chunk：取前 3 个 markdown section，或截取前 6000 字 | 1 次 | 快速预览、短文档 |
+| **标准** | chunk_document(max_chars=6000, max_chunks=5) | 3~5 次 | 日常使用，平衡速度与覆盖 |
+| **深度** | chunk_document(max_chars=3000, max_chunks=20) | 最多 20 次 | 正式评测，覆盖完整 |
+| **自动** | 根据文档字符数和 section 数自动选择上述三种 | 取决于文档 | 不确定时选这个 |
+""")
+            st.markdown("**自动模式的选择规则：**")
+            st.code(
+                "字符数 < 3,000 → 极速\n"
+                "3,000 ≤ 字符数 < 15,000 且 section ≤ 3 → 极速\n"
+                "3,000 ≤ 字符数 < 15,000 且 section > 3 → 标准\n"
+                "15,000 ≤ 字符数 ≤ 50,000 → 标准\n"
+                "字符数 > 50,000 → 深度"
             )
 
         with st.expander("API 配置", expanded=False):
@@ -281,6 +299,35 @@ with tab_qgen:
 
         if char_count > 8000:
             st.info(f"文件较长（{char_count:,} 字），建议使用「标准」或「深度」策略以确保内容覆盖完整。")
+
+        # --- Auto-mode analysis (show when strategy is auto) ---
+        if qgen_strategy == "自动":
+            from question_generator import _split_markdown_sections
+            sections = _split_markdown_sections(file_content)
+            is_plain = len(sections) == 1 and sections[0][0] == "(前言)"
+            section_count = 0 if is_plain else len(sections)
+            predicted = choose_strategy(file_content)
+
+            # Determine reasoning
+            if char_count < 3000:
+                reason = f"字符数 {char_count:,} < 3,000，文档很短，1 次调用即可覆盖"
+            elif char_count < 15000:
+                if section_count <= 3:
+                    reason = f"字符数 {char_count:,}，识别到 {section_count} 个 section（≤3），结构简单，选极速"
+                else:
+                    reason = f"字符数 {char_count:,}，识别到 {section_count} 个 section（>3），有结构，选标准以适度覆盖"
+            elif char_count <= 50000:
+                reason = f"字符数 {char_count:,}，中等长度文档，选标准平衡速度和覆盖"
+            else:
+                reason = f"字符数 {char_count:,} > 50,000，长文档需要完整覆盖，选深度"
+
+            with st.container(border=True):
+                st.markdown(f"**自动模式分析** → 将使用「{STRATEGY_LABELS[predicted]}」策略")
+                acol1, acol2, acol3 = st.columns(3)
+                acol1.metric("字符数", f"{char_count:,}")
+                acol2.metric("Section 数", f"{section_count}" if not is_plain else "无（纯文本）")
+                acol3.metric("判定结果", STRATEGY_LABELS[predicted])
+                st.caption(f"判断依据：{reason}")
 
         # --- Generate button ---
         if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
@@ -443,6 +490,32 @@ with tab_batch:
                                 questions_list.append(q.strip())
                         except json.JSONDecodeError:
                             continue
+                elif q_file.name.endswith(".csv"):
+                    import csv as csv_mod
+                    import io
+                    reader = csv_mod.reader(io.StringIO(content))
+                    header = None
+                    for row in reader:
+                        if not row:
+                            continue
+                        # 检测表头行：如果首行不含常见列名，当作数据行
+                        if header is None and any(
+                            h.lower() in ("question", "query", "问题", "questions")
+                            for h in row
+                        ):
+                            header = [h.lower().strip() for h in row]
+                            continue
+                        # 优先从 question/query 列取值，否则取第一列
+                        if header:
+                            q = ""
+                            for i, h in enumerate(header):
+                                if h in ("question", "query", "问题") and i < len(row):
+                                    q = row[i]
+                                    break
+                        else:
+                            q = row[0] if row else ""
+                        if q.strip():
+                            questions_list.append(q.strip())
                 else:
                     questions_list = [line.strip() for line in content.strip().split("\n") if line.strip()]
                 st.success(f"从文件加载了 {len(questions_list)} 个问题")

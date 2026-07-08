@@ -541,8 +541,6 @@ def _generate_fast(content, num_questions, difficulty, topic_hint,
         section_title = "文档前部"
 
     chunk = _make_chunk(section_title, text, 0)
-    if progress_callback:
-        progress_callback(0, 1, section_title)
 
     return _generate_from_chunks(
         [chunk], num_questions, difficulty, topic_hint,
