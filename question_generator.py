@@ -400,45 +400,54 @@ def deduplicate_questions(questions):
     return unique
 
 
-# ========== Main Entry Point ==========
+# ========== Strategy Selection ==========
 
-def generate_questions(content, api_key, base_url, model,
-                       num_questions=5, difficulty="混合",
-                       topic_hint="", timeout=120,
-                       progress_callback=None):
-    """Generate questions from content using LLM with smart chunking.
+def choose_strategy(content):
+    """根据文档特征自动选择生成策略。
 
-    Args:
-        content: Full document text
-        api_key, base_url, model: LLM API config
-        num_questions: Total number of questions to generate
-        difficulty: Difficulty preference
-        topic_hint: Optional topic direction
-        timeout: LLM request timeout in seconds
-        progress_callback: Optional callback(chunk_index, total_chunks, chunk_title)
+    规则（可读、非黑箱）：
+      - 字符数 < 3000 → fast（文档很短，一次调用足够）
+      - 3000 ≤ 字符数 < 15000 且 markdown section 数 ≤ 3 → fast（结构简单）
+      - 3000 ≤ 字符数 < 15000 且 markdown section 数 > 3 → balanced（有结构，适度覆盖）
+      - 15000 ≤ 字符数 ≤ 50000 → balanced（中等长度，平衡速度和覆盖）
+      - 字符数 > 50000 → deep（长文档需要完整覆盖）
 
     Returns:
-        List of question dicts (deduplicated).
+        "fast" | "balanced" | "deep"
     """
-    # Step 1: Chunk the document
-    chunks = chunk_document(content)
+    char_count = len(content)
+    sections = _split_markdown_sections(content)
+    is_plain = len(sections) == 1 and sections[0][0] == "(前言)"
+    section_count = 0 if is_plain else len(sections)
 
+    if char_count < 3000:
+        return "fast"
+    if char_count < 15000:
+        return "fast" if section_count <= 3 else "balanced"
+    if char_count <= 50000:
+        return "balanced"
+    return "deep"
+
+
+# ========== Per-Chunk Generation Helper (shared by all strategies) ==========
+
+def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
+                          api_key, base_url, model, timeout, progress_callback):
+    """对已切分的 chunks 执行 allocate → per-chunk LLM call → dedup → 多样性裁剪。
+
+    所有策略共用此函数，仅 chunks 的来源和参数不同。
+    """
     if not chunks:
         raise ValueError("文档内容为空，无法生成题目")
 
-    # Step 2: Allocate questions per chunk
     allocation = allocate_questions(chunks, num_questions)
 
-    # Step 3: Build chunk context string (list of all section titles)
     all_titles = list(dict.fromkeys(c["section_title"] for c in chunks))
     chunk_context = "、".join(all_titles[:10])
     if len(all_titles) > 10:
         chunk_context += f"等共{len(all_titles)}个章节"
 
-    # Step 4: Generate questions per chunk
     all_questions = []
-    template = load_qgen_prompt_template()
-
     for i, (chunk, n_questions) in enumerate(zip(chunks, allocation)):
         if n_questions <= 0:
             continue
@@ -458,25 +467,25 @@ def generate_questions(content, api_key, base_url, model,
         try:
             response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
             questions = parse_qgen_response(response_text)
-            # Tag each question with source section
             for q in questions:
                 q["source_section"] = chunk["section_title"]
                 q["chunk_index"] = chunk["chunk_index"]
             all_questions.extend(questions)
         except Exception as e:
-            # Log but continue with other chunks
             print(f"  ⚠️ 章节「{chunk['section_title']}」出题失败: {e}")
             continue
 
     if not all_questions:
         raise ValueError("所有章节均出题失败，请检查 API 配置或文档内容")
 
-    # Step 5: Deduplicate
+    return _deduplicate_and_trim(all_questions, num_questions)
+
+
+def _deduplicate_and_trim(all_questions, num_questions):
+    """去重 + 多样性裁剪，供所有策略共用。"""
     unique_questions = deduplicate_questions(all_questions)
 
-    # Step 6: Trim to requested count (keep diverse topics)
     if len(unique_questions) > num_questions:
-        # Round-robin from different sections to maximize diversity
         by_section = {}
         for q in unique_questions:
             sec = q.get("source_section", "")
@@ -492,17 +501,134 @@ def generate_questions(content, api_key, base_url, model,
             if by_section[sec]:
                 diversified.append(by_section[sec].pop(0))
             si += 1
-            # Safety: break if all empty
             if si > len(section_keys) * num_questions:
                 break
         unique_questions = diversified
 
-    # Remove internal tracking fields from output
     for q in unique_questions:
         q.pop("source_section", None)
         q.pop("chunk_index", None)
 
     return unique_questions
+
+
+# ========== Strategy Implementations ==========
+
+# Fast 模式：截取文档前部内容，1 次 LLM 调用
+_FAST_MAX_CHARS = 6000
+
+def _generate_fast(content, num_questions, difficulty, topic_hint,
+                   api_key, base_url, model, timeout, progress_callback):
+    """极速模式 — 只调用 1 次 LLM。
+
+    如果文档有 ≥3 个 markdown section，取前 3 个 section 合并；
+    否则截取前 _FAST_MAX_CHARS 字符。
+    """
+    sections = _split_markdown_sections(content)
+    is_plain = len(sections) == 1 and sections[0][0] == "(前言)"
+
+    if not is_plain and len(sections) >= 3:
+        # 取前 3 个 section，保留标题
+        parts = []
+        for title, body in sections[:3]:
+            body = body.strip()
+            if body:
+                parts.append(f"## {title}\n\n{body}")
+        text = "\n\n".join(parts)
+        section_title = "、".join(t for t, _ in sections[:3])
+    else:
+        text = content[:_FAST_MAX_CHARS]
+        section_title = "文档前部"
+
+    chunk = _make_chunk(section_title, text, 0)
+    if progress_callback:
+        progress_callback(0, 1, section_title)
+
+    return _generate_from_chunks(
+        [chunk], num_questions, difficulty, topic_hint,
+        api_key, base_url, model, timeout, progress_callback,
+    )
+
+
+# Balanced 模式：适度切分，3~5 次 LLM 调用
+_BALANCED_MAX_CHARS = 6000
+_BALANCED_MAX_CHUNKS = 5
+
+def _generate_balanced(content, num_questions, difficulty, topic_hint,
+                       api_key, base_url, model, timeout, progress_callback):
+    """标准模式 — 控制在 3~5 次 LLM 调用。
+
+    使用更大的 chunk 尺寸和更少的 chunk 上限，平衡速度和覆盖。
+    """
+    chunks = chunk_document(content, max_chars=_BALANCED_MAX_CHARS, max_chunks=_BALANCED_MAX_CHUNKS)
+    return _generate_from_chunks(
+        chunks, num_questions, difficulty, topic_hint,
+        api_key, base_url, model, timeout, progress_callback,
+    )
+
+
+# Deep 模式：完整切分，当前逻辑
+def _generate_deep(content, num_questions, difficulty, topic_hint,
+                   api_key, base_url, model, timeout, progress_callback):
+    """深度模式 — 完整切分，覆盖最全面。
+
+    使用默认 chunk_document 参数（max_chars=3000, max_chunks=20），
+    每个 chunk 单独调用 LLM，最后去重汇总。
+    """
+    chunks = chunk_document(content)
+    return _generate_from_chunks(
+        chunks, num_questions, difficulty, topic_hint,
+        api_key, base_url, model, timeout, progress_callback,
+    )
+
+
+# ========== Main Entry Point ==========
+
+_STRATEGY_MAP = {
+    "fast": _generate_fast,
+    "balanced": _generate_balanced,
+    "deep": _generate_deep,
+}
+
+STRATEGY_LABELS = {
+    "fast": "极速",
+    "balanced": "标准",
+    "deep": "深度",
+    "auto": "自动",
+}
+
+
+def generate_questions(content, api_key, base_url, model,
+                       num_questions=5, difficulty="混合",
+                       topic_hint="", timeout=120,
+                       progress_callback=None, strategy="auto"):
+    """Generate questions from content using LLM.
+
+    Args:
+        content: Full document text
+        api_key, base_url, model: LLM API config
+        num_questions: Total number of questions to generate
+        difficulty: Difficulty preference
+        topic_hint: Optional topic direction
+        timeout: LLM request timeout in seconds
+        progress_callback: Optional callback(chunk_index, total_chunks, chunk_title)
+        strategy: "auto" | "fast" | "balanced" | "deep"
+
+    Returns:
+        List of question dicts (deduplicated).
+    """
+    # 自动模式：根据文档特征选择策略
+    if strategy == "auto":
+        strategy = choose_strategy(content)
+
+    gen_fn = _STRATEGY_MAP.get(strategy)
+    if gen_fn is None:
+        raise ValueError(f"未知策略: {strategy}，可选: {list(_STRATEGY_MAP.keys())}")
+
+    return gen_fn(
+        content, num_questions, difficulty, topic_hint,
+        api_key, base_url, model, timeout, progress_callback,
+    )
 
 
 # ========== Save / Export ==========

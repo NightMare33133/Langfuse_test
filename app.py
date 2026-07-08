@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
 from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template
-from question_generator import generate_questions, save_questions, export_csv_bytes
+from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS
+from batch_query import run_batch_query, save_batch_results, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -19,6 +20,7 @@ RAW_DIR = Path(__file__).parent / "data" / "raw"
 PROCESSED_DIR = Path(__file__).parent / "data" / "processed"
 JUDGED_DIR = Path(__file__).parent / "data" / "judged"
 JUDGED_FILE = JUDGED_DIR / "eval_results.jsonl"
+BATCH_DIR = Path(__file__).parent / "data" / "batch"
 
 
 # ---------- 评测结果可视化 / 导出辅助函数 ----------
@@ -156,9 +158,26 @@ def build_markdown_report(results: list) -> str:
 st.set_page_config(page_title="Langfuse RAG 评测工具", layout="wide")
 st.title("Langfuse RAG 评测工具")
 
-# --- Minimal Sidebar ---
-st.sidebar.markdown("三步工作流：**题目生成** → **样本解析** → **Judge 评测**")
-st.sidebar.caption("切换上方 Tab 进入不同工作区")
+# --- Sidebar ---
+st.sidebar.markdown(
+    "基于 Langfuse 数据的 RAG 检索 + 回答质量自动评测工具。"
+    "支持从知识库文件自动生成测评题目、导入 Langfuse trace 解析为结构化样本、"
+    "并通过 LLM Judge 对检索命中率和回答正确性进行自动评分。"
+)
+st.sidebar.divider()
+st.sidebar.markdown("**四步工作流**")
+st.sidebar.markdown(
+    "1. **题目生成** — 上传知识库文件（.txt / .md），"
+    "自动按章节切分后调用 LLM 出题，支持难度和主题偏好设置\n"
+    "2. **批量提问** — 将生成的题目或手动输入的问题批量发送到 Dify Q&A 接口，"
+    "自动收集回答和检索结果\n"
+    "3. **样本解析** — 导入 Langfuse 导出的 JSONL 或直接从 Langfuse API 拉取 traces，"
+    "按 traceId 聚合为结构化样本\n"
+    "4. **Judge 评测** — 对样本进行自动评分（Top1/Top3/Top5 命中 + 回答正确性），"
+    "结果可视化并支持 CSV / Markdown 报告导出"
+)
+st.sidebar.divider()
+st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有独立配置面板。")
 
 # Load existing samples if available
 if "samples" not in st.session_state:
@@ -174,7 +193,7 @@ samples = st.session_state.get("samples")
 summary = st.session_state.get("summary") or {}
 
 # --- Tabs ---
-tab_qgen, tab_samples, tab_judge = st.tabs(["题目生成", "样本列表", "评测结果"])
+tab_qgen, tab_batch, tab_samples, tab_judge = st.tabs(["题目生成", "批量提问", "样本列表", "评测结果"])
 
 # ========== Tab: 题目生成 ==========
 with tab_qgen:
@@ -185,7 +204,7 @@ with tab_qgen:
     with st.expander("配置", expanded=True):
         qgen_uploaded = st.file_uploader("上传知识库文件", type=["txt", "md"], key="qgen_upload")
 
-        cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+        cfg_col1, cfg_col2, cfg_col3, cfg_col4 = st.columns(4)
         with cfg_col1:
             qgen_num = st.select_slider("生成题目数量", options=[5, 10, 15, 20], value=10, key="qgen_num")
         with cfg_col2:
@@ -194,6 +213,14 @@ with tab_qgen:
             )
         with cfg_col3:
             qgen_topic_hint = st.text_input("主题提示（可选）", placeholder="如：金融科技基础概念", key="qgen_topic")
+        with cfg_col4:
+            qgen_strategy = st.selectbox(
+                "生成策略",
+                ["自动", "极速", "标准", "深度"],
+                index=0,
+                key="qgen_strategy",
+                help="极速：1次调用，适合快速预览\n标准：3-5次调用，平衡速度和覆盖\n深度：多次调用，覆盖更完整\n自动：根据文档自动选择",
+            )
 
         with st.expander("API 配置", expanded=False):
             api_col1, api_col2, api_col3 = st.columns(3)
@@ -253,7 +280,7 @@ with tab_qgen:
                 st.text(file_content)
 
         if char_count > 8000:
-            st.info(f"文件较长（{char_count:,} 字），将自动按章节切分后分段出题，确保内容覆盖完整。")
+            st.info(f"文件较长（{char_count:,} 字），建议使用「标准」或「深度」策略以确保内容覆盖完整。")
 
         # --- Generate button ---
         if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
@@ -267,8 +294,17 @@ with tab_qgen:
                     "综合题": "综合",
                 }
                 difficulty_val = difficulty_map.get(qgen_difficulty, "混合")
+                strategy_map = {"自动": "auto", "极速": "fast", "标准": "balanced", "深度": "deep"}
+                strategy_val = strategy_map.get(qgen_strategy, "auto")
 
-                with st.status("正在生成题目...", expanded=True) as gen_status:
+                # 自动模式下先预测策略，显示给用户
+                if strategy_val == "auto":
+                    predicted = choose_strategy(file_content)
+                    strategy_label = f"自动 → {STRATEGY_LABELS[predicted]}"
+                else:
+                    strategy_label = STRATEGY_LABELS[strategy_val]
+
+                with st.status(f"正在生成题目（{strategy_label}模式）...", expanded=True) as gen_status:
                     status_text = st.empty()
                     status_text.write("正在切分文档...")
 
@@ -283,6 +319,7 @@ with tab_qgen:
                             num_questions=qgen_num, difficulty=difficulty_val,
                             topic_hint=qgen_topic_hint,
                             progress_callback=_on_progress,
+                            strategy=strategy_val,
                         )
                         st.session_state["generated_questions"] = questions
                         output_path, fname = save_questions(questions)
@@ -354,6 +391,224 @@ with tab_qgen:
             )
 
         st.caption("生成的题目保存在 `data/questions/` 目录下，可作为批量提问 Dify 的输入来源。")
+
+# ========== Tab: 批量提问 ==========
+with tab_batch:
+    st.subheader("批量提问")
+    st.caption("将题目批量发送到 Dify Q&A 接口，自动收集回答和检索结果")
+
+    # --- Question source ---
+    with st.expander("问题来源", expanded=True):
+        q_source = st.radio(
+            "选择问题来源",
+            ["使用已生成的题目", "手动输入问题", "从文件加载"],
+            horizontal=True,
+            key="batch_q_source",
+        )
+
+        questions_list = []
+
+        if q_source == "使用已生成的题目":
+            gen_qs = st.session_state.get("generated_questions")
+            if gen_qs:
+                questions_list = [q["question"] for q in gen_qs if q.get("question")]
+                st.success(f"已加载 {len(questions_list)} 道已生成的题目")
+                with st.expander("预览题目", expanded=False):
+                    for i, q in enumerate(questions_list, 1):
+                        st.write(f"{i}. {q}")
+            else:
+                st.warning("暂无已生成的题目，请先在「题目生成」tab 中生成题目，或选择其他来源")
+
+        elif q_source == "手动输入问题":
+            manual_input = st.text_area(
+                "输入问题（每行一个）",
+                height=200,
+                placeholder="问题1\n问题2\n问题3",
+                key="batch_manual_input",
+            )
+            if manual_input.strip():
+                questions_list = [line.strip() for line in manual_input.strip().split("\n") if line.strip()]
+                st.caption(f"已输入 {len(questions_list)} 个问题")
+
+        elif q_source == "从文件加载":
+            q_file = st.file_uploader("上传问题文件", type=["jsonl", "txt", "csv"], key="batch_q_file")
+            if q_file is not None:
+                content = q_file.getvalue().decode("utf-8")
+                if q_file.name.endswith(".jsonl"):
+                    for line in content.strip().split("\n"):
+                        try:
+                            obj = json.loads(line)
+                            q = obj.get("question") or obj.get("query") or ""
+                            if q.strip():
+                                questions_list.append(q.strip())
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    questions_list = [line.strip() for line in content.strip().split("\n") if line.strip()]
+                st.success(f"从文件加载了 {len(questions_list)} 个问题")
+
+    # --- Dify API config ---
+    with st.expander("Dify API 配置", expanded=False):
+        dify_col1, dify_col2 = st.columns(2)
+        with dify_col1:
+            dify_api_key = st.text_input(
+                "Dify API Key", type="password",
+                value=os.getenv("DIFY_API_KEY", ""),
+                key="batch_dify_key",
+            )
+        with dify_col2:
+            dify_base_url = st.text_input(
+                "Dify Base URL",
+                value=os.getenv("DIFY_API_BASE", "http://localhost/v1"),
+                key="batch_dify_url",
+            )
+        opt_col1, opt_col2 = st.columns(2)
+        with opt_col1:
+            dify_timeout = st.number_input(
+                "请求超时（秒）", min_value=10, max_value=300, value=60, key="batch_timeout"
+            )
+        with opt_col2:
+            dify_delay = st.number_input(
+                "请求间隔（秒）", min_value=0.0, max_value=10.0, value=1.0, step=0.5, key="batch_delay",
+                help="每次请求之间的等待时间，避免过快调用"
+            )
+
+    # --- Run batch query ---
+    st.divider()
+
+    if st.button("开始提问", type="primary", disabled=len(questions_list) == 0, key="batch_run"):
+        if not dify_api_key:
+            st.error("请填写 Dify API Key")
+        elif not questions_list:
+            st.error("没有可提问的问题")
+        else:
+            batch_results = []
+            progress_bar = st.progress(0, text="准备开始...")
+            status_container = st.container()
+
+            for idx, total, result in run_batch_query(
+                questions_list, dify_api_key, dify_base_url,
+                timeout=dify_timeout, delay=dify_delay,
+            ):
+                progress_bar.progress(
+                    (idx + 1) / total,
+                    text=f"正在提问第 {idx + 1} / {total} 条",
+                )
+                batch_results.append(result)
+
+                with status_container:
+                    if result["success"]:
+                        answer_preview = (result["sample"].get("final_answer", "") or "")[:80]
+                        st.success(f"✅ [{idx + 1}/{total}] {result['question'][:40]}... → {answer_preview}")
+                    else:
+                        st.error(f"❌ [{idx + 1}/{total}] {result['question'][:40]}... → {result['error'][:80]}")
+
+            progress_bar.progress(1.0, text="提问完成！")
+            st.session_state["batch_results"] = batch_results
+
+            # 自动保存结果
+            save_batch_results(batch_results)
+            st.success(f"批量提问完成！成功 {sum(1 for r in batch_results if r['success'])} / {total} 条")
+
+    # --- Results display ---
+    batch_results = st.session_state.get("batch_results")
+    if batch_results:
+        st.divider()
+        st.subheader("提问结果")
+
+        success_count = sum(1 for r in batch_results if r["success"])
+        fail_count = len(batch_results) - success_count
+        res_col1, res_col2, res_col3 = st.columns(3)
+        res_col1.metric("总问题数", len(batch_results))
+        res_col2.metric("成功", success_count)
+        res_col3.metric("失败", fail_count)
+
+        # Results table
+        table_data = []
+        for i, r in enumerate(batch_results):
+            if r["success"]:
+                sample = r.get("sample", {})
+                table_data.append({
+                    "序号": i + 1,
+                    "问题": r["question"],
+                    "回答": (sample.get("final_answer", "") or "")[:100],
+                    "检索结果数": len(sample.get("retrieval_results", [])),
+                    "状态": "✅ 成功",
+                })
+            else:
+                table_data.append({
+                    "序号": i + 1,
+                    "问题": r["question"],
+                    "回答": "",
+                    "检索结果数": 0,
+                    "状态": f"❌ {r.get('error', '未知错误')[:50]}",
+                })
+        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+        # Expandable detail for each result
+        for i, r in enumerate(batch_results):
+            if r["success"]:
+                sample = r.get("sample", {})
+                with st.expander(f"✅ Q{i+1}: {r['question'][:60]}"):
+                    st.markdown(f"**问题**: {r['question']}")
+                    st.markdown(f"**回答**: {sample.get('final_answer', '')}")
+                    retrieval_results = sample.get("retrieval_results", [])
+                    if retrieval_results:
+                        st.markdown(f"**检索结果** ({len(retrieval_results)} 条):")
+                        for rr in retrieval_results:
+                            st.write(f"  - [{rr.get('position')}] {rr.get('title', 'N/A')} (score: {rr.get('score', 'N/A')})")
+                            if rr.get("content"):
+                                st.caption(f"    {rr['content'][:200]}")
+                    else:
+                        st.caption("无检索结果")
+                    with st.expander("原始响应"):
+                        st.json(r.get("raw_response", {}))
+            else:
+                with st.expander(f"❌ Q{i+1}: {r['question'][:60]}"):
+                    st.error(f"错误: {r.get('error', '未知错误')}")
+
+        # --- Export & Push ---
+        st.divider()
+        st.subheader("导出与推送")
+
+        exp_col1, exp_col2, exp_col3 = st.columns(3)
+
+        with exp_col1:
+            # JSONL download
+            jsonl_lines = []
+            for r in batch_results:
+                jsonl_lines.append(json.dumps(r, ensure_ascii=False))
+            jsonl_data = "\n".join(jsonl_lines).encode("utf-8")
+            st.download_button(
+                label="📥 下载完整结果 (JSONL)",
+                data=jsonl_data,
+                file_name="batch_results.jsonl",
+                mime="application/jsonl",
+                use_container_width=True,
+            )
+
+        with exp_col2:
+            # CSV download
+            csv_data = batch_export_csv(batch_results)
+            st.download_button(
+                label="📥 下载结果 (CSV)",
+                data=csv_data,
+                file_name="batch_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with exp_col3:
+            # Push to raw dir for downstream consumption
+            if st.button("📤 推送到样本列表", use_container_width=True,
+                         help="将成功的结果保存到 data/raw/，可在「样本列表」tab 中解析"):
+                successful = [r for r in batch_results if r["success"] and r.get("sample")]
+                if successful:
+                    push_path, push_name = push_to_raw_dir(batch_results)
+                    st.success(f"已推送 {len(successful)} 条结果到 {push_name}")
+                    st.caption("请切换到「样本列表」tab，选择该文件并点击「解析」")
+                else:
+                    st.warning("没有成功的结果可推送")
 
 # ========== Tab: 样本列表 ==========
 with tab_samples:
