@@ -253,7 +253,7 @@ with tab_qgen:
                 st.text(file_content)
 
         if char_count > 8000:
-            st.warning(f"文件内容较长（{char_count:,} 字），生成时将截取前 8000 字。建议拆分为多个较小的文件以获得更好效果。")
+            st.info(f"文件较长（{char_count:,} 字），将自动按章节切分后分段出题，确保内容覆盖完整。")
 
         # --- Generate button ---
         if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
@@ -268,18 +268,32 @@ with tab_qgen:
                 }
                 difficulty_val = difficulty_map.get(qgen_difficulty, "混合")
 
-                with st.spinner(f"正在调用 LLM 生成 {qgen_num} 道题目..."):
+                with st.status("正在生成题目...", expanded=True) as gen_status:
+                    status_text = st.empty()
+                    status_text.write("正在切分文档...")
+
+                    def _on_progress(chunk_idx, total_chunks, section_title):
+                        status_text.write(
+                            f"正在出题: 章节 {chunk_idx + 1}/{total_chunks} — {section_title[:40]}"
+                        )
+
                     try:
                         questions = generate_questions(
                             file_content, qgen_api_key, qgen_base_url, qgen_model,
                             num_questions=qgen_num, difficulty=difficulty_val,
                             topic_hint=qgen_topic_hint,
+                            progress_callback=_on_progress,
                         )
                         st.session_state["generated_questions"] = questions
                         output_path, fname = save_questions(questions)
                         st.session_state["qgen_saved_file"] = fname
-                        st.success(f"生成完成！共 {len(questions)} 道题目，已保存到 data/questions/{fname}")
+                        gen_status.update(
+                            label=f"生成完成！共 {len(questions)} 道题目",
+                            state="complete",
+                            expanded=False,
+                        )
                     except Exception as e:
+                        gen_status.update(label="生成失败", state="error")
                         st.error(f"生成失败: {e}")
     else:
         st.info("请在上方「配置」区域上传知识库文件（.txt 或 .md）")
