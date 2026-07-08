@@ -780,56 +780,66 @@ with tab_samples:
 
     # --- Data import section (collapsible) ---
     with st.expander("数据导入", expanded=not samples):
-        # Upload section
-        uploaded = st.file_uploader("上传 Langfuse 导出文件", type=["jsonl"], key="langfuse_upload")
-        if uploaded is not None:
-            save_path = RAW_DIR / uploaded.name
-            save_path.write_bytes(uploaded.getvalue())
-            st.success(f"已保存: {uploaded.name}")
-            st.rerun()
+        # Step 1: Acquire data
+        st.markdown("**第一步：获取 Langfuse 导出文件**")
+        source_mode = st.radio(
+            "获取方式",
+            ["上传文件", "从 API 拉取"],
+            horizontal=True,
+            key="lf_source_mode",
+            label_visibility="collapsed",
+        )
 
-        # API fetch section
+        if source_mode == "上传文件":
+            uploaded = st.file_uploader("上传 Langfuse 导出文件", type=["jsonl"], key="langfuse_upload")
+            if uploaded is not None:
+                save_path = RAW_DIR / uploaded.name
+                save_path.write_bytes(uploaded.getvalue())
+                st.success(f"已保存: {uploaded.name}")
+                st.rerun()
+
+        elif source_mode == "从 API 拉取":
+            fetch_col1, fetch_col2 = st.columns(2)
+            with fetch_col1:
+                langfuse_host = st.text_input("Langfuse 地址", value=os.getenv("LANGFUSE_HOST", "http://localhost:3000"), key="lf_host")
+                langfuse_pk = st.text_input("Public Key", value=os.getenv("LANGFUSE_PUBLIC_KEY", ""), key="lf_pk")
+            with fetch_col2:
+                langfuse_sk = st.text_input("Secret Key", value=os.getenv("LANGFUSE_SECRET_KEY", ""), type="password", key="lf_sk")
+                fetch_limit = st.number_input("每页 trace 数", min_value=1, max_value=500, value=50, key="lf_limit")
+
+            if st.button("拉取 Traces", key="fetch_traces"):
+                if not langfuse_pk or not langfuse_sk:
+                    st.error("请填写 Langfuse Public Key 和 Secret Key")
+                else:
+                    from fetch_traces import fetch_all
+                    from datetime import datetime
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"langfuse_api_export_{ts}.jsonl"
+                    output_path = RAW_DIR / filename
+                    with st.spinner(f"正在从 {langfuse_host} 拉取 Traces..."):
+                        try:
+                            count = 0
+                            with output_path.open("w", encoding="utf-8") as f:
+                                for row in fetch_all(langfuse_host, langfuse_pk, langfuse_sk, limit=fetch_limit):
+                                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                                    count += 1
+                            st.success(f"拉取完成！共 {count} 行，已保存为 {filename}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"拉取失败: {e}")
+
+        # Step 2: Select file & parse
         st.divider()
-        st.subheader("从 Langfuse API 拉取")
-        fetch_col1, fetch_col2 = st.columns(2)
-        with fetch_col1:
-            langfuse_host = st.text_input("Langfuse 地址", value=os.getenv("LANGFUSE_HOST", "http://localhost:3000"), key="lf_host")
-            langfuse_pk = st.text_input("Public Key", value=os.getenv("LANGFUSE_PUBLIC_KEY", ""), key="lf_pk")
-        with fetch_col2:
-            langfuse_sk = st.text_input("Secret Key", value=os.getenv("LANGFUSE_SECRET_KEY", ""), type="password", key="lf_sk")
-            fetch_limit = st.number_input("每页 trace 数", min_value=1, max_value=500, value=50, key="lf_limit")
+        st.markdown("**第二步：选择文件并解析**")
 
-        if st.button("拉取 Traces", key="fetch_traces"):
-            if not langfuse_pk or not langfuse_sk:
-                st.error("请填写 Langfuse Public Key 和 Secret Key")
-            else:
-                from fetch_traces import fetch_all
-                from datetime import datetime
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"langfuse_api_export_{ts}.jsonl"
-                output_path = RAW_DIR / filename
-                with st.spinner(f"正在从 {langfuse_host} 拉取 Traces..."):
-                    try:
-                        count = 0
-                        with output_path.open("w", encoding="utf-8") as f:
-                            for row in fetch_all(langfuse_host, langfuse_pk, langfuse_sk, limit=fetch_limit):
-                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                                count += 1
-                        st.success(f"拉取完成！共 {count} 行，已保存为 {filename}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"拉取失败: {e}")
-
-        # File selection & parse
-        st.divider()
         raw_files = sorted(RAW_DIR.glob("*.jsonl"))
         if not raw_files:
-            st.warning("data/raw 目录下没有找到 .jsonl 文件，请上传或从 API 拉取")
+            st.info("data/raw 目录下暂无 .jsonl 文件，请先通过上方方式获取数据")
             selected_name = None
             selected_path = None
         else:
             file_names = [f.name for f in raw_files]
-            selected_name = st.selectbox("选择 Langfuse 导出文件", file_names, key="raw_select")
+            selected_name = st.selectbox("待解析文件", file_names, key="raw_select")
             selected_path = RAW_DIR / selected_name
 
             file_size_kb = selected_path.stat().st_size / 1024
