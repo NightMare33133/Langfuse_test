@@ -501,11 +501,21 @@ PISP和AISP的区别?
         if q_source == "使用已生成的题目":
             gen_qs = st.session_state.get("generated_questions")
             if gen_qs:
-                questions_list = [q["question"] for q in gen_qs if q.get("question")]
+                # 传递完整 question 对象（含 reference_answer / source_excerpt）
+                questions_list = [q for q in gen_qs if q.get("question")]
                 st.success(f"已加载 {len(questions_list)} 道已生成的题目")
+                has_ref = sum(1 for q in questions_list if q.get("reference_answer"))
+                if has_ref:
+                    st.caption(f"其中 {has_ref} 道带有参考答案，评测时将用于严格评判")
                 with st.expander("预览题目", expanded=False):
                     for i, q in enumerate(questions_list, 1):
-                        st.write(f"{i}. {q}")
+                        qtext = q.get("question", "")
+                        ref = q.get("reference_answer", "")
+                        if ref:
+                            st.write(f"{i}. {qtext}")
+                            st.caption(f"   参考答案: {ref[:80]}{'...' if len(ref) > 80 else ''}")
+                        else:
+                            st.write(f"{i}. {qtext}")
             else:
                 st.warning("暂无已生成的题目，请先在「题目生成」tab 中生成题目，或选择其他来源")
 
@@ -530,7 +540,13 @@ PISP和AISP的区别?
                             obj = json.loads(line)
                             q = obj.get("question") or obj.get("query") or ""
                             if q.strip():
-                                questions_list.append(q.strip())
+                                # 保留 reference_answer / source_excerpt（如有）
+                                item = {"question": q.strip()}
+                                if obj.get("reference_answer"):
+                                    item["reference_answer"] = obj["reference_answer"]
+                                if obj.get("source_excerpt"):
+                                    item["source_excerpt"] = obj["source_excerpt"]
+                                questions_list.append(item)
                         except json.JSONDecodeError:
                             continue
                 elif q_file.name.endswith(".csv"):
@@ -551,14 +567,20 @@ PISP和AISP的区别?
                         # 优先从 question/query 列取值，否则取第一列
                         if header:
                             q = ""
+                            ref = ""
                             for i, h in enumerate(header):
                                 if h in ("question", "query", "问题") and i < len(row):
                                     q = row[i]
-                                    break
+                                if h in ("reference_answer", "参考答案") and i < len(row):
+                                    ref = row[i]
                         else:
                             q = row[0] if row else ""
+                            ref = ""
                         if q.strip():
-                            questions_list.append(q.strip())
+                            item = {"question": q.strip()}
+                            if ref.strip():
+                                item["reference_answer"] = ref.strip()
+                            questions_list.append(item)
                 else:
                     questions_list = [line.strip() for line in content.strip().split("\n") if line.strip()]
                 st.success(f"从文件加载了 {len(questions_list)} 个问题")
@@ -589,13 +611,30 @@ PISP和AISP的区别?
                             obj = json.loads(line)
                             q = obj.get("question") or obj.get("query") or ""
                             if q.strip():
-                                questions_list.append(q.strip())
+                                item = {"question": q.strip()}
+                                if obj.get("reference_answer"):
+                                    item["reference_answer"] = obj["reference_answer"]
+                                if obj.get("source_excerpt"):
+                                    item["source_excerpt"] = obj["source_excerpt"]
+                                questions_list.append(item)
                         except json.JSONDecodeError:
                             continue
                     st.success(f"从 {selected_file.name} 加载了 {len(questions_list)} 个问题")
+                    has_ref = sum(1 for q in questions_list if isinstance(q, dict) and q.get("reference_answer"))
+                    if has_ref:
+                        st.caption(f"其中 {has_ref} 道带有参考答案，评测时将用于严格评判")
                     with st.expander("预览题目", expanded=False):
                         for i, q in enumerate(questions_list, 1):
-                            st.write(f"{i}. {q}")
+                            if isinstance(q, dict):
+                                qtext = q.get("question", "")
+                                ref = q.get("reference_answer", "")
+                                if ref:
+                                    st.write(f"{i}. {qtext}")
+                                    st.caption(f"   参考答案: {ref[:80]}{'...' if len(ref) > 80 else ''}")
+                                else:
+                                    st.write(f"{i}. {qtext}")
+                            else:
+                                st.write(f"{i}. {q}")
                 except Exception as e:
                     st.error(f"读取文件失败: {e}")
 
@@ -944,9 +983,123 @@ with tab_judge:
     st.subheader("Judge 评测")
     st.caption("对解析后的样本进行自动评分")
 
+    # ---------- 运行机制说明 ----------
+    with st.expander("Judge 运行机制说明（点击展开）", expanded=False):
+        st.markdown(f"""
+**一句话总览：** Judge 从「样本列表」中取出候选样本，逐条调用 LLM 对检索质量和回答正确性进行评分，结果保存到评测结果文件。
+
+---
+
+**Judge 评什么？两层评测，不是一个总分**
+
+Judge 不是只给一个"总分"，而是同时评两个独立维度：
+
+| 评测维度 | 评什么 | 对应指标 | 含义 |
+|---|---|---|---|
+| RAG 检索层 | 检索结果是否召回了正确内容 | Top1 / Top3 / Top5 Hit | 检索链路质量 |
+| LLM 回答层 | 最终回答是否正确完整 | Answer OK | 回答生成质量 |
+
+这两层相互独立：
+- 检索命中高，不代表回答一定对（LLM 可能理解错或生成错）
+- 回答正确，也不代表检索一定好（LLM 可能靠自身知识推断）
+- 两层都高，才说明 RAG 链路整体健康
+
+---
+
+**两种评测模式：有参考答案 vs 无参考答案**
+
+Judge 支持两种评测模式，取决于样本是否带有 `reference_answer`（参考答案）：
+
+| 模式 | 判断依据 | Answer Correct 含义 | 适用场景 |
+|---|---|---|---|
+| **严格评测**（有参考答案） | 将最终回答与参考答案对比 | 回答是否与参考答案一致、覆盖关键要点 | 题目生成链路产出的样本 |
+| **合理性评测**（无参考答案） | LLM 基于问题和检索内容自行判断 | 回答是否看起来合理且完整 | 手动问题、Langfuse 导入等 |
+
+- 参考答案来自题目生成模块（`reference_answer` 字段），随样本全链路传递
+- 严格评测更可靠，因为有明确的正确答案作为基准
+- 合理性评测更宽松，LLM 只能判断"看起来对不对"，不能保证与标准答案一致
+- 页面指标区会显示当前是哪种模式（或混合模式）
+
+---
+
+**评测输入是什么？**
+
+Judge 评的不是原始题目文件，而是经过「样本解析」后的结构化样本列表。
+
+- 输入文件：`{PROCESSED_DIR.name}/langfuse_samples.jsonl`
+- 每条样本包含：用户问题、检索查询、检索结果列表、最终回答、trace_id 等
+- 如果样本带有 `reference_answer`，Judge 会用它进行严格评测
+- 页面中的候选样本，就是从这份文件中加载的
+
+---
+
+**样本怎么选？**
+
+| 配置项 | 效果 |
+|---|---|
+| 评测样本数 = N | 从样本列表中按顺序取前 N 条作为候选 |
+| 只评前 1 条（快速测试） | 覆盖上述设置，仅取第 1 条候选样本 |
+| 跳过已有成功结果 | 候选样本中已有成功评测记录的会被跳过 |
+| 强制重新评测 | 不跳过任何候选样本，全部重新运行 |
+| 只重试失败样本 | 切换评测对象：不走「前 N 条」逻辑，而是从已有结果中找出失败的样本重跑 |
+
+---
+
+**「缓存」是什么意思？**
+
+Judge 有三层减少重复调用的机制：
+
+1. **结果跳过**：读取已有评测结果文件（`{JUDGED_DIR.name}/{JUDGED_FILE.name}`），如果某条样本已有成功结果且选择「跳过已有成功结果」，则不会重复调用 LLM
+2. **内容复用**：如果多条样本的问题、检索查询、回答内容完全相同，只需评测一次，其余复用结果
+3. **规则预筛选**：对于明显无法评测的样本（如无问题、无回答、无检索结果），直接给出规则判定结果，不进入 LLM
+
+这些在点击「预览优化策略」后可以看到具体节省了多少次 LLM 调用。
+
+---
+
+**结果保存到哪里？**
+
+- 最新结果始终保存到：`{JUDGED_DIR.name}/{JUDGED_FILE.name}`
+- 每次运行后还会生成带时间戳的历史快照（如 `eval_results_20250709_143000.jsonl`）
+- 结果按 trace_id 合并更新：新评测结果会覆盖同一条样本的旧结果，未重跑的成功结果保留
+- 这意味着结果文件会持续积累，不是每次运行都从零开始
+
+---
+
+**新样本怎么进入 Judge？**
+
+新题目不会自动出现在 Judge 中，需要经过完整流程：
+
+```
+题目生成 → 批量提问(Dify) → 样本解析 → Judge 评测
+```
+
+1. **题目生成**：从知识库文件生成测试问题
+2. **批量提问**：将问题发送给 Dify，获取检索结果和回答
+3. **样本解析**：将 Dify 返回结果解析为结构化样本，存入样本列表
+4. **Judge 评测**：从样本列表中取出样本，调用 LLM 评分
+
+只有完成前 3 步，新样本才会出现在 Judge 的候选列表中。
+""")
+
     if not samples:
         st.info("请先切换到「样本列表」tab 解析数据")
     else:
+        # ---------- 已有结果加载 & 索引（放在 UI 前，供策略摘要使用） ----------
+        existing_results_map = {}  # trace_id -> result dict
+        if JUDGED_FILE.exists():
+            with JUDGED_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        r = json.loads(line)
+                        tid = r.get("trace_id")
+                        if tid:
+                            existing_results_map[tid] = r
+                    except json.JSONDecodeError:
+                        pass
+
         # --- Judge config section (collapsible) ---
         with st.expander("评测配置", expanded=True):
             # API config
@@ -976,11 +1129,16 @@ with tab_judge:
                                 status.update(label="连接失败", state="error")
                                 st.error(str(e))
 
-            # Evaluation range & options
-            range_col1, range_col2, range_col3 = st.columns(3)
-            with range_col1:
-                total_available = len(samples)
-                debug_limit = st.checkbox("只评前 1 条（快速测试）", value=True, key="debug_limit")
+            # === 第一层：评测范围与模式 ===
+            st.markdown("##### 评测范围")
+            total_available = len(samples)
+
+            scope_col1, scope_col2 = st.columns(2)
+            with scope_col1:
+                debug_limit = st.checkbox(
+                    "只评前 1 条（快速测试）", value=True, key="debug_limit",
+                    help="勾选后「评测样本数」不生效，仅评测第 1 条样本"
+                )
                 if debug_limit:
                     max_samples = 1
                 else:
@@ -988,40 +1146,120 @@ with tab_judge:
                         "评测样本数", min_value=1, max_value=max(total_available, 1),
                         value=min(10, total_available), key="max_samples",
                     )
-            with range_col2:
-                skip_existing = st.checkbox("跳过已有成功结果", value=True, key="skip_existing",
-                                            help="已有评测结果的样本不会重复调用 LLM")
-            with range_col3:
-                force_rerun = st.checkbox("强制重新评测", value=False, key="force_rerun",
-                                          help="忽略所有缓存，重新评测全部样本")
+                    st.caption(f"从样本列表前 {total_available} 条中按顺序取前 {max_samples} 条作为候选")
+            with scope_col2:
+                existing_success_count = sum(
+                    1 for r in existing_results_map.values() if "error" not in r
+                )
 
-            # Advanced options
+                eval_mode = st.radio(
+                    "已有结果处理方式",
+                    options=["skip", "rerun_all"],
+                    format_func=lambda x: {
+                        "skip": "跳过已有成功结果（推荐）",
+                        "rerun_all": "强制重新评测全部样本",
+                    }[x],
+                    index=0,
+                    key="eval_mode",
+                    help="跳过模式：已有成功结果的样本不会重复消耗 token；强制模式：忽略所有缓存，全部重跑",
+                )
+                skip_existing = (eval_mode == "skip")
+                force_rerun = (eval_mode == "rerun_all")
+
+            # === 第二层：高级选项 ===
             with st.expander("高级选项", expanded=False):
                 show_debug = st.checkbox("显示 Judge Prompt 和原始响应", key="show_debug")
 
-            # Action buttons
-            btn_col1, btn_col2, btn_col3 = st.columns(3)
-            with btn_col1:
-                preview_optimization = st.button("预览优化策略", use_container_width=True, help="查看实际需要调用 LLM 的次数，不消耗 token")
-            with btn_col2:
-                run_judge = st.button("运行 Judge 评测", type="primary", use_container_width=True)
-            with btn_col3:
-                retry_failed = st.button("只重试失败样本", use_container_width=True)
+            # === 策略摘要 & 样本选择预览 ===
+            effective_count = max_samples if not debug_limit else 1
+            st.markdown("---")
 
-        # ---------- 已有结果加载 & 索引 ----------
-        existing_results_map = {}  # trace_id -> result dict
-        if JUDGED_FILE.exists():
-            with JUDGED_FILE.open("r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        r = json.loads(line)
-                        tid = r.get("trace_id")
-                        if tid:
-                            existing_results_map[tid] = r
-                    except json.JSONDecodeError:
-                        pass
+            # 模拟真实筛选逻辑，生成样本选择预览
+            _preview_candidates = samples[:effective_count]
+            _preview_will_judge = []
+            _preview_will_skip = []
+            for _s in _preview_candidates:
+                _tid = _s.get("trace_id")
+                _existing = existing_results_map.get(_tid)
+                if _existing and "error" not in _existing and skip_existing and not force_rerun:
+                    _preview_will_skip.append(_s)
+                else:
+                    _preview_will_judge.append(_s)
+
+            # 策略摘要 — 清晰三步式：候选 → 跳过 → 实际新评测
+            if debug_limit:
+                st.markdown(f"📋 **执行策略**：快速测试，仅取样本列表第 1 条")
+            else:
+                st.markdown(f"📋 **执行策略**：从 {total_available} 条样本中按顺序取前 **{effective_count}** 条作为候选")
+
+            if force_rerun:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;→ 强制重评，不跳过任何样本 → 实际新评测 **{len(_preview_will_judge)}** 条")
+            elif skip_existing and _preview_will_skip:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;→ 其中 **{len(_preview_will_skip)}** 条已有成功结果，本次将跳过 → 实际新评测 **{len(_preview_will_judge)}** 条")
+            elif skip_existing:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;→ 跳过模式开启，但候选样本中暂无已有成功结果 → 实际新评测 **{len(_preview_will_judge)}** 条")
+            else:
+                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;→ 实际新评测 **{len(_preview_will_judge)}** 条")
+
+            # 全局历史参考信息（仅在有历史数据且开启跳过时显示）
+            if existing_success_count > 0 and skip_existing and not force_rerun:
+                st.caption(f"（历史评测结果中共 {existing_success_count} 条成功记录，本次候选中有 {len(_preview_will_skip)} 条命中）")
+
+            # 样本选择预览
+            with st.expander("本次将评测哪些样本（点击展开）", expanded=False):
+                if not _preview_candidates:
+                    st.info("没有候选样本")
+                else:
+                    st.caption(f"候选样本（按原始顺序前 {len(_preview_candidates)} 条）：")
+                    for _idx, _s in enumerate(_preview_candidates):
+                        _q = (_s.get("question") or "(无问题)")[:50]
+                        _existing = existing_results_map.get(_s.get("trace_id"))
+                        if _existing and "error" not in _existing and skip_existing and not force_rerun:
+                            st.caption(f"  ⏭️ {_idx+1}. `{_q}` — 已有成功结果，将跳过")
+                        elif _existing and "error" in _existing:
+                            st.caption(f"  🔄 {_idx+1}. `{_q}` — 之前评测失败，将重试")
+                        else:
+                            st.caption(f"  ✅ {_idx+1}. `{_q}` — 将评测")
+                    if len(_preview_will_skip) > 0:
+                        st.caption(f"共 {len(_preview_will_skip)} 条跳过，{len(_preview_will_judge)} 条需要评测")
+
+            st.markdown("---")
+
+            # === 第三层：执行动作 ===
+            # 计算重试按钮上下文
+            failed_count = sum(1 for r in existing_results_map.values() if "error" in r)
+            retry_label = "只重试失败样本" if failed_count == 0 else f"只重试失败样本（{failed_count} 条）"
+            retry_disabled = (failed_count == 0)
+
+            btn_preview, btn_run, btn_retry = st.columns([2, 3, 2])
+            with btn_preview:
+                preview_optimization = st.button(
+                    "预览优化策略",
+                    use_container_width=True,
+                    help="查看实际需要调用 LLM 的次数，不消耗 token",
+                )
+            with btn_run:
+                run_judge = st.button(
+                    "运行 Judge 评测",
+                    type="primary",
+                    use_container_width=True,
+                    help="按当前配置正式开始评测",
+                )
+            with btn_retry:
+                if retry_disabled:
+                    st.button(
+                        retry_label,
+                        use_container_width=True,
+                        disabled=True,
+                        help="暂无失败样本，无需重试",
+                    )
+                    retry_failed = False
+                else:
+                    retry_failed = st.button(
+                        retry_label,
+                        use_container_width=True,
+                        help="仅重新评测之前失败的样本，不影响成功结果",
+                    )
 
         def _load_existing_for_session():
             if "judge_results" not in st.session_state and existing_results_map:
@@ -1320,26 +1558,96 @@ with tab_judge:
 
             # ---------- 指标卡片 ----------
             st.subheader("评测指标")
-            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-            c1.metric("总样本数", metrics["total"])
-            c2.metric("有效评测数", metrics["evaluated"])
-            c3.metric("错误数", metrics["errors"])
-            c4.metric(
-                "Top1 Hit",
-                f"{metrics['top1_hit_rate']:.0%}" if metrics["top1_hit_rate"] is not None else "N/A",
-            )
-            c5.metric(
-                "Top3 Hit",
-                f"{metrics['top3_hit_rate']:.0%}" if metrics["top3_hit_rate"] is not None else "N/A",
-            )
-            c6.metric(
-                "Top5 Hit",
-                f"{metrics['top5_hit_rate']:.0%}" if metrics["top5_hit_rate"] is not None else "N/A",
-            )
-            c7.metric(
-                "Answer OK",
-                f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
-            )
+
+            with_ref = metrics.get("with_ref_count", 0)
+            without_ref = metrics.get("without_ref_count", 0)
+            is_mixed = with_ref > 0 and without_ref > 0
+
+            # 概览
+            ov1, ov2, ov3 = st.columns(3)
+            ov1.metric("总样本数", metrics["total"])
+            ov2.metric("有效评测数", metrics["evaluated"])
+            ov3.metric("错误数", metrics["errors"])
+
+            # 评测模式构成
+            if is_mixed:
+                st.markdown(f"**评测模式构成**：严格评测 **{with_ref}** 条（有参考答案）｜ 合理性评测 **{without_ref}** 条（无参考答案）")
+            elif with_ref > 0:
+                st.markdown(f"**评测模式**：全部 **{with_ref}** 条均为严格评测（有参考答案）")
+            else:
+                st.markdown(f"**评测模式**：全部 **{without_ref}** 条均为合理性评测（无参考答案）")
+
+            # RAG 检索 vs LLM 回答 — 分两列展示
+            st.markdown("")
+            metric_col1, metric_col2 = st.columns(2)
+
+            with metric_col1:
+                st.markdown("**RAG 检索质量** — 检索结果是否召回了正确内容")
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric(
+                    "Top1 Hit",
+                    f"{metrics['top1_hit_rate']:.0%}" if metrics["top1_hit_rate"] is not None else "N/A",
+                    help="第 1 条检索结果是否命中正确答案（所有样本统一标准）",
+                )
+                mc2.metric(
+                    "Top3 Hit",
+                    f"{metrics['top3_hit_rate']:.0%}" if metrics["top3_hit_rate"] is not None else "N/A",
+                    help="前 3 条检索结果中是否包含正确答案（所有样本统一标准）",
+                )
+                mc3.metric(
+                    "Top5 Hit",
+                    f"{metrics['top5_hit_rate']:.0%}" if metrics["top5_hit_rate"] is not None else "N/A",
+                    help="前 5 条检索结果中是否包含正确答案（所有样本统一标准）",
+                )
+
+            with metric_col2:
+                st.markdown("**LLM 回答质量** — 含义因评测模式而异")
+                mc4, mc5 = st.columns([1, 2])
+
+                if is_mixed:
+                    # 混合模式：显示总正确率 + 分模式正确率
+                    mc4.metric(
+                        "Answer OK（总）",
+                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
+                        help="混合口径：包含严格评测和合理性评测两类结果，不应直接与纯严格评测对比",
+                    )
+                    ref_rate = metrics.get("with_ref_answer_rate")
+                    noref_rate = metrics.get("without_ref_answer_rate")
+                    rate_parts = []
+                    if ref_rate is not None:
+                        rate_parts.append(f"严格（有参考答案）: **{ref_rate:.0%}**")
+                    if noref_rate is not None:
+                        rate_parts.append(f"合理性（无参考答案）: **{noref_rate:.0%}**")
+                    if rate_parts:
+                        mc5.caption("｜".join(rate_parts))
+                    mc5.caption("严格评测：回答是否与参考答案一致 ｜ 合理性评测：回答是否基于检索内容合理")
+                elif with_ref > 0:
+                    mc4.metric(
+                        "Answer OK",
+                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
+                        help="严格口径：回答是否与参考答案一致、覆盖关键要点",
+                    )
+                else:
+                    mc4.metric(
+                        "Answer OK",
+                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
+                        help="合理性口径：回答是否基于检索内容看起来合理、完整（非标准答案对比）",
+                    )
+
+                # 对角关系提示
+                if valid_results:
+                    retrieval_hit_but_answer_wrong = sum(
+                        1 for r in valid_results
+                        if r.get("retrieval_top1_hit") and not r.get("answer_correct")
+                    )
+                    retrieval_miss = sum(
+                        1 for r in valid_results
+                        if not r.get("retrieval_top1_hit")
+                    )
+                    if retrieval_hit_but_answer_wrong > 0:
+                        mc5.caption(f"检索命中但回答错误: {retrieval_hit_but_answer_wrong} 条（更可能是回答生成问题）")
+                    if retrieval_miss > 0:
+                        mc5.caption(f"检索未命中: {retrieval_miss} 条（更可能是检索链路问题）")
 
             if metrics["errors"] > 0:
                 st.warning(f"有 {metrics['errors']} 条评测出错")
@@ -1349,35 +1657,63 @@ with tab_judge:
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
-                st.markdown("**命中率 / 正确率概览**")
+                st.markdown("**RAG 检索命中率 & LLM 回答正确率**")
                 st.plotly_chart(build_eval_bar_chart(metrics), use_container_width=True)
 
             with chart_col2:
-                st.markdown("**Answer 正确 vs 错误**")
+                st.markdown("**LLM 回答：正确 vs 错误**")
                 if valid_results:
                     st.plotly_chart(build_answer_pye(valid_results), use_container_width=True)
                 else:
                     st.info("无有效评测数据")
 
-            st.markdown("**每题命中情况**")
+            st.markdown("**每题检索命中情况**")
             pq_fig = build_per_question_chart(valid_results) if valid_results else None
             if pq_fig:
                 st.plotly_chart(pq_fig, use_container_width=True)
             else:
                 st.info("无有效评测数据")
 
-            # ---------- Top1 未命中案例 ----------
+            # ---------- Top1 未命中案例（检索维度诊断） ----------
             top1_miss = [r for r in valid_results if not r.get("retrieval_top1_hit")]
             if top1_miss:
-                st.subheader(f"Top1 未命中案例 ({len(top1_miss)} 条)")
-                st.caption("以下问题 Top1 未命中但可能 Top3 命中，可用于分析检索质量问题")
+                st.subheader(f"RAG 检索：Top1 未命中案例 ({len(top1_miss)} 条)")
+                st.caption("以下问题 Top1 未命中 — 说明检索链路可能存在问题（如召回策略、向量相似度、关键词匹配等）")
                 for r in top1_miss:
-                    with st.expander(f"**{r.get('question', '(无问题)')[:60]}**"):
+                    _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
+                    with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
                         st.markdown(f"**问题**: {r.get('question', '')}")
-                        st.markdown(f"**原因**: {r.get('reason', '(无)')}")
+                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
                         t3 = "✓" if r.get("retrieval_top3_hit") else "✗"
                         t5 = "✓" if r.get("retrieval_top5_hit") else "✗"
-                        st.markdown(f"**Top3**: {t3} | **Top5**: {t5}")
+                        ans = "✓" if r.get("answer_correct") else "✗"
+                        st.markdown(f"**检索**: Top3 {t3} | Top5 {t5}　　**回答**: {ans}　　**评测模式**: {_mode_tag}")
+                        # 诊断提示
+                        if r.get("retrieval_top3_hit") and not r.get("retrieval_top1_hit"):
+                            st.caption("Top1 未命中但 Top3 命中 — 排序可能有问题，正确结果未排到第一位")
+                        elif not r.get("retrieval_top5_hit"):
+                            st.caption("Top5 也未命中 — 检索完全未召回正确内容，需检查检索策略")
+                        if r.get("answer_correct"):
+                            st.caption("虽然检索未命中 Top1，但 LLM 仍给出了正确回答 — 可能靠其他上下文推断")
+                        st.markdown(f"**trace_id**: `{r.get('trace_id', '')}`")
+
+            # ---------- 回答错误但检索命中的案例（回答维度诊断） ----------
+            answer_wrong_but_retrieval_hit = [
+                r for r in valid_results
+                if r.get("retrieval_top1_hit") and not r.get("answer_correct")
+            ]
+            if answer_wrong_but_retrieval_hit:
+                st.subheader(f"LLM 回答：检索命中但回答错误 ({len(answer_wrong_but_retrieval_hit)} 条)")
+                st.caption("以下问题检索已命中正确内容，但 LLM 未给出正确回答 — 说明回答生成环节可能存在问题")
+                for r in answer_wrong_but_retrieval_hit:
+                    _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
+                    with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
+                        st.markdown(f"**问题**: {r.get('question', '')}")
+                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
+                        if r.get("has_reference"):
+                            st.caption("参考答案评测：回答与参考答案不一致或遗漏关键点 — 需检查回答生成是否覆盖了参考答案的核心内容")
+                        else:
+                            st.caption("合理性评测：检索已命中，但 LLM 判断回答不合理 — 可能原因：回答生成模型能力不足、prompt 设计问题、或检索结果干扰")
                         st.markdown(f"**trace_id**: `{r.get('trace_id', '')}`")
 
             # ---------- 评测详情表格 ----------
@@ -1386,6 +1722,7 @@ with tab_judge:
             for r in judge_results:
                 table_rows.append({
                     "question": r.get("question", ""),
+                    "评测模式": "参考答案" if r.get("has_reference") else "LLM判断",
                     "retrieval_top1_hit": r.get("retrieval_top1_hit"),
                     "retrieval_top3_hit": r.get("retrieval_top3_hit"),
                     "retrieval_top5_hit": r.get("retrieval_top5_hit"),

@@ -13,27 +13,41 @@ import requests
 
 
 def compute_content_hash(sample):
-    """基于 question + retrieval_query + final_answer 生成内容指纹。
+    """基于 question + retrieval_query + final_answer + reference_answer 生成内容指纹。
 
     同内容不同 trace 的样本会得到相同 hash，用于去重和缓存复用。
+    包含 reference_answer 以确保有/无参考答案的样本不会误合并。
     """
     parts = [
         (sample.get("question") or "").strip(),
         (sample.get("retrieval_query") or "").strip(),
         (sample.get("final_answer") or "").strip(),
+        (sample.get("reference_answer") or "").strip(),
     ]
     raw = "\n".join(parts)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "judge_prompt.txt"
+PROMPT_TEMPLATE_WITH_REF_PATH = Path(__file__).parent / "prompts" / "judge_prompt_with_ref.txt"
 
 
 def load_prompt_template():
     return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
 
 
+def load_prompt_template_with_ref():
+    return PROMPT_TEMPLATE_WITH_REF_PATH.read_text(encoding="utf-8").strip()
+
+
 def build_judge_prompt(sample, template=None, max_content_chars=300):
-    if template is None:
+    """构建 Judge prompt。如果 sample 包含 reference_answer，自动使用含参考答案的模板。"""
+    has_ref = bool((sample.get("reference_answer") or "").strip())
+
+    if template is not None:
+        pass  # 使用传入的模板
+    elif has_ref:
+        template = load_prompt_template_with_ref()
+    else:
         template = load_prompt_template()
 
     retrieval_results = sample.get("retrieval_results") or []
@@ -59,6 +73,9 @@ def build_judge_prompt(sample, template=None, max_content_chars=300):
     prompt = prompt.replace("{retrieval_query}", sample.get("retrieval_query") or "(无)")
     prompt = prompt.replace("{retrieval_results}", retrieval_text)
     prompt = prompt.replace("{final_answer}", sample.get("final_answer") or "(无)")
+    if has_ref:
+        prompt = prompt.replace("{reference_answer}", sample.get("reference_answer"))
+        prompt = prompt.replace("{source_excerpt}", sample.get("source_excerpt") or "(无)")
     return prompt
 
 
@@ -108,7 +125,12 @@ def call_llm(prompt, api_key, base_url, model, timeout=30):
 def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout=60):
     """Judge a single sample. Returns a dict with scores or error info."""
     trace_id = sample.get("trace_id", "unknown")
-    result = {"trace_id": trace_id, "question": sample.get("question") or ""}
+    has_ref = bool((sample.get("reference_answer") or "").strip())
+    result = {
+        "trace_id": trace_id,
+        "question": sample.get("question") or "",
+        "has_reference": has_ref,
+    }
 
     try:
         prompt = build_judge_prompt(sample, prompt_template)
@@ -129,8 +151,10 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
     内置规则预筛选和内容级去重：
     - 预筛选：无检索结果/无回答的样本直接出结果，不调 LLM
     - 去重：相同 question+retrieval_query+final_answer 的样本只评一次
+
+    模板选择：不预加载模板，由 build_judge_prompt 根据每个 sample
+    是否包含 reference_answer 自动选择对应模板。
     """
-    template = load_prompt_template()
     content_cache = {}  # content_hash -> result dict (without trace_id/question)
     total = len(samples)
 
@@ -164,8 +188,8 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
             yield result
             continue
 
-        # 实际调用 LLM
-        result = judge_sample(sample, api_key, base_url, model, template, timeout=timeout)
+        # 实际调用 LLM（不传 template，由 build_judge_prompt 根据 sample 自动选择）
+        result = judge_sample(sample, api_key, base_url, model, timeout=timeout)
         # 缓存成功结果（不含 trace_id/question，因为这些是样本特定的）
         if "error" not in result:
             content_cache[ch] = {
@@ -218,10 +242,16 @@ def pre_screen(sample):
 
 
 def compute_metrics(results):
-    """Compute aggregate metrics from judge results."""
+    """Compute aggregate metrics from judge results.
+
+    返回值新增 with_ref_count / without_ref_count，用于 UI 区分评测模式。
+    """
     valid = [r for r in results if "error" not in r]
     total = len(results)
     errored = total - len(valid)
+
+    with_ref = [r for r in valid if r.get("has_reference")]
+    without_ref = [r for r in valid if not r.get("has_reference")]
 
     if not valid:
         return {
@@ -232,9 +262,17 @@ def compute_metrics(results):
             "top3_hit_rate": None,
             "top5_hit_rate": None,
             "answer_correct_rate": None,
+            "with_ref_count": 0,
+            "without_ref_count": 0,
+            "has_reference_data": False,
+            "with_ref_answer_rate": None,
+            "without_ref_answer_rate": None,
         }
 
     n = len(valid)
+    with_ref_n = len(with_ref)
+    without_ref_n = len(without_ref)
+
     return {
         "total": total,
         "evaluated": n,
@@ -243,4 +281,9 @@ def compute_metrics(results):
         "top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in valid) / n,
         "top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in valid) / n,
         "answer_correct_rate": sum(r.get("answer_correct", 0) for r in valid) / n,
+        "with_ref_count": with_ref_n,
+        "without_ref_count": without_ref_n,
+        "has_reference_data": with_ref_n > 0,
+        "with_ref_answer_rate": sum(r.get("answer_correct", 0) for r in with_ref) / with_ref_n if with_ref_n else None,
+        "without_ref_answer_rate": sum(r.get("answer_correct", 0) for r in without_ref) / without_ref_n if without_ref_n else None,
     }

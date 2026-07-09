@@ -89,7 +89,7 @@ def _map_retriever_resources(resources):
     return results
 
 
-def query_to_sample(question, dify_result, index, timestamp):
+def query_to_sample(question, dify_result, index, timestamp, reference_answer="", source_excerpt=""):
     """将单次提问结果转换为 parser.py 兼容的 sample 结构。
 
     Args:
@@ -97,11 +97,13 @@ def query_to_sample(question, dify_result, index, timestamp):
         dify_result: call_dify_query 的返回值
         index: 问题序号（从 0 开始）
         timestamp: 批次时间戳字符串
+        reference_answer: 参考答案（如有）
+        source_excerpt: 来源摘录（如有）
     """
     retrieval_results = _map_retriever_resources(dify_result.get("retriever_resources", []))
     retrieval_query = question  # Dify 不单独返回 retrieval_query，用原始问题代替
 
-    return {
+    sample = {
         "trace_id": f"batch_qa_{index}_{timestamp}",
         "trace_name": "batch_query",
         "session_id": dify_result.get("conversation_id"),
@@ -118,13 +120,20 @@ def query_to_sample(question, dify_result, index, timestamp):
         "final_answer": dify_result.get("answer", ""),
         "observations": [],
     }
+    if reference_answer:
+        sample["reference_answer"] = reference_answer
+    if source_excerpt:
+        sample["source_excerpt"] = source_excerpt
+    return sample
 
 
 def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
     """批量提问生成器。逐条调用 Dify API，yield 进度和结果。
 
     Args:
-        questions: 问题文本列表
+        questions: 问题列表。每项可以是：
+            - str: 纯问题文本
+            - dict: 包含 question、reference_answer、source_excerpt 等字段
         api_key: Dify API Key
         base_url: Dify API Base URL (e.g. http://localhost/v1)
         timeout: 单次请求超时秒数
@@ -142,8 +151,17 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
     total = len(questions)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for i, question in enumerate(questions):
-        question = question.strip()
+    for i, q in enumerate(questions):
+        # 支持 str 和 dict 两种输入格式
+        if isinstance(q, dict):
+            question = (q.get("question") or q.get("query") or "").strip()
+            reference_answer = q.get("reference_answer", "")
+            source_excerpt = q.get("source_excerpt", "")
+        else:
+            question = str(q).strip()
+            reference_answer = ""
+            source_excerpt = ""
+
         if not question:
             yield i, total, {
                 "success": False,
@@ -154,7 +172,11 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
 
         try:
             dify_result = call_dify_query(question, api_key, base_url, timeout=timeout)
-            sample = query_to_sample(question, dify_result, i, timestamp)
+            sample = query_to_sample(
+                question, dify_result, i, timestamp,
+                reference_answer=reference_answer,
+                source_excerpt=source_excerpt,
+            )
             yield i, total, {
                 "success": True,
                 "question": question,
