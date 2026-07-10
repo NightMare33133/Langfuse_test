@@ -156,6 +156,27 @@ def build_markdown_report(results: list) -> str:
     return "\n".join(lines)
 
 
+def _compute_subset_metrics(results, has_ref_filter):
+    """计算指定子集的指标。has_ref_filter: True=仅有参考答案, False=仅无参考答案, None=全部。
+
+    与 compute_metrics() 口径一致：has_reference 缺失时视为 False（无参考答案）。
+    """
+    if has_ref_filter is None:
+        subset = [r for r in results if "error" not in r]
+    else:
+        subset = [r for r in results if "error" not in r and bool(r.get("has_reference")) == has_ref_filter]
+    n = len(subset)
+    if n == 0:
+        return None
+    return {
+        "count": n,
+        "top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in subset) / n,
+        "top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in subset) / n,
+        "top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in subset) / n,
+        "answer_correct_rate": sum(r.get("answer_correct", 0) for r in subset) / n,
+    }
+
+
 st.set_page_config(page_title="Langfuse RAG 评测工具", layout="wide")
 st.title("Langfuse RAG 评测工具")
 
@@ -1386,7 +1407,7 @@ Judge 有三层减少重复调用的机制：
             scope_col1, scope_col2 = st.columns(2)
             with scope_col1:
                 debug_limit = st.checkbox(
-                    "只评前 1 条（快速测试）", value=True, key="debug_limit",
+                    "只评前 1 条（快速测试）", value=False, key="debug_limit",
                     help="勾选后「评测样本数」不生效，仅评测第 1 条样本"
                 )
                 if debug_limit:
@@ -1394,7 +1415,7 @@ Judge 有三层减少重复调用的机制：
                 else:
                     max_samples = st.number_input(
                         "评测样本数", min_value=1, max_value=max(total_available, 1),
-                        value=min(10, total_available), key="max_samples",
+                        value=total_available, key="max_samples",
                     )
                     st.caption(f"从样本准备前 {total_available} 条中按顺序取前 {max_samples} 条作为候选")
             with scope_col2:
@@ -1523,6 +1544,44 @@ Judge 有三层减少重复调用的机制：
                             st.caption(f"  ✅ {_idx+1}. `{_q}` — 新样本，将评测 [{_mode_tag}]")
 
             st.markdown("---")
+
+            # === Prompt 示例（独立可查看） ===
+            with st.expander("Prompt 示例（点击展开）", expanded=False):
+                # 判断当前候选样本是否混合模式
+                _cand_has_ref = sum(1 for s in _preview_candidates if (s.get("reference_answer") or "").strip())
+                _prompt_is_mixed = _cand_has_ref > 0 and _cand_has_ref < len(_preview_candidates)
+
+                # 从候选样本中挑出严格/合理性各一条
+                _sample_strict = next((s for s in _preview_candidates if (s.get("reference_answer") or "").strip()), None)
+                _sample_reasonable = next((s for s in _preview_candidates if not (s.get("reference_answer") or "").strip()), None)
+
+                def _show_prompt_for_sample(sample, mode_label):
+                    """展示单条样本的 prompt 示例。"""
+                    if not sample:
+                        st.info(f"当前候选样本中无{mode_label}样本")
+                        return
+                    _q = (sample.get("question") or "(无问题)")[:60]
+                    st.markdown(f"**示例样本**：`{_q}` — {mode_label}")
+                    prompt = build_judge_prompt(sample)
+                    st.code(prompt, language=None)
+                    st.caption(f"prompt 长度：{len(prompt)} 字符")
+
+                if _prompt_is_mixed:
+                    ptab_strict, ptab_reasonable = st.tabs([
+                        f"严格评测 Prompt（含参考答案）",
+                        f"合理性评测 Prompt（无参考答案）",
+                    ])
+                    with ptab_strict:
+                        _show_prompt_for_sample(_sample_strict, "严格评测")
+                    with ptab_reasonable:
+                        _show_prompt_for_sample(_sample_reasonable, "合理性评测")
+                else:
+                    # 纯模式：直接展示
+                    _any_sample = _preview_candidates[0] if _preview_candidates else None
+                    if _cand_has_ref > 0:
+                        _show_prompt_for_sample(_any_sample, "严格评测")
+                    else:
+                        _show_prompt_for_sample(_any_sample, "合理性评测")
 
             # === 第三层：执行动作 ===
             # 计算重试按钮上下文
@@ -1894,6 +1953,9 @@ Judge 有三层减少重复调用的机制：
 
         judge_results = st.session_state.get("judge_results") or []
 
+        # 构建 trace_id -> sample 的查找表，用于结果详情展示原始数据
+        _sample_map = {s.get("trace_id"): s for s in (samples or []) if s.get("trace_id")}
+
         if not judge_results:
             st.info("请在上方配置 API 后点击「运行 Judge 评测」")
         else:
@@ -1935,6 +1997,10 @@ Judge 有三层减少重复调用的机制：
             without_ref = metrics.get("without_ref_count", 0)
             is_mixed = with_ref > 0 and without_ref > 0
 
+            # 计算分组指标
+            _strict_metrics = _compute_subset_metrics(judge_results, True)
+            _reasonable_metrics = _compute_subset_metrics(judge_results, False)
+
             # 概览
             ov1, ov2, ov3 = st.columns(3)
             ov1.metric("总样本数", metrics["total"])
@@ -1946,173 +2012,229 @@ Judge 有三层减少重复调用的机制：
                 st.warning(
                     f"**混合模式**：严格评测 **{with_ref}** 条 + 合理性评测 **{without_ref}** 条。"
                     f"严格评测的 Answer OK = 与参考答案对比；合理性评测的 Answer OK = 基于检索内容判断。"
-                    f"两者口径不同，总正确率需谨慎解读。"
+                    f"两者口径不同，下方可分别查看。"
                 )
             elif with_ref > 0:
-                st.success(f"**纯严格评测**：全部 **{with_ref}** 条均有参考答案，Answer OK = 与参考答案对比的正确性")
+                st.success(f"**纯严格评测**：全部 **{with_ref}** 条均有参考答案")
             else:
-                st.info(f"**纯合理性评测**：全部 **{without_ref}** 条均无参考答案，Answer OK = 基于检索内容判断的合理性")
+                st.info(f"**纯合理性评测**：全部 **{without_ref}** 条均无参考答案")
 
-            # RAG 检索 vs LLM 回答 — 分两列展示
-            st.markdown("")
-            metric_col1, metric_col2 = st.columns(2)
+            # ---------- 指标视图：tabs 或单视图 ----------
+            def _render_metric_view(m, label, description):
+                """渲染一组指标卡片。"""
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Top1 Hit", f"{m['top1_hit_rate']:.0%}")
+                mc2.metric("Top3 Hit", f"{m['top3_hit_rate']:.0%}")
+                mc3.metric("Top5 Hit", f"{m['top5_hit_rate']:.0%}")
+                mc4.metric("Answer OK", f"{m['answer_correct_rate']:.0%}")
+                st.caption(description)
 
-            with metric_col1:
-                st.markdown("**RAG 检索质量** — 检索结果是否召回了正确内容")
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric(
-                    "Top1 Hit",
-                    f"{metrics['top1_hit_rate']:.0%}" if metrics["top1_hit_rate"] is not None else "N/A",
-                    help="第 1 条检索结果是否命中正确答案（所有样本统一标准）",
-                )
-                mc2.metric(
-                    "Top3 Hit",
-                    f"{metrics['top3_hit_rate']:.0%}" if metrics["top3_hit_rate"] is not None else "N/A",
-                    help="前 3 条检索结果中是否包含正确答案（所有样本统一标准）",
-                )
-                mc3.metric(
-                    "Top5 Hit",
-                    f"{metrics['top5_hit_rate']:.0%}" if metrics["top5_hit_rate"] is not None else "N/A",
-                    help="前 5 条检索结果中是否包含正确答案（所有样本统一标准）",
-                )
+            # ---------- 视图切换 + 下游内容（用 tabs 实现） ----------
+            def _render_judge_view(view_valid, view_all, metrics_subset, metrics_desc, view_label=""):
+                """渲染一个视图下的全部内容：指标、图表、诊断、详情。"""
+                # 指标卡片
+                _render_metric_view(metrics_subset, view_label, metrics_desc)
 
-            with metric_col2:
-                st.markdown("**LLM 回答质量** — 含义因评测模式而异")
-                mc4, mc5 = st.columns([1, 2])
+                if metrics["errors"] > 0:
+                    st.warning(f"有 {metrics['errors']} 条评测出错")
 
-                if is_mixed:
-                    # 混合模式：显示总正确率 + 分模式正确率
-                    mc4.metric(
-                        "Answer OK（总）",
-                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
-                        help="混合口径：包含严格评测和合理性评测两类结果，不应直接与纯严格评测对比",
-                    )
-                    ref_rate = metrics.get("with_ref_answer_rate")
-                    noref_rate = metrics.get("without_ref_answer_rate")
-                    rate_parts = []
-                    if ref_rate is not None:
-                        rate_parts.append(f"严格（有参考答案）: **{ref_rate:.0%}**")
-                    if noref_rate is not None:
-                        rate_parts.append(f"合理性（无参考答案）: **{noref_rate:.0%}**")
-                    if rate_parts:
-                        mc5.caption("｜".join(rate_parts))
-                    mc5.caption("严格评测：回答是否与参考答案一致 ｜ 合理性评测：回答是否基于检索内容合理")
-                elif with_ref > 0:
-                    mc4.metric(
-                        "Answer OK",
-                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
-                        help="严格口径：回答是否与参考答案一致、覆盖关键要点",
-                    )
-                else:
-                    mc4.metric(
-                        "Answer OK",
-                        f"{metrics['answer_correct_rate']:.0%}" if metrics["answer_correct_rate"] is not None else "N/A",
-                        help="合理性口径：回答是否基于检索内容看起来合理、完整（非标准答案对比）",
-                    )
+                # 可视化图表
+                st.subheader("可视化")
+                chart_col1, chart_col2 = st.columns(2)
 
-                # 对角关系提示
-                if valid_results:
-                    retrieval_hit_but_answer_wrong = sum(
-                        1 for r in valid_results
-                        if r.get("retrieval_top1_hit") and not r.get("answer_correct")
-                    )
-                    retrieval_miss = sum(
-                        1 for r in valid_results
-                        if not r.get("retrieval_top1_hit")
-                    )
-                    if retrieval_hit_but_answer_wrong > 0:
-                        mc5.caption(f"检索命中但回答错误: {retrieval_hit_but_answer_wrong} 条（更可能是回答生成问题）")
-                    if retrieval_miss > 0:
-                        mc5.caption(f"检索未命中: {retrieval_miss} 条（更可能是检索链路问题）")
+                with chart_col1:
+                    st.markdown("**RAG 检索命中率 & LLM 回答正确率**")
+                    st.plotly_chart(build_eval_bar_chart(
+                        _compute_subset_metrics(view_all, None) or metrics_subset
+                    ), use_container_width=True)
 
-            if metrics["errors"] > 0:
-                st.warning(f"有 {metrics['errors']} 条评测出错")
+                with chart_col2:
+                    st.markdown("**LLM 回答：正确 vs 错误**")
+                    if view_valid:
+                        st.plotly_chart(build_answer_pye(view_valid), use_container_width=True)
+                    else:
+                        st.info("无有效评测数据")
 
-            # ---------- 可视化图表 ----------
-            st.subheader("可视化")
-            chart_col1, chart_col2 = st.columns(2)
-
-            with chart_col1:
-                st.markdown("**RAG 检索命中率 & LLM 回答正确率**")
-                st.plotly_chart(build_eval_bar_chart(metrics), use_container_width=True)
-
-            with chart_col2:
-                st.markdown("**LLM 回答：正确 vs 错误**")
-                if valid_results:
-                    st.plotly_chart(build_answer_pye(valid_results), use_container_width=True)
+                st.markdown("**每题检索命中情况**")
+                pq_fig = build_per_question_chart(view_valid) if view_valid else None
+                if pq_fig:
+                    st.plotly_chart(pq_fig, use_container_width=True)
                 else:
                     st.info("无有效评测数据")
 
-            st.markdown("**每题检索命中情况**")
-            pq_fig = build_per_question_chart(valid_results) if valid_results else None
-            if pq_fig:
-                st.plotly_chart(pq_fig, use_container_width=True)
-            else:
-                st.info("无有效评测数据")
+                # Top1 未命中案例
+                top1_miss = [r for r in view_valid if not r.get("retrieval_top1_hit")]
+                if top1_miss:
+                    st.subheader(f"RAG 检索：Top1 未命中案例 ({len(top1_miss)} 条)")
+                    st.caption("以下问题 Top1 未命中 — 说明检索链路可能存在问题（如召回策略、向量相似度、关键词匹配等）")
+                    for r in top1_miss:
+                        _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
+                        _tid = r.get("trace_id", "")
+                        _sample = _sample_map.get(_tid, {})
+                        with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
+                            st.markdown(f"**问题**: {r.get('question', '')}")
+                            t3 = "✓" if r.get("retrieval_top3_hit") else "✗"
+                            t5 = "✓" if r.get("retrieval_top5_hit") else "✗"
+                            ans = "✓" if r.get("answer_correct") else "✗"
+                            st.markdown(f"**检索命中**: Top1 ✗ | Top3 {t3} | Top5 {t5}　　**回答正确**: {ans}")
+                            _final = _sample.get("final_answer") or "(无)"
+                            st.markdown("**最终回答**")
+                            st.code(_final[:1000], language=None)
+                            if r.get("has_reference"):
+                                _ref = (_sample.get("reference_answer") or "").strip()
+                                if _ref:
+                                    st.markdown("**参考答案**")
+                                    st.code(_ref[:1000], language=None)
+                            st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
+                            if r.get("retrieval_top3_hit") and not r.get("retrieval_top1_hit"):
+                                st.caption("Top1 未命中但 Top3 命中 — 排序可能有问题，正确结果未排到第一位")
+                            elif not r.get("retrieval_top5_hit"):
+                                st.caption("Top5 也未命中 — 检索完全未召回正确内容，需检查检索策略")
+                            if r.get("answer_correct"):
+                                st.caption("虽然检索未命中 Top1，但 LLM 仍给出了正确回答 — 可能靠其他上下文推断")
+                            st.caption(f"trace_id: `{_tid}`")
 
-            # ---------- Top1 未命中案例（检索维度诊断） ----------
-            top1_miss = [r for r in valid_results if not r.get("retrieval_top1_hit")]
-            if top1_miss:
-                st.subheader(f"RAG 检索：Top1 未命中案例 ({len(top1_miss)} 条)")
-                st.caption("以下问题 Top1 未命中 — 说明检索链路可能存在问题（如召回策略、向量相似度、关键词匹配等）")
-                for r in top1_miss:
-                    _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
-                    with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
-                        st.markdown(f"**问题**: {r.get('question', '')}")
-                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-                        t3 = "✓" if r.get("retrieval_top3_hit") else "✗"
-                        t5 = "✓" if r.get("retrieval_top5_hit") else "✗"
-                        ans = "✓" if r.get("answer_correct") else "✗"
-                        st.markdown(f"**检索**: Top3 {t3} | Top5 {t5}　　**回答**: {ans}　　**评测模式**: {_mode_tag}")
-                        # 诊断提示
-                        if r.get("retrieval_top3_hit") and not r.get("retrieval_top1_hit"):
-                            st.caption("Top1 未命中但 Top3 命中 — 排序可能有问题，正确结果未排到第一位")
-                        elif not r.get("retrieval_top5_hit"):
-                            st.caption("Top5 也未命中 — 检索完全未召回正确内容，需检查检索策略")
-                        if r.get("answer_correct"):
-                            st.caption("虽然检索未命中 Top1，但 LLM 仍给出了正确回答 — 可能靠其他上下文推断")
-                        st.markdown(f"**trace_id**: `{r.get('trace_id', '')}`")
+                # 回答错误但检索命中
+                answer_wrong = [r for r in view_valid if r.get("retrieval_top1_hit") and not r.get("answer_correct")]
+                if answer_wrong:
+                    st.subheader(f"LLM 回答：检索命中但回答错误 ({len(answer_wrong)} 条)")
+                    st.caption("以下问题检索已命中正确内容，但 LLM 未给出正确回答 — 说明回答生成环节可能存在问题")
+                    for r in answer_wrong:
+                        _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
+                        _tid = r.get("trace_id", "")
+                        _sample = _sample_map.get(_tid, {})
+                        with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
+                            st.markdown(f"**问题**: {r.get('question', '')}")
+                            _final = _sample.get("final_answer") or "(无)"
+                            st.markdown("**最终回答**")
+                            st.code(_final[:1000], language=None)
+                            if r.get("has_reference"):
+                                _ref = (_sample.get("reference_answer") or "").strip()
+                                if _ref:
+                                    st.markdown("**参考答案**")
+                                    st.code(_ref[:1000], language=None)
+                                    st.caption("回答与参考答案不一致或遗漏关键点 — 需检查回答生成是否覆盖了参考答案的核心内容")
+                            else:
+                                st.caption("合理性评测：检索已命中，但 LLM 判断回答不合理 — 可能原因：回答生成模型能力不足、prompt 设计问题、或检索结果干扰")
+                            st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
+                            st.caption(f"trace_id: `{_tid}`")
 
-            # ---------- 回答错误但检索命中的案例（回答维度诊断） ----------
-            answer_wrong_but_retrieval_hit = [
-                r for r in valid_results
-                if r.get("retrieval_top1_hit") and not r.get("answer_correct")
-            ]
-            if answer_wrong_but_retrieval_hit:
-                st.subheader(f"LLM 回答：检索命中但回答错误 ({len(answer_wrong_but_retrieval_hit)} 条)")
-                st.caption("以下问题检索已命中正确内容，但 LLM 未给出正确回答 — 说明回答生成环节可能存在问题")
-                for r in answer_wrong_but_retrieval_hit:
-                    _mode_tag = "参考答案" if r.get("has_reference") else "LLM判断"
-                    with st.expander(f"**{r.get('question', '(无问题)')[:60]}** [{_mode_tag}]"):
-                        st.markdown(f"**问题**: {r.get('question', '')}")
-                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-                        if r.get("has_reference"):
-                            st.caption("参考答案评测：回答与参考答案不一致或遗漏关键点 — 需检查回答生成是否覆盖了参考答案的核心内容")
+                # 评测详情卡
+                st.subheader("评测详情")
+                if not view_all:
+                    st.info("当前视图下无评测样本")
+                for _idx, r in enumerate(view_all):
+                    _tid = r.get("trace_id", "")
+                    _sample = _sample_map.get(_tid, {})
+                    _q = r.get("question", "(无问题)")
+                    _has_ref = r.get("has_reference", False)
+                    _mtag = "严格" if _has_ref else "合理性"
+                    _ans_ok = r.get("answer_correct")
+                    _t1 = r.get("retrieval_top1_hit")
+                    _t3 = r.get("retrieval_top3_hit")
+                    _t5 = r.get("retrieval_top5_hit")
+                    _status = "✅" if _ans_ok else "❌"
+                    _rs = f"T1:{'✓' if _t1 else '✗'} T3:{'✓' if _t3 else '✗'} T5:{'✓' if _t5 else '✗'}"
+
+                    with st.expander(f"{_status} {_q[:55]}{'...' if len(_q) > 55 else ''}  [{_mtag}] {_rs}"):
+                        st.markdown(f"**检索命中**: Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
+                        if _t1:
+                            st.caption("Top1 检索结果包含回答问题所需的关键信息")
+                        elif _t3:
+                            st.caption("Top1 未命中，但 Top3 内命中 — 正确结果排在第 2~3 位，排序可能有优化空间")
+                        elif _t5:
+                            st.caption("Top3 未命中，但 Top5 内命中 — 正确结果排在第 4~5 位，召回但排序较差")
                         else:
-                            st.caption("合理性评测：检索已命中，但 LLM 判断回答不合理 — 可能原因：回答生成模型能力不足、prompt 设计问题、或检索结果干扰")
-                        st.markdown(f"**trace_id**: `{r.get('trace_id', '')}`")
+                            st.caption("Top5 全未命中 — 检索未召回正确内容，需检查检索策略")
+                        st.markdown("---")
+                        _final = _sample.get("final_answer") or "(无)"
+                        st.markdown("**最终回答**")
+                        st.code(_final[:1500], language=None)
+                        if _has_ref:
+                            _ref = (_sample.get("reference_answer") or "").strip()
+                            if _ref:
+                                st.markdown("**参考答案**")
+                                st.code(_ref[:1500], language=None)
+                            _excerpt = (_sample.get("source_excerpt") or "").strip()
+                            if _excerpt:
+                                with st.expander("来源摘录"):
+                                    st.text(_excerpt[:1000])
+                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
+                        st.caption(f"trace_id: `{_tid}` | 评测模式: {_mtag}评测 | answer_correct: {_ans_ok}")
 
-            # ---------- 评测详情表格 ----------
-            st.subheader("评测详情表格")
-            table_rows = []
-            for r in judge_results:
-                table_rows.append({
-                    "question": r.get("question", ""),
-                    "评测模式": "参考答案" if r.get("has_reference") else "LLM判断",
-                    "retrieval_top1_hit": r.get("retrieval_top1_hit"),
-                    "retrieval_top3_hit": r.get("retrieval_top3_hit"),
-                    "retrieval_top5_hit": r.get("retrieval_top5_hit"),
-                    "answer_correct": r.get("answer_correct"),
-                    "reason": r.get("reason", ""),
-                    "trace_id": r.get("trace_id", ""),
-                    "error": r.get("error", ""),
-                })
-            df_results = pd.DataFrame(table_rows)
-            st.dataframe(
-                df_results,
-                use_container_width=True,
-                height=min(400, len(df_results) * 40 + 60),
-            )
+            # ---------- 根据视图过滤数据 ----------
+            def _filter_by_view(results, mode):
+                if mode == "mixed":
+                    return results
+                elif mode == "strict":
+                    return [r for r in results if bool(r.get("has_reference"))]
+                else:
+                    return [r for r in results if not bool(r.get("has_reference"))]
+
+            # ---------- 混合模式用 tabs，纯模式直接渲染 ----------
+            _mixed_metrics = {
+                "top1_hit_rate": metrics["top1_hit_rate"],
+                "top3_hit_rate": metrics["top3_hit_rate"],
+                "top5_hit_rate": metrics["top5_hit_rate"],
+                "answer_correct_rate": metrics["answer_correct_rate"],
+            }
+
+            if is_mixed:
+                tab_all, tab_strict, tab_reasonable = st.tabs([
+                    f"混合总览（{metrics['evaluated']} 条）",
+                    f"严格评测（{with_ref} 条）",
+                    f"合理性评测（{without_ref} 条）",
+                ])
+
+                with tab_all:
+                    _render_judge_view(
+                        valid_results, judge_results,
+                        _mixed_metrics,
+                        "混合口径：Top1~Top5 为统一标准，Answer OK 包含两种评测模式的结果，需谨慎解读",
+                        "混合总览",
+                    )
+
+                with tab_strict:
+                    _sv = _filter_by_view(valid_results, "strict")
+                    _sa = _filter_by_view(judge_results, "strict")
+                    if _strict_metrics:
+                        _render_judge_view(
+                            _sv, _sa,
+                            _strict_metrics,
+                            "严格口径：Answer OK = 回答是否与参考答案一致、覆盖关键要点",
+                            "严格评测",
+                        )
+                    else:
+                        st.info("无严格评测样本")
+
+                with tab_reasonable:
+                    _rv = _filter_by_view(valid_results, "reasonable")
+                    _ra = _filter_by_view(judge_results, "reasonable")
+                    if _reasonable_metrics:
+                        _render_judge_view(
+                            _rv, _ra,
+                            _reasonable_metrics,
+                            "合理性口径：Answer OK = 回答是否基于检索内容看起来合理、完整",
+                            "合理性评测",
+                        )
+                    else:
+                        st.info("无合理性评测样本")
+            else:
+                # 纯模式：不需要 tab 切换
+                if with_ref > 0:
+                    _render_judge_view(
+                        valid_results, judge_results,
+                        _mixed_metrics,
+                        "严格口径：Answer OK = 回答是否与参考答案一致、覆盖关键要点",
+                        "纯严格评测",
+                    )
+                else:
+                    _render_judge_view(
+                        valid_results, judge_results,
+                        _mixed_metrics,
+                        "合理性口径：Answer OK = 回答是否基于检索内容看起来合理、完整",
+                        "纯合理性评测",
+                    )
 
             # ---------- 导出按钮 ----------
             st.subheader("导出")
