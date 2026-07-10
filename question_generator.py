@@ -249,9 +249,12 @@ def chunk_document(content, max_chars=MAX_CHUNK_CHARS, max_chunks=MAX_CHUNKS):
 def allocate_questions(chunks, total_questions):
     """Allocate question count to each chunk proportionally to char_count.
 
-    - Every chunk gets at least 1 question
-    - Longer chunks get more
-    - Total sums to exactly total_questions
+    Uses the "largest remainder" method for fair distribution:
+      1. Calculate raw proportional share for each chunk
+      2. Floor each value (minimum 1)
+      3. Distribute remaining questions to chunks with the largest fractional remainders
+
+    This ensures smaller chunks don't get disproportionately many questions.
     """
     if not chunks:
         return []
@@ -262,33 +265,39 @@ def allocate_questions(chunks, total_questions):
         allocation = [1] * total_questions + [0] * (n - total_questions)
         return allocation
 
-    # Proportional allocation with minimum 1
     total_chars = sum(c["char_count"] for c in chunks)
     if total_chars == 0:
-        return [max(1, total_questions // n)] * n
+        base = max(1, total_questions // n)
+        return [base] * n
 
+    # Raw proportional share
     raw = [(c["char_count"] / total_chars) * total_questions for c in chunks]
+
+    # Floor with minimum 1
     allocation = [max(1, int(r)) for r in raw]
 
-    # Adjust to match total_questions
+    # Distribute remaining by largest remainder
     diff = total_questions - sum(allocation)
     if diff > 0:
-        # Need more — add to largest chunks
-        order = sorted(range(n), key=lambda i: chunks[i]["char_count"], reverse=True)
-        for i in order:
-            if diff <= 0:
-                break
-            allocation[i] += 1
-            diff -= 1
+        remainders = [(r - int(r), i) for i, r in enumerate(raw)]
+        remainders.sort(key=lambda x: x[0], reverse=True)
+        for j in range(diff):
+            allocation[remainders[j][1]] += 1
     elif diff < 0:
-        # Need fewer — remove from chunks with >1
-        order = sorted(range(n), key=lambda i: chunks[i]["char_count"])
-        for i in order:
-            if diff >= 0:
-                break
-            if allocation[i] > 1:
-                allocation[i] -= 1
-                diff += 1
+        # Over-allocated — remove from chunks with smallest remainder (and >1)
+        remainders = [(r - int(r), i) for i, r in enumerate(raw)]
+        remainders.sort(key=lambda x: x[0])
+        for j in range(-diff):
+            idx = remainders[j][1]
+            if allocation[idx] > 1:
+                allocation[idx] -= 1
+            else:
+                # Find next chunk with >1
+                for k in range(j + 1, len(remainders)):
+                    alt = remainders[k][1]
+                    if allocation[alt] > 1:
+                        allocation[alt] -= 1
+                        break
 
     return allocation
 
@@ -323,11 +332,18 @@ def build_qgen_prompt(content, num_questions=5, difficulty="混合", topic_hint=
         if chunk_context:
             section_context += f"\n文档整体结构：{chunk_context}"
 
+    # 根据当前 chunk 分配到的题目数，动态调整出题要求
+    if num_questions <= 1:
+        coverage_instruction = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
+    else:
+        coverage_instruction = f"- 当前片段需生成 {num_questions} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
+
     prompt = template.replace("{content}", content)
     prompt = prompt.replace("{num_questions}", str(num_questions))
     prompt = prompt.replace("{difficulty}", difficulty)
     prompt = prompt.replace("{topic_hint_section}", topic_hint_section)
     prompt = prompt.replace("{section_context}", section_context)
+    prompt = prompt.replace("{coverage_instruction}", coverage_instruction)
     return prompt
 
 

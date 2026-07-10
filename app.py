@@ -408,6 +408,123 @@ with tab_qgen:
                 acol3.metric("判定结果", STRATEGY_LABELS[predicted])
                 st.caption(f"判断依据：{reason}")
 
+        # --- Prompt 示例 ---
+        with st.expander("Prompt 示例（点击展开）", expanded=False):
+            from question_generator import (
+                load_qgen_prompt_template, chunk_document, allocate_questions,
+                choose_strategy, _BALANCED_MAX_CHARS, _BALANCED_MAX_CHUNKS,
+                MAX_CHUNK_CHARS, MAX_CHUNKS, _FAST_MAX_CHARS,
+            )
+            _qgen_template = load_qgen_prompt_template()
+
+            # 构造示例参数
+            _difficulty_map = {"混合": "混合", "基础概念题": "基础", "理解题": "理解", "综合题": "综合"}
+            _qgen_diff_val = _difficulty_map.get(qgen_difficulty, "混合")
+
+            _topic_hint_section = ""
+            if qgen_topic_hint:
+                _topic_hint_section = f"- 主题方向：{qgen_topic_hint}"
+
+            # --- 运行机制说明 ---
+            st.markdown("""
+**题目生成的真实运行流程：**
+
+1. **切分文档** — 将整篇知识库文件按章节/段落切分为多个 chunk
+2. **分配题目数** — 将总题目数按 chunk 长度比例分配（每个 chunk 至少 1 题）
+3. **逐 chunk 调用 LLM** — 每个 chunk 单独调用一次 LLM 生成其分配到的题目
+4. **去重汇总** — 去除重复题目，按多样性裁剪到目标数量
+
+因此，"题目数量 10"是整篇文档的总目标，不是单个 chunk 要出 10 道。
+""")
+
+            # --- chunk 分配预览 ---
+            if qgen_uploaded is not None:
+                strategy_map = {"自动": "auto", "极速": "fast", "标准": "balanced", "深度": "deep"}
+                _strategy_val = strategy_map.get(qgen_strategy, "auto")
+
+                # 根据策略选择切分参数
+                if _strategy_val == "auto":
+                    _predicted = choose_strategy(file_content)
+                    _strategy_val = _predicted
+                    _strategy_name = f"自动 → {STRATEGY_LABELS[_predicted]}"
+                else:
+                    _strategy_name = qgen_strategy
+
+                if _strategy_val == "fast":
+                    _chunks = []  # fast 模式不真正切分，只有 1 个 chunk
+                    _chunk_count = 1
+                    _alloc = [qgen_num]
+                elif _strategy_val == "balanced":
+                    _chunks = chunk_document(file_content, max_chars=_BALANCED_MAX_CHARS, max_chunks=_BALANCED_MAX_CHUNKS)
+                    _chunk_count = len(_chunks)
+                    _alloc = allocate_questions(_chunks, qgen_num)
+                else:  # deep
+                    _chunks = chunk_document(file_content, max_chars=MAX_CHUNK_CHARS, max_chunks=MAX_CHUNKS)
+                    _chunk_count = len(_chunks)
+                    _alloc = allocate_questions(_chunks, qgen_num)
+
+                st.markdown(f"**当前文档切分预览**（策略：{_strategy_name}）：")
+                _alloc_display = [f"chunk {i+1}: {n} 题" for i, n in enumerate(_alloc[:10])]
+                if len(_alloc) > 10:
+                    _alloc_display.append(f"...共 {_chunk_count} 个 chunk")
+                st.caption(" → ".join(_alloc_display))
+
+                # 展示前 3 个 chunk 的 prompt 示例
+                if _chunks:
+                    _preview_count = min(3, len(_chunks))
+                    st.markdown(f"**Prompt 示例**（前 {_preview_count} 个 chunk，与真实执行完全一致）：")
+                    for _pi in range(_preview_count):
+                        _pc = _chunks[_pi]
+                        _pa = _alloc[_pi]
+                        _pc_len = _pc["char_count"]
+                        _pc_context = f"\n当前章节：「{_pc['section_title']}」"
+                        with st.expander(
+                            f"chunk {_pi+1} — 「{_pc['section_title'][:30]}」"
+                            f"（{_pc_len:,} 字 | 分配 {_pa} 题）",
+                            expanded=(_pi == 0),
+                        ):
+                            _p = _qgen_template
+                            _p = _p.replace("{content}", _pc["text"])
+                            _p = _p.replace("{num_questions}", str(_pa))
+                            _p = _p.replace("{difficulty}", _qgen_diff_val)
+                            _p = _p.replace("{topic_hint_section}", _topic_hint_section)
+                            _p = _p.replace("{section_context}", _pc_context)
+                            if _pa <= 1:
+                                _cov = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
+                            else:
+                                _cov = f"- 当前片段需生成 {_pa} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
+                            _p = _p.replace("{coverage_instruction}", _cov)
+                            st.code(_p, language=None)
+                            st.caption(f"prompt 长度：{len(_p)} 字符（含 {_pc_len:,} 字 chunk 内容）")
+                    if len(_chunks) > 3:
+                        st.caption(f"...还有 {len(_chunks) - 3} 个 chunk，结构相同，每个 chunk 独立调用 LLM")
+                else:
+                    # fast 模式：单个 prompt
+                    st.markdown("**Prompt 示例**（极速模式，整个文档前部）：")
+                    _p = _qgen_template
+                    _p = _p.replace("{content}", file_content[:800] + ("..." if len(file_content) > 800 else ""))
+                    _p = _p.replace("{num_questions}", str(qgen_num))
+                    _p = _p.replace("{difficulty}", _qgen_diff_val)
+                    _p = _p.replace("{topic_hint_section}", _topic_hint_section)
+                    _p = _p.replace("{section_context}", "\n当前章节：「文档前部」")
+                    if qgen_num <= 1:
+                        _p = _p.replace("{coverage_instruction}", "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点")
+                    else:
+                        _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
+                    st.code(_p, language=None)
+                    st.caption(f"prompt 长度：{len(_p)} 字符")
+            else:
+                st.markdown("**Prompt 模板结构**（上传文件后将展示真实 chunk 分配）：")
+                _p = _qgen_template
+                _p = _p.replace("{content}", "（上传知识库文件后，此处将展示实际文档内容片段）")
+                _p = _p.replace("{num_questions}", str(qgen_num))
+                _p = _p.replace("{difficulty}", _qgen_diff_val)
+                _p = _p.replace("{topic_hint_section}", _topic_hint_section)
+                _p = _p.replace("{section_context}", "")
+                _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
+                st.code(_p, language=None)
+                st.caption(f"prompt 模板长度：{len(_p)} 字符")
+
         # --- Generate button ---
         if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
             if not qgen_api_key:
