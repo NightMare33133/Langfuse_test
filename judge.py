@@ -39,8 +39,64 @@ def load_prompt_template_with_ref():
     return PROMPT_TEMPLATE_WITH_REF_PATH.read_text(encoding="utf-8").strip()
 
 
-def build_judge_prompt(sample, template=None, max_content_chars=300):
-    """构建 Judge prompt。如果 sample 包含 reference_answer，自动使用含参考答案的模板。"""
+def _clean_content(text):
+    """清洗 content 中的结构噪音，保留对 Judge 有用的正文。
+
+    清洗内容：
+    1. <metadata>...</metadata> 块 — 结构化元数据 JSON，对判断 hit 无用
+    2. 上下文引用标记（previous_content / next_content 等残留）
+    """
+    if not text:
+        return text
+    # 去掉 <metadata>...</metadata> 块（含跨行）
+    text = re.sub(r"<metadata>\s*\{[\s\S]*?\}\s*</metadata>\s*", "", text)
+    # 去掉可能残留的空行堆积
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# 每条检索结果的正文字符上限
+# Top-1 对 hit 判断最关键，给更多空间；Top-2~5 适当缩减
+_CONTENT_LIMITS = {0: 2000, 1: 1200, 2: 1200, 3: 1000, 4: 1000}
+
+
+def _format_single_result(r, index, max_content_chars=None):
+    """格式化单条检索结果：先清洗噪音，再保留正文。"""
+    raw_content = r.get("content") or "(无内容)"
+    score = r.get("score")
+    pos = r.get("position")
+    doc_name = r.get("document_name") or ""
+
+    # 1. 清洗 content 中的 metadata 块
+    content = _clean_content(raw_content)
+
+    # 2. 确定本条的字符上限
+    limit = max_content_chars or _CONTENT_LIMITS.get(index, 1000)
+    if len(content) > limit:
+        content = content[:limit] + "...(截断)"
+
+    # 3. 来源标识：只用 document_name，不用 title（实测 title 几乎全为 null）
+    source_label = doc_name if doc_name else ""
+
+    # 4. 组装：标注行 + 正文
+    parts = []
+    pos_tag = f"[{pos}]" if pos is not None else ""
+    score_tag = f"(score: {score:.4f})" if score is not None else ""
+    tags = " ".join(filter(None, [pos_tag, source_label, score_tag]))
+    if tags:
+        parts.append(tags)
+    parts.append(content)
+    return "\n".join(parts)
+
+
+def build_judge_prompt(sample, template=None, max_content_chars=None):
+    """构建 Judge prompt。如果 sample 包含 reference_answer，自动使用含参考答案的模板。
+
+    Args:
+        sample: 样本数据字典
+        template: 自定义 prompt 模板（可选）
+        max_content_chars: 统一字符上限。为 None 时使用分层策略（Top-1: 2000, Top-2~5: 1000~1200）。
+    """
     has_ref = bool((sample.get("reference_answer") or "").strip())
 
     if template is not None:
@@ -52,19 +108,13 @@ def build_judge_prompt(sample, template=None, max_content_chars=300):
 
     retrieval_results = sample.get("retrieval_results") or []
     if retrieval_results:
-        lines = []
-        for r in retrieval_results:
-            title = r.get("title") or "(无标题)"
-            content = r.get("content") or "(无内容)"
-            score = r.get("score")
-            pos = r.get("position")
-            prefix = f"[位置{pos}]" if pos is not None else ""
-            score_str = f" (score: {score})" if score is not None else ""
-            # 裁剪过长的正文
-            if len(content) > max_content_chars:
-                content = content[:max_content_chars] + "..."
-            lines.append(f"{prefix}{title}{score_str}: {content}")
-        retrieval_text = "\n".join(lines)
+        formatted = []
+        for i, r in enumerate(retrieval_results):
+            formatted.append(
+                f"--- 检索结果 {i + 1} ---\n"
+                + _format_single_result(r, i, max_content_chars)
+            )
+        retrieval_text = "\n\n".join(formatted)
     else:
         retrieval_text = "(无检索结果)"
 

@@ -89,6 +89,43 @@ def _map_retriever_resources(resources):
     return results
 
 
+def normalize_questions(items):
+    """将各种格式的问题输入统一为 list[dict]。
+
+    每个 dict 至少包含 "question": str。
+    可选保留 reference_answer、source_excerpt、difficulty、topic 等元数据。
+
+    兼容输入：
+    - str: 纯问题文本
+    - dict: 包含 question / query 及可选元数据
+    - None / 空值: 过滤掉
+    """
+    normalized = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            q = (item.get("question") or item.get("query") or "").strip()
+            if not q:
+                continue
+            entry = {"question": q}
+            # 保留所有额外元数据
+            for key in ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id"):
+                val = item.get(key)
+                if val:
+                    entry[key] = val
+            normalized.append(entry)
+        elif isinstance(item, str):
+            q = item.strip()
+            if q:
+                normalized.append({"question": q})
+        else:
+            q = str(item).strip()
+            if q:
+                normalized.append({"question": q})
+    return normalized
+
+
 def query_to_sample(question, dify_result, index, timestamp, reference_answer="", source_excerpt=""):
     """将单次提问结果转换为 parser.py 兼容的 sample 结构。
 
@@ -130,10 +167,11 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
 def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
     """批量提问生成器。逐条调用 Dify API，yield 进度和结果。
 
+    输入契约：questions 为 list[dict]，每个 dict 至少包含 "question": str。
+    也向后兼容 list[str]，内部通过 normalize_questions() 统一处理。
+
     Args:
-        questions: 问题列表。每项可以是：
-            - str: 纯问题文本
-            - dict: 包含 question、reference_answer、source_excerpt 等字段
+        questions: 问题列表（list[dict] 或 list[str]）
         api_key: Dify API Key
         base_url: Dify API Base URL (e.g. http://localhost/v1)
         timeout: 单次请求超时秒数
@@ -148,27 +186,15 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
           - raw_response: dict (仅 success=True 时)
           - error: str (仅 success=False 时)
     """
-    total = len(questions)
+    # 入口统一标准化：保证后续逻辑只面对 list[dict]
+    items = normalize_questions(questions)
+    total = len(items)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for i, q in enumerate(questions):
-        # 支持 str 和 dict 两种输入格式
-        if isinstance(q, dict):
-            question = (q.get("question") or q.get("query") or "").strip()
-            reference_answer = q.get("reference_answer", "")
-            source_excerpt = q.get("source_excerpt", "")
-        else:
-            question = str(q).strip()
-            reference_answer = ""
-            source_excerpt = ""
-
-        if not question:
-            yield i, total, {
-                "success": False,
-                "question": question,
-                "error": "问题为空，已跳过",
-            }
-            continue
+    for i, item in enumerate(items):
+        question = item["question"]
+        reference_answer = item.get("reference_answer", "")
+        source_excerpt = item.get("source_excerpt", "")
 
         try:
             dify_result = call_dify_query(question, api_key, base_url, timeout=timeout)
