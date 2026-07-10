@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
-from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template
+from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref
 from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS
 from batch_query import run_batch_query, save_batch_results, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
@@ -893,6 +893,18 @@ with tab_samples:
                     st.session_state["samples"] = samples
                     st.session_state["summary"] = full_summary
                 st.success(f"解析完成，共 {len(samples)} 条 trace")
+                # 回填结果提示
+                bs = summary.get("backfill_stats") or {}
+                if bs:
+                    bf = bs.get("backfilled", 0)
+                    already = bs.get("already_has", 0)
+                    no_ref = bs["total"] - bf - already
+                    if bf > 0:
+                        st.success(f"参考答案回填：**{bf}** 条样本匹配到题目库，已回填 reference_answer")
+                    if already > 0:
+                        st.info(f"**{already}** 条样本本身已带参考答案")
+                    if no_ref > 0:
+                        st.warning(f"**{no_ref}** 条样本未匹配到题目库，将走无参考答案评测")
                 st.rerun()
 
     # --- Sample display section ---
@@ -966,6 +978,30 @@ with tab_samples:
                 st.markdown("**最终回答 (final_answer)**")
                 st.code(sample.get("final_answer") or "(无)", language=None)
 
+                # --- 参考答案与评测模式 ---
+                ref_answer = (sample.get("reference_answer") or "").strip()
+                source_excerpt = (sample.get("source_excerpt") or "").strip()
+                difficulty = sample.get("difficulty") or ""
+                topic = sample.get("topic") or ""
+
+                if ref_answer:
+                    st.markdown("**参考答案 (reference_answer)**")
+                    st.code(ref_answer, language=None)
+                    if source_excerpt:
+                        with st.expander("来源摘录 (source_excerpt)"):
+                            st.text(source_excerpt[:2000])
+                    # 题目元数据（如果有）
+                    _meta_parts = []
+                    if difficulty:
+                        _meta_parts.append(f"难度: {difficulty}")
+                    if topic:
+                        _meta_parts.append(f"主题: {topic}")
+                    if _meta_parts:
+                        st.caption(" | ".join(_meta_parts))
+                    st.success("评测模式：**严格评测**（有参考答案，将与参考答案对比评判）")
+                else:
+                    st.warning("评测模式：**无参考答案评测**（LLM 将基于问题和检索内容自行判断回答合理性）")
+
                 st.markdown("**元数据**")
                 st.json({
                     "trace_id": sample.get("trace_id"),
@@ -987,14 +1023,26 @@ with tab_judge:
         trace_count = summary.get("trace_count") or len(samples)
         retrieval_total = summary.get("total_retrieval_results")
         has_ref_count = sum(1 for s in samples if (s.get("reference_answer") or "").strip())
+        no_ref_count = trace_count - has_ref_count
 
         info_parts = [
             f"**来源文件**: `{src_name}`",
             f"**样本数**: {trace_count}",
             f"**检索结果总数**: {retrieval_total}" if retrieval_total else None,
-            f"**含参考答案**: {has_ref_count} 条" if has_ref_count else None,
         ]
         st.info(" | ".join(p for p in info_parts if p))
+
+        # 评测模式构成
+        if has_ref_count > 0 and no_ref_count > 0:
+            st.warning(
+                f"**混合评测模式**：{has_ref_count} 条严格评测（有参考答案）"
+                f" + {no_ref_count} 条合理性评测（无参考答案）。"
+                f"两者的 Answer OK 口径不同，指标需谨慎解读。"
+            )
+        elif has_ref_count > 0:
+            st.success(f"**纯严格评测**：全部 {has_ref_count} 条样本均带参考答案，Answer OK = 与参考答案对比的正确性")
+        elif no_ref_count > 0:
+            st.info(f"**纯合理性评测**：全部 {no_ref_count} 条样本无参考答案，Answer OK = 基于检索内容判断的合理性")
     else:
         st.caption("对解析后的样本进行自动评分")
 
@@ -1212,6 +1260,16 @@ Judge 有三层减少重复调用的机制：
             else:
                 st.markdown(f"**候选样本**：从当前样本（共 {total_available} 条）中取前 **{effective_count}** 条")
 
+            # 候选样本的评测模式构成
+            _cand_with_ref = sum(1 for s in _preview_candidates if (s.get("reference_answer") or "").strip())
+            _cand_no_ref = len(_preview_candidates) - _cand_with_ref
+            if _cand_with_ref > 0 and _cand_no_ref > 0:
+                st.caption(f"其中 {_cand_with_ref} 条走严格评测，{_cand_no_ref} 条走合理性评测")
+            elif _cand_with_ref > 0:
+                st.caption(f"全部 {_cand_with_ref} 条走严格评测（均有参考答案）")
+            elif _cand_no_ref > 0:
+                st.caption(f"全部 {_cand_no_ref} 条走合理性评测（均无参考答案）")
+
             # --- 下半部分：与历史结果的交叉分析 ---
             existing_success_count = sum(
                 1 for r in existing_results_map.values() if "error" not in r
@@ -1267,13 +1325,15 @@ Judge 有三层减少重复调用的机制：
                 else:
                     for _idx, _s in enumerate(_preview_candidates):
                         _q = (_s.get("question") or "(无问题)")[:60]
+                        _has_ref = bool((_s.get("reference_answer") or "").strip())
+                        _mode_tag = "严格" if _has_ref else "合理性"
                         _existing = existing_results_map.get(_s.get("trace_id"))
                         if _existing and "error" not in _existing and skip_existing and not force_rerun:
-                            st.caption(f"  ⏭️ {_idx+1}. `{_q}` — 历史成功，将跳过")
+                            st.caption(f"  ⏭️ {_idx+1}. `{_q}` — 历史成功，将跳过 [{_mode_tag}]")
                         elif _existing and "error" in _existing:
-                            st.caption(f"  🔄 {_idx+1}. `{_q}` — 历史失败，将重试")
+                            st.caption(f"  🔄 {_idx+1}. `{_q}` — 历史失败，将重试 [{_mode_tag}]")
                         else:
-                            st.caption(f"  ✅ {_idx+1}. `{_q}` — 新样本，将评测")
+                            st.caption(f"  ✅ {_idx+1}. `{_q}` — 新样本，将评测 [{_mode_tag}]")
 
             st.markdown("---")
 
@@ -1515,7 +1575,14 @@ Judge 有三层减少重复调用的机制：
 
             # ===== 需要 LLM 的样本 =====
             if need_llm:
-                st.markdown(f"#### 以下 {len(need_llm)} 条样本需要调用 LLM：")
+                _llm_with_ref = sum(1 for s in need_llm if (s.get("reference_answer") or "").strip())
+                _llm_no_ref = len(need_llm) - _llm_with_ref
+                _mode_desc = []
+                if _llm_with_ref:
+                    _mode_desc.append(f"{_llm_with_ref} 条严格评测")
+                if _llm_no_ref:
+                    _mode_desc.append(f"{_llm_no_ref} 条合理性评测")
+                st.markdown(f"#### 以下 {len(need_llm)} 条样本需要调用 LLM（{'，'.join(_mode_desc)}）：")
                 for s in need_llm[:5]:
                     q = (s.get("question") or "(无问题)")[:60]
                     retrieval_count = len(s.get("retrieval_results", []))
@@ -1527,16 +1594,55 @@ Judge 有三层减少重复调用的机制：
                 # prompt 长度预览
                 st.markdown("#### Prompt 长度预览")
                 sample_preview = need_llm[0]
-                template = load_prompt_template()
-                # 无裁剪版本（不清洗 metadata，不截断）
-                full_prompt = build_judge_prompt(sample_preview, template, max_content_chars=999999)
-                # 实际版本（清洗 metadata + 分层截断）
-                actual_prompt = build_judge_prompt(sample_preview, template)
-                save_chars = len(full_prompt) - len(actual_prompt)
-                pct = save_chars / len(full_prompt) * 100 if len(full_prompt) > 0 else 0
+                _has_ref = bool((sample_preview.get("reference_answer") or "").strip())
+
+                # 标注当前示例代表哪种评测模式
+                _q_preview = (sample_preview.get("question") or "(无问题)")[:50]
+                if _has_ref:
+                    st.caption(f"当前示例样本：`{_q_preview}` — **严格评测**（含参考答案，使用含参考答案模板）")
+                else:
+                    st.caption(f"当前示例样本：`{_q_preview}` — **合理性评测**（无参考答案，使用基础模板）")
+
+                # 选择与样本匹配的模板（和 build_judge_prompt 内部逻辑一致）
+                if _has_ref:
+                    template = load_prompt_template_with_ref()
+                else:
+                    template = load_prompt_template()
+
+                # 真正的原始版本：未清洗 metadata、未截断
+                _raw_results = sample_preview.get("retrieval_results") or []
+                if _raw_results:
+                    _raw_lines = []
+                    for _r in _raw_results:
+                        _t = _r.get("title") or ""
+                        _c = _r.get("content") or ""
+                        _s = _r.get("score")
+                        _p = _r.get("position")
+                        _prefix = f"[{_p}]" if _p is not None else ""
+                        _score = f" (score: {_s})" if _s is not None else ""
+                        _raw_lines.append(f"{_prefix}{_t}{_score}: {_c}")
+                    _raw_retrieval_text = "\n".join(_raw_lines)
+                else:
+                    _raw_retrieval_text = "(无检索结果)"
+                raw_prompt = template
+                raw_prompt = raw_prompt.replace("{question}", sample_preview.get("question") or "(无)")
+                raw_prompt = raw_prompt.replace("{retrieval_query}", sample_preview.get("retrieval_query") or "(无)")
+                raw_prompt = raw_prompt.replace("{retrieval_results}", _raw_retrieval_text)
+                raw_prompt = raw_prompt.replace("{final_answer}", sample_preview.get("final_answer") or "(无)")
+                if _has_ref:
+                    raw_prompt = raw_prompt.replace("{reference_answer}", sample_preview.get("reference_answer") or "(无)")
+                    raw_prompt = raw_prompt.replace("{source_excerpt}", sample_preview.get("source_excerpt") or "(无)")
+
+                # 实际版本：清洗 metadata + 分层截断（build_judge_prompt 内部会自动选模板）
+                actual_prompt = build_judge_prompt(sample_preview)
+
+                save_chars = len(raw_prompt) - len(actual_prompt)
+                pct = save_chars / len(raw_prompt) * 100 if len(raw_prompt) > 0 else 0
                 st.caption(
-                    f"原始 {len(full_prompt)} 字符 → 清洗+截断后 {len(actual_prompt)} 字符"
-                    f"（省 {pct:.0f}%），策略：去除 metadata 块 + Top-1 保留 2000 字 / Top-2~5 保留 1000~1200 字"
+                    f"原始 {len(raw_prompt)} 字符 → 清洗+截断后 {len(actual_prompt)} 字符"
+                    f"（省 {pct:.0f}%）。"
+                    f"策略：去除 metadata 块，分层保留正文 — "
+                    f"Top-1: 2000字，Top-2/3: 1200字，Top-4/5: 1000字"
                 )
                 with st.expander("查看处理后的 prompt 示例"):
                     st.code(actual_prompt, language=None)
@@ -1650,11 +1756,15 @@ Judge 有三层减少重复调用的机制：
 
             # 评测模式构成
             if is_mixed:
-                st.markdown(f"**评测模式构成**：严格评测 **{with_ref}** 条（有参考答案）｜ 合理性评测 **{without_ref}** 条（无参考答案）")
+                st.warning(
+                    f"**混合模式**：严格评测 **{with_ref}** 条 + 合理性评测 **{without_ref}** 条。"
+                    f"严格评测的 Answer OK = 与参考答案对比；合理性评测的 Answer OK = 基于检索内容判断。"
+                    f"两者口径不同，总正确率需谨慎解读。"
+                )
             elif with_ref > 0:
-                st.markdown(f"**评测模式**：全部 **{with_ref}** 条均为严格评测（有参考答案）")
+                st.success(f"**纯严格评测**：全部 **{with_ref}** 条均有参考答案，Answer OK = 与参考答案对比的正确性")
             else:
-                st.markdown(f"**评测模式**：全部 **{without_ref}** 条均为合理性评测（无参考答案）")
+                st.info(f"**纯合理性评测**：全部 **{without_ref}** 条均无参考答案，Answer OK = 基于检索内容判断的合理性")
 
             # RAG 检索 vs LLM 回答 — 分两列展示
             st.markdown("")

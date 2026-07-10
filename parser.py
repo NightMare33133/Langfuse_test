@@ -286,12 +286,112 @@ def load_jsonl(path):
 
 
 
+def load_question_index(questions_dir=None):
+    """从 data/questions/*.jsonl 加载题目索引，用于回填 reference_answer。
+
+    返回两个 dict：
+    - by_id:   {question_id: question_dict}
+    - by_text: {question_text: question_dict}  （精确匹配，取最新文件中的版本）
+
+    按文件名排序（时间戳在文件名中），后加载的覆盖先加载的，保证取最新。
+    """
+    from pathlib import Path as _Path
+    if questions_dir is None:
+        questions_dir = _Path(__file__).parent / "data" / "questions"
+    else:
+        questions_dir = _Path(questions_dir)
+
+    by_id = {}
+    by_text = {}
+
+    if not questions_dir.exists():
+        return by_id, by_text
+
+    for f in sorted(questions_dir.glob("*.jsonl")):
+        try:
+            with f.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        q = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    q_text = (q.get("question") or "").strip()
+                    if not q_text:
+                        continue
+                    # 按 question_id 索引
+                    qid = q.get("question_id")
+                    if qid:
+                        by_id[str(qid)] = q
+                    # 按 question 文本索引（后加载覆盖先加载）
+                    by_text[q_text] = q
+        except Exception:
+            continue
+
+    return by_id, by_text
+
+
+_BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id")
+
+
+def backfill_reference_answers(samples, questions_dir=None):
+    """尝试为样本回填 reference_answer 等题目元数据。
+
+    匹配规则：
+    1. 按 question_id 精确匹配（如果样本有 question_id）
+    2. 按 question 文本精确匹配
+
+    返回 (samples, stats)：
+    - samples: 原地修改后的样本列表
+    - stats: {"total": N, "backfilled": M, "already_has": K}
+    """
+    by_id, by_text = load_question_index(questions_dir)
+
+    if not by_id and not by_text:
+        return samples, {"total": len(samples), "backfilled": 0, "already_has": 0}
+
+    stats = {"total": len(samples), "backfilled": 0, "already_has": 0}
+
+    for s in samples:
+        # 已有 reference_answer 的跳过
+        if (s.get("reference_answer") or "").strip():
+            stats["already_has"] += 1
+            continue
+
+        matched_q = None
+
+        # 优先按 question_id 匹配
+        qid = s.get("question_id")
+        if qid and str(qid) in by_id:
+            matched_q = by_id[str(qid)]
+
+        # 其次按 question 文本精确匹配
+        if not matched_q:
+            q_text = (s.get("question") or "").strip()
+            if q_text and q_text in by_text:
+                matched_q = by_text[q_text]
+
+        if matched_q:
+            for field in _BACKFILL_FIELDS:
+                val = matched_q.get(field)
+                if val and not s.get(field):
+                    s[field] = val
+            stats["backfilled"] += 1
+
+    return samples, stats
+
+
 def parse_langfuse_jsonl(input_path):
     """Parse a Langfuse JSONL export file and return samples + summary."""
     input_path = Path(input_path)
     traces, bad_lines = load_jsonl(input_path)
     samples = [build_trace_sample(trace_id, obs) for trace_id, obs in traces.items()]
     samples.sort(key=lambda x: (x.get("question") or "", x["trace_id"]))
+
+    # 回填 reference_answer
+    samples, backfill_stats = backfill_reference_answers(samples)
 
     summary = {
         "input_file": str(input_path),
@@ -301,6 +401,7 @@ def parse_langfuse_jsonl(input_path):
         "total_retrieval_results": sum(
             len(s.get("retrieval_results", [])) for s in samples
         ),
+        "backfill_stats": backfill_stats,
     }
 
     return samples, summary
