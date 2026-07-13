@@ -333,7 +333,7 @@ def load_question_index(questions_dir=None):
     return by_id, by_text
 
 
-_BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id")
+_BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode")
 
 
 def backfill_reference_answers(samples, questions_dir=None):

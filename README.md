@@ -104,7 +104,7 @@ cp .env.example .env
 ### 1. 启动 Streamlit 应用
 
 ```bash
-streamlit run app.py
+ streamlit run app.py
 ```
 
 ### 2. 题目生成

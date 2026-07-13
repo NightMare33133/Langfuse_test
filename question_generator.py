@@ -24,7 +24,16 @@ import pandas as pd
 from judge import call_llm
 
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt.txt"
+RETRIEVAL_PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt_retrieval.txt"
 QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
+
+# 出题模式
+MODE_RETRIEVAL = "retrieval"  # 检索评测模式
+MODE_QA = "qa"                # 全流程问答评测模式
+MODE_LABELS = {
+    MODE_RETRIEVAL: "检索评测",
+    MODE_QA: "全流程问答评测",
+}
 
 # Chunking parameters
 MAX_CHUNK_CHARS = 3000   # Target max chars per chunk
@@ -304,12 +313,19 @@ def allocate_questions(chunks, total_questions):
 
 # ========== Prompt Building ==========
 
-def load_qgen_prompt_template():
+def load_qgen_prompt_template(mode=MODE_QA):
+    """Load prompt template based on mode.
+
+    Args:
+        mode: MODE_RETRIEVAL for retrieval testing, MODE_QA for full QA evaluation
+    """
+    if mode == MODE_RETRIEVAL:
+        return RETRIEVAL_PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
     return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
 
 
 def build_qgen_prompt(content, num_questions=5, difficulty="混合", topic_hint="",
-                      section_title=None, chunk_context=None):
+                      section_title=None, chunk_context=None, mode=MODE_QA):
     """Build prompt for a single chunk.
 
     Args:
@@ -319,8 +335,9 @@ def build_qgen_prompt(content, num_questions=5, difficulty="混合", topic_hint=
         topic_hint: Optional topic direction
         section_title: Name of the section this chunk belongs to
         chunk_context: Brief description of document structure for context
+        mode: MODE_RETRIEVAL for retrieval testing, MODE_QA for full QA evaluation
     """
-    template = load_qgen_prompt_template()
+    template = load_qgen_prompt_template(mode)
 
     topic_hint_section = ""
     if topic_hint:
@@ -333,10 +350,18 @@ def build_qgen_prompt(content, num_questions=5, difficulty="混合", topic_hint=
             section_context += f"\n文档整体结构：{chunk_context}"
 
     # 根据当前 chunk 分配到的题目数，动态调整出题要求
-    if num_questions <= 1:
-        coverage_instruction = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
+    if mode == MODE_RETRIEVAL:
+        # 检索模式：强调质量优先，允许减少数量
+        if num_questions <= 1:
+            coverage_instruction = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心的单跳检索题"
+        else:
+            coverage_instruction = f"- 当前片段目标生成 {num_questions} 道单跳检索题，如果适合的知识点不足，减少数量即可，不要凑数"
     else:
-        coverage_instruction = f"- 当前片段需生成 {num_questions} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
+        # 问答模式：正常覆盖
+        if num_questions <= 1:
+            coverage_instruction = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
+        else:
+            coverage_instruction = f"- 当前片段需生成 {num_questions} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
 
     prompt = template.replace("{content}", content)
     prompt = prompt.replace("{num_questions}", str(num_questions))
@@ -448,7 +473,8 @@ def choose_strategy(content):
 # ========== Per-Chunk Generation Helper (shared by all strategies) ==========
 
 def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
-                          api_key, base_url, model, timeout, progress_callback):
+                          api_key, base_url, model, timeout, progress_callback,
+                          mode=MODE_QA):
     """对已切分的 chunks 执行 allocate → per-chunk LLM call → dedup → 多样性裁剪。
 
     所有策略共用此函数，仅 chunks 的来源和参数不同。
@@ -478,6 +504,7 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
             topic_hint=topic_hint,
             section_title=chunk["section_title"],
             chunk_context=chunk_context,
+            mode=mode,
         )
 
         try:
@@ -486,6 +513,7 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
             for q in questions:
                 q["source_section"] = chunk["section_title"]
                 q["chunk_index"] = chunk["chunk_index"]
+                q["question_mode"] = mode  # 透传出题模式
             all_questions.extend(questions)
         except Exception as e:
             print(f"  ⚠️ 章节「{chunk['section_title']}」出题失败: {e}")
@@ -534,7 +562,7 @@ def _deduplicate_and_trim(all_questions, num_questions):
 _FAST_MAX_CHARS = 6000
 
 def _generate_fast(content, num_questions, difficulty, topic_hint,
-                   api_key, base_url, model, timeout, progress_callback):
+                   api_key, base_url, model, timeout, progress_callback, mode=MODE_QA):
     """极速模式 — 只调用 1 次 LLM。
 
     如果文档有 ≥3 个 markdown section，取前 3 个 section 合并；
@@ -560,7 +588,7 @@ def _generate_fast(content, num_questions, difficulty, topic_hint,
 
     return _generate_from_chunks(
         [chunk], num_questions, difficulty, topic_hint,
-        api_key, base_url, model, timeout, progress_callback,
+        api_key, base_url, model, timeout, progress_callback, mode=mode,
     )
 
 
@@ -569,7 +597,7 @@ _BALANCED_MAX_CHARS = 6000
 _BALANCED_MAX_CHUNKS = 5
 
 def _generate_balanced(content, num_questions, difficulty, topic_hint,
-                       api_key, base_url, model, timeout, progress_callback):
+                       api_key, base_url, model, timeout, progress_callback, mode=MODE_QA):
     """标准模式 — 控制在 3~5 次 LLM 调用。
 
     使用更大的 chunk 尺寸和更少的 chunk 上限，平衡速度和覆盖。
@@ -577,13 +605,13 @@ def _generate_balanced(content, num_questions, difficulty, topic_hint,
     chunks = chunk_document(content, max_chars=_BALANCED_MAX_CHARS, max_chunks=_BALANCED_MAX_CHUNKS)
     return _generate_from_chunks(
         chunks, num_questions, difficulty, topic_hint,
-        api_key, base_url, model, timeout, progress_callback,
+        api_key, base_url, model, timeout, progress_callback, mode=mode,
     )
 
 
 # Deep 模式：完整切分，当前逻辑
 def _generate_deep(content, num_questions, difficulty, topic_hint,
-                   api_key, base_url, model, timeout, progress_callback):
+                   api_key, base_url, model, timeout, progress_callback, mode=MODE_QA):
     """深度模式 — 完整切分，覆盖最全面。
 
     使用默认 chunk_document 参数（max_chars=3000, max_chunks=20），
@@ -592,7 +620,7 @@ def _generate_deep(content, num_questions, difficulty, topic_hint,
     chunks = chunk_document(content)
     return _generate_from_chunks(
         chunks, num_questions, difficulty, topic_hint,
-        api_key, base_url, model, timeout, progress_callback,
+        api_key, base_url, model, timeout, progress_callback, mode=mode,
     )
 
 
@@ -615,7 +643,7 @@ STRATEGY_LABELS = {
 def generate_questions(content, api_key, base_url, model,
                        num_questions=5, difficulty="混合",
                        topic_hint="", timeout=120,
-                       progress_callback=None, strategy="auto"):
+                       progress_callback=None, strategy="auto", mode=MODE_QA):
     """Generate questions from content using LLM.
 
     Args:
@@ -627,6 +655,7 @@ def generate_questions(content, api_key, base_url, model,
         timeout: LLM request timeout in seconds
         progress_callback: Optional callback(chunk_index, total_chunks, chunk_title)
         strategy: "auto" | "fast" | "balanced" | "deep"
+        mode: MODE_RETRIEVAL for retrieval testing, MODE_QA for full QA evaluation
 
     Returns:
         List of question dicts (deduplicated).
@@ -641,7 +670,7 @@ def generate_questions(content, api_key, base_url, model,
 
     return gen_fn(
         content, num_questions, difficulty, topic_hint,
-        api_key, base_url, model, timeout, progress_callback,
+        api_key, base_url, model, timeout, progress_callback, mode=mode,
     )
 
 
@@ -659,9 +688,17 @@ def save_questions(questions, filename=None):
         filename = f"questions_{ts}.jsonl"
 
     output_path = QUESTIONS_DIR / filename
+
+    # 写入文件
     with output_path.open("w", encoding="utf-8") as f:
         for q in questions:
             f.write(json.dumps(q, ensure_ascii=False) + "\n")
+
+    # 验证文件是否写入成功
+    if not output_path.exists():
+        raise IOError(f"文件写入失败: {output_path}")
+
+    print(f"[save_questions] 已保存 {len(questions)} 道题目到: {output_path}")
 
     return output_path, filename
 

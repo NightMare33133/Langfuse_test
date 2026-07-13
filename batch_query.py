@@ -110,7 +110,7 @@ def normalize_questions(items):
                 continue
             entry = {"question": q}
             # 保留所有额外元数据
-            for key in ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id"):
+            for key in ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode"):
                 val = item.get(key)
                 if val:
                     entry[key] = val
@@ -126,7 +126,7 @@ def normalize_questions(items):
     return normalized
 
 
-def query_to_sample(question, dify_result, index, timestamp, reference_answer="", source_excerpt=""):
+def query_to_sample(question, dify_result, index, timestamp, reference_answer="", source_excerpt="", question_mode=""):
     """将单次提问结果转换为 parser.py 兼容的 sample 结构。
 
     Args:
@@ -136,6 +136,7 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
         timestamp: 批次时间戳字符串
         reference_answer: 参考答案（如有）
         source_excerpt: 来源摘录（如有）
+        question_mode: 题目模式（retrieval 或 full_qa，如有）
     """
     retrieval_results = _map_retriever_resources(dify_result.get("retriever_resources", []))
     retrieval_query = question  # Dify 不单独返回 retrieval_query，用原始问题代替
@@ -161,6 +162,8 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
         sample["reference_answer"] = reference_answer
     if source_excerpt:
         sample["source_excerpt"] = source_excerpt
+    if question_mode:
+        sample["question_mode"] = question_mode
     return sample
 
 
@@ -195,6 +198,7 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
         question = item["question"]
         reference_answer = item.get("reference_answer", "")
         source_excerpt = item.get("source_excerpt", "")
+        question_mode = item.get("question_mode", "")
 
         try:
             dify_result = call_dify_query(question, api_key, base_url, timeout=timeout)
@@ -202,6 +206,7 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
                 question, dify_result, i, timestamp,
                 reference_answer=reference_answer,
                 source_excerpt=source_excerpt,
+                question_mode=question_mode,
             )
             yield i, total, {
                 "success": True,
