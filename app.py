@@ -290,7 +290,7 @@ samples = st.session_state.get("samples")
 summary = st.session_state.get("summary") or {}
 
 # --- Tabs ---
-tab_qgen, tab_batch, tab_samples, tab_judge = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测"])
+tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "实验版本"])
 
 # ========== Tab: 题目生成 ==========
 with tab_qgen:
@@ -1147,6 +1147,125 @@ PISP和AISP的区别?
                 except Exception as e:
                     st.error(f"读取文件失败: {e}")
 
+    # --- RAG 配置方案 ---
+    with st.expander("RAG 配置方案", expanded=False):
+        from experiment import (
+            create_config_profile, load_config_profile, list_config_profiles,
+            create_experiment_run, update_experiment_run, ensure_question_id,
+        )
+
+        # 配置来源选择
+        config_source = st.radio(
+            "配置来源",
+            ["新建配置方案", "使用历史配置"],
+            horizontal=True,
+            key="batch_config_source",
+        )
+
+        if config_source == "使用历史配置":
+            # 加载历史配置列表
+            historical_configs = list_config_profiles()
+            if not historical_configs:
+                st.warning("暂无历史配置，请选择「新建配置方案」")
+                config_source = "新建配置方案"
+            else:
+                # 构建下拉选项
+                config_options = []
+                for cfg in historical_configs:
+                    label = f"{cfg.get('config_name', '未命名')} | {cfg.get('knowledge_base_version', '')} | {cfg.get('changed_variable', '')[:30]}"
+                    config_options.append((cfg.get("config_id"), label))
+
+                selected_config_id = st.selectbox(
+                    "选择历史配置",
+                    options=[c[0] for c in config_options],
+                    format_func=lambda x: next((c[1] for c in config_options if c[0] == x), x),
+                    key="batch_selected_config",
+                )
+
+                # 回填配置字段
+                if selected_config_id:
+                    selected_config = load_config_profile(selected_config_id)
+                    if selected_config:
+                        st.caption(f"当前使用历史配置: **{selected_config.get('config_name', '')}**")
+                        exp_name = selected_config.get("config_name", "")
+                        exp_kb_version = selected_config.get("knowledge_base_version", "")
+                        exp_workflow_version = selected_config.get("workflow_version", "")
+                        exp_changed = selected_config.get("changed_variable", "")
+                        exp_retrieval_config = selected_config.get("retrieval_config", "")
+                        exp_notes = selected_config.get("notes", "")
+
+                        # 显示只读字段
+                        with st.container(border=True):
+                            st.markdown("**当前配置（只读）**")
+                            ro_col1, ro_col2 = st.columns(2)
+                            with ro_col1:
+                                st.text_input("配置名称", value=exp_name, disabled=True, key="ro_exp_name")
+                                st.text_input("知识库版本", value=exp_kb_version, disabled=True, key="ro_exp_kb")
+                                st.text_input("工作流版本", value=exp_workflow_version, disabled=True, key="ro_exp_wf")
+                            with ro_col2:
+                                st.text_input("本次改动", value=exp_changed, disabled=True, key="ro_exp_changed")
+                                st.text_input("检索配置", value=exp_retrieval_config, disabled=True, key="ro_exp_retrieval")
+                                st.text_area("备注", value=exp_notes, disabled=True, height=68, key="ro_exp_notes")
+
+                        # 另存为新方案
+                        if st.button("基于此配置另存为新方案", key="batch_save_as_new"):
+                            st.session_state["batch_config_source"] = "新建配置方案"
+                            st.session_state["batch_exp_name"] = f"{exp_name} (副本)"
+                            st.session_state["batch_exp_kb_version"] = exp_kb_version
+                            st.session_state["batch_exp_workflow_version"] = exp_workflow_version
+                            st.session_state["batch_exp_changed"] = exp_changed
+                            st.session_state["batch_exp_retrieval_config"] = exp_retrieval_config
+                            st.session_state["batch_exp_notes"] = exp_notes
+                            st.rerun()
+
+        if config_source == "新建配置方案":
+            st.caption("创建新的 RAG 配置方案，可在此后的多次批量测试中复用")
+            exp_col1, exp_col2 = st.columns(2)
+            with exp_col1:
+                exp_name = st.text_input(
+                    "配置名称",
+                    placeholder="例如：chunk_size 优化测试",
+                    key="batch_exp_name",
+                    help="必填（留空将使用'未命名配置'）"
+                )
+                exp_kb_version = st.text_input(
+                    "知识库版本",
+                    placeholder="例如：fintech_kb_v2",
+                    key="batch_exp_kb_version",
+                    help="必填（留空将使用'未指定'）"
+                )
+                exp_workflow_version = st.text_input(
+                    "工作流版本（可选）",
+                    placeholder="例如：chatflow_v2",
+                    key="batch_exp_workflow_version",
+                )
+            with exp_col2:
+                exp_changed = st.text_input(
+                    "本次改动",
+                    placeholder="例如：chunk_size: 1000 -> 500",
+                    key="batch_exp_changed",
+                    help="必填（留空将使用'未指定'）"
+                )
+                exp_retrieval_config = st.text_input(
+                    "检索配置摘要（可选）",
+                    placeholder="例如：hybrid / top_k=5 / reranker=on",
+                    key="batch_exp_retrieval_config",
+                )
+                exp_notes = st.text_area(
+                    "备注（可选）",
+                    placeholder="其他需要记录的信息",
+                    key="batch_exp_notes",
+                    height=68,
+                )
+
+            # 必填字段检查提示
+            if not exp_name:
+                st.warning("建议填写配置名称，否则将使用'未命名配置'")
+            if not exp_kb_version:
+                st.warning("建议填写知识库版本")
+            if not exp_changed:
+                st.warning("建议填写本次改动")
+
     # --- Dify API config ---
     with st.expander("Dify API 配置", expanded=False):
         dify_col1, dify_col2 = st.columns(2)
@@ -1182,6 +1301,51 @@ PISP和AISP的区别?
         elif not questions_list:
             st.error("没有可提问的问题")
         else:
+            # 获取配置来源
+            _config_source = st.session_state.get("batch_config_source", "新建配置方案")
+
+            # 获取或创建配置方案
+            if _config_source == "使用历史配置":
+                _config_id = st.session_state.get("batch_selected_config", "")
+                if not _config_id:
+                    st.error("请选择历史配置")
+                    st.stop()
+            else:
+                # 创建新配置方案
+                _exp_name = st.session_state.get("batch_exp_name", "") or "未命名配置"
+                _exp_kb_version = st.session_state.get("batch_exp_kb_version", "") or "未指定"
+                _exp_workflow_version = st.session_state.get("batch_exp_workflow_version", "")
+                _exp_changed = st.session_state.get("batch_exp_changed", "") or "未指定"
+                _exp_retrieval_config = st.session_state.get("batch_exp_retrieval_config", "")
+                _exp_notes = st.session_state.get("batch_exp_notes", "")
+
+                config_result = create_config_profile(
+                    config_name=_exp_name,
+                    knowledge_base_version=_exp_kb_version,
+                    workflow_version=_exp_workflow_version,
+                    changed_variable=_exp_changed,
+                    retrieval_config=_exp_retrieval_config,
+                    notes=_exp_notes,
+                )
+                _config_id = config_result["config_id"]
+
+            # 创建运行记录
+            run_result = create_experiment_run(
+                config_id=_config_id,
+                question_set_source=st.session_state.get("batch_q_source", ""),
+                question_count=len(questions_list),
+            )
+            run_id = run_result["run_id"]
+            run_dir = run_result["run_dir"]
+
+            # 确保每个问题有 question_id
+            question_ids = []
+            for q in questions_list:
+                q = ensure_question_id(q)
+                question_ids.append(q.get("question_id", ""))
+
+            st.info(f"运行已创建: `{run_id}` | 配置方案: `{_config_id}`")
+
             batch_results = []
             progress_bar = st.progress(0, text="准备开始...")
             status_container = st.container()
@@ -1189,6 +1353,9 @@ PISP和AISP的区别?
             for idx, total, result in run_batch_query(
                 questions_list, dify_api_key, dify_base_url,
                 timeout=dify_timeout, delay=dify_delay,
+                run_id=run_id,
+                config_id=_config_id,
+                question_ids=question_ids,
             ):
                 progress_bar.progress(
                     (idx + 1) / total,
@@ -1205,10 +1372,29 @@ PISP和AISP的区别?
 
             progress_bar.progress(1.0, text="提问完成！")
             st.session_state["batch_results"] = batch_results
+            st.session_state["batch_run_id"] = run_id
 
-            # 自动保存结果
-            save_batch_results(batch_results)
+            # 保存结果到运行目录
+            run_batch_path = run_dir / "batch_results.jsonl"
+            with run_batch_path.open("w", encoding="utf-8") as f:
+                for r in batch_results:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+            # 同时保存到 data/batch/
+            batch_path, batch_filename = save_batch_results(batch_results)
+
+            # 推送到 data/raw/
+            raw_path, raw_filename = push_to_raw_dir(batch_results)
+
+            # 更新运行 manifest
+            update_experiment_run(run_id, {
+                "batch_results_file": batch_filename,
+                "raw_results_file": raw_filename,
+                "status": "completed",
+            })
+
             st.success(f"批量提问完成！成功 {sum(1 for r in batch_results if r['success'])} / {total} 条")
+            st.caption(f"运行结果已保存到: `{run_dir}`")
 
     # --- Results display ---
     batch_results = st.session_state.get("batch_results")
@@ -3093,3 +3279,161 @@ Judge 有三层减少重复调用的机制：
                     file_name="eval_report.md",
                     mime="text/markdown",
                 )
+
+# ========== Tab: 实验版本 ==========
+with tab_experiment:
+    st.subheader("实验版本管理")
+    st.caption("RAG 配置方案 + 测试运行记录，便于区分和追溯不同配置下的测试结果")
+
+    # ---------- 模块说明 ----------
+    with st.expander("实验版本说明（点击展开）", expanded=False):
+        st.markdown("""
+**一句话总览：** 将 RAG 配置（知识库版本、检索配置等）与测试运行分离管理，同一配置可复用于多次批量测试。
+
+---
+
+**数据模型**
+
+| 概念 | 说明 | 存储位置 |
+|------|------|---------|
+| **配置方案** | 可复用的 RAG 配置（知识库版本、检索配置等） | `data/config_profiles/<config_id>.json` |
+| **测试运行** | 每次批量提问的运行记录，关联一个配置方案 | `data/experiments/<run_id>/manifest.json` |
+
+---
+
+**如何使用？**
+
+1. 在「批量提问」页面展开「RAG 配置方案」
+2. 选择「新建配置方案」或「使用历史配置」
+3. 开始提问时自动创建运行记录并关联配置
+4. 在本页面查看所有配置方案和运行记录
+
+---
+
+**与 Langfuse 的关联**
+
+- 每道题生成唯一 `question_id`
+- Dify API 调用时设置 `user` 字段为 `rag_eval:<run_id>:<question_id>`
+- 后续可通过 Langfuse trace 的 `user_id` 精确关联运行记录
+""")
+
+    # ---------- RAG 配置方案 ----------
+    from experiment import list_config_profiles, list_experiment_runs, list_runs_by_config
+
+    st.markdown("---")
+    st.markdown("##### RAG 配置方案")
+
+    configs = list_config_profiles()
+
+    if not configs:
+        st.info("暂无配置方案。在「批量提问」页面创建配置后，将自动记录在此。")
+    else:
+        st.markdown(f"**共 {len(configs)} 个配置方案**")
+
+        # 配置方案表格
+        config_table = []
+        for cfg in configs:
+            # 统计使用该配置的运行次数
+            runs_count = len(list_runs_by_config(cfg.get("config_id", "")))
+            config_table.append({
+                "配置名称": cfg.get("config_name", "未命名"),
+                "配置ID": cfg.get("config_id", ""),
+                "知识库版本": cfg.get("knowledge_base_version", ""),
+                "工作流版本": cfg.get("workflow_version", ""),
+                "本次改动": cfg.get("changed_variable", ""),
+                "使用次数": runs_count,
+                "创建时间": cfg.get("created_at", "")[:19],
+            })
+
+        st.dataframe(config_table, use_container_width=True)
+
+        # 配置详情展开
+        for cfg in configs:
+            config_id = cfg.get("config_id", "")
+            config_name = cfg.get("config_name", "未命名")
+            runs = list_runs_by_config(config_id)
+
+            with st.expander(f"{config_name} | {config_id} | 使用 {len(runs)} 次", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**配置名称**: {cfg.get('config_name', '')}")
+                    st.markdown(f"**知识库版本**: {cfg.get('knowledge_base_version', '')}")
+                    st.markdown(f"**工作流版本**: {cfg.get('workflow_version', '') or '未指定'}")
+                    st.markdown(f"**本次改动**: {cfg.get('changed_variable', '')}")
+                with col2:
+                    st.markdown(f"**检索配置**: {cfg.get('retrieval_config', '') or '未指定'}")
+                    st.markdown(f"**备注**: {cfg.get('notes', '') or '无'}")
+                    st.markdown(f"**创建时间**: {cfg.get('created_at', '')}")
+
+                # 显示使用该配置的运行
+                if runs:
+                    st.markdown("---")
+                    st.markdown(f"**使用该配置的运行** ({len(runs)} 次):")
+                    for run in runs:
+                        run_id = run.get("run_id", "")
+                        run_status = run.get("status", "")
+                        status_icon = "✅" if run_status == "completed" else "⏳"
+                        st.caption(f"  {status_icon} `{run_id}` | 题目数: {run.get('question_count', 0)} | {run.get('started_at', '')[:19]}")
+
+    # ---------- 测试运行记录 ----------
+    st.markdown("---")
+    st.markdown("##### 测试运行记录")
+
+    runs = list_experiment_runs()
+
+    if not runs:
+        st.info("暂无运行记录。在「批量提问」页面开始提问后，运行记录将自动记录在此。")
+    else:
+        st.markdown(f"**共 {len(runs)} 次运行**")
+
+        # 运行记录表格
+        run_table = []
+        for run in runs:
+            # 获取配置快照中的名称
+            config_snapshot = run.get("config_snapshot", {})
+            config_name = config_snapshot.get("config_name", "未知配置")
+            run_table.append({
+                "运行ID": run.get("run_id", ""),
+                "配置方案": config_name,
+                "配置ID": run.get("config_id", ""),
+                "题目来源": run.get("question_set_source", ""),
+                "题目数量": run.get("question_count", 0),
+                "创建时间": run.get("started_at", "")[:19],
+                "状态": run.get("status", ""),
+            })
+
+        st.dataframe(run_table, use_container_width=True)
+
+        # 运行详情展开
+        for run in runs:
+            run_id = run.get("run_id", "")
+            config_snapshot = run.get("config_snapshot", {})
+            config_name = config_snapshot.get("config_name", "未知配置")
+            run_status = run.get("status", "created")
+            status_icon = "✅" if run_status == "completed" else "⏳"
+
+            with st.expander(f"{status_icon} {run_id} | {config_name}", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**运行ID**: {run_id}")
+                    st.markdown(f"**配置方案**: {config_name}")
+                    st.markdown(f"**配置ID**: {run.get('config_id', '')}")
+                    st.markdown(f"**题目来源**: {run.get('question_set_source', '') or '未指定'}")
+                with col2:
+                    st.markdown(f"**题目数量**: {run.get('question_count', 0)}")
+                    st.markdown(f"**创建时间**: {run.get('started_at', '')}")
+                    st.markdown(f"**状态**: {run_status}")
+
+                # 显示关联的文件
+                st.markdown("---")
+                st.markdown(f"**运行目录**: `data/experiments/{run_id}/`")
+                batch_file = run.get("batch_results_file")
+                raw_file = run.get("raw_results_file")
+                if batch_file:
+                    st.markdown(f"**批量结果文件**: `{batch_file}`")
+                if raw_file:
+                    st.markdown(f"**原始结果文件**: `{raw_file}`")
+
+                # 配置快照详情
+                with st.expander("配置快照详情", expanded=False):
+                    st.json(config_snapshot)

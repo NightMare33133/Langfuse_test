@@ -14,8 +14,15 @@ BATCH_DIR = Path(__file__).parent / "data" / "batch"
 RAW_DIR = Path(__file__).parent / "data" / "raw"
 
 
-def call_dify_query(question, api_key, base_url, timeout=60):
+def call_dify_query(question, api_key, base_url, timeout=60, user="batch-query"):
     """调用 Dify chat-messages API（blocking 模式）提出单个问题。
+
+    Args:
+        question: 问题文本
+        api_key: Dify API Key
+        base_url: Dify API Base URL
+        timeout: 请求超时秒数
+        user: 用户标识（用于 Langfuse 关联实验）
 
     Returns:
         dict with keys: answer, conversation_id, message_id, retriever_resources, raw_response
@@ -31,7 +38,7 @@ def call_dify_query(question, api_key, base_url, timeout=60):
         "inputs": {},
         "query": question,
         "response_mode": "blocking",
-        "user": "batch-query",
+        "user": user,
     }
 
     try:
@@ -110,7 +117,8 @@ def normalize_questions(items):
                 continue
             entry = {"question": q}
             # 保留所有额外元数据
-            for key in ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode"):
+            for key in ("reference_answer", "source_excerpt", "difficulty", "topic",
+                        "question_id", "question_mode", "run_id", "config_id"):
                 val = item.get(key)
                 if val:
                     entry[key] = val
@@ -126,7 +134,9 @@ def normalize_questions(items):
     return normalized
 
 
-def query_to_sample(question, dify_result, index, timestamp, reference_answer="", source_excerpt="", question_mode=""):
+def query_to_sample(question, dify_result, index, timestamp,
+                    reference_answer="", source_excerpt="", question_mode="",
+                    question_id="", run_id="", config_id="", dify_user=""):
     """将单次提问结果转换为 parser.py 兼容的 sample 结构。
 
     Args:
@@ -137,6 +147,10 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
         reference_answer: 参考答案（如有）
         source_excerpt: 来源摘录（如有）
         question_mode: 题目模式（retrieval 或 full_qa，如有）
+        question_id: 问题ID（如有）
+        run_id: 运行ID（如有）
+        config_id: 配置方案ID（如有）
+        dify_user: Dify 调用的 user 字段（如有）
     """
     retrieval_results = _map_retriever_resources(dify_result.get("retriever_resources", []))
     retrieval_query = question  # Dify 不单独返回 retrieval_query，用原始问题代替
@@ -145,7 +159,7 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
         "trace_id": f"batch_qa_{index}_{timestamp}",
         "trace_name": "batch_query",
         "session_id": dify_result.get("conversation_id"),
-        "user_id": "batch-query",
+        "user_id": dify_user or "batch-query",
         "workflow_run_id": None,
         "question": question,
         "root_input": None,
@@ -164,10 +178,17 @@ def query_to_sample(question, dify_result, index, timestamp, reference_answer=""
         sample["source_excerpt"] = source_excerpt
     if question_mode:
         sample["question_mode"] = question_mode
+    if question_id:
+        sample["question_id"] = question_id
+    if run_id:
+        sample["run_id"] = run_id
+    if config_id:
+        sample["config_id"] = config_id
     return sample
 
 
-def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
+def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
+                    run_id="", config_id="", question_ids=None):
     """批量提问生成器。逐条调用 Dify API，yield 进度和结果。
 
     输入契约：questions 为 list[dict]，每个 dict 至少包含 "question": str。
@@ -179,6 +200,9 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
         base_url: Dify API Base URL (e.g. http://localhost/v1)
         timeout: 单次请求超时秒数
         delay: 每次请求之间的间隔秒数
+        run_id: 运行ID（可选，用于 Langfuse 关联）
+        config_id: 配置方案ID（可选）
+        question_ids: 问题ID列表（可选，与 questions 一一对应）
 
     Yields:
         (index, total, result_dict)
@@ -199,14 +223,25 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0):
         reference_answer = item.get("reference_answer", "")
         source_excerpt = item.get("source_excerpt", "")
         question_mode = item.get("question_mode", "")
+        question_id = item.get("question_id") or (question_ids[i] if question_ids and i < len(question_ids) else "")
+
+        # 构建 Dify user 字段
+        if run_id and question_id:
+            dify_user = f"rag_eval:{run_id}:{question_id}"
+        else:
+            dify_user = "batch-query"
 
         try:
-            dify_result = call_dify_query(question, api_key, base_url, timeout=timeout)
+            dify_result = call_dify_query(question, api_key, base_url, timeout=timeout, user=dify_user)
             sample = query_to_sample(
                 question, dify_result, i, timestamp,
                 reference_answer=reference_answer,
                 source_excerpt=source_excerpt,
                 question_mode=question_mode,
+                question_id=question_id,
+                run_id=run_id,
+                config_id=config_id,
+                dify_user=dify_user,
             )
             yield i, total, {
                 "success": True,
