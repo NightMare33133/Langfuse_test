@@ -74,6 +74,37 @@ def _ensure_unique_dir(base_id: str, parent_dir: Path) -> tuple:
     return new_id, dir_path
 
 
+# ========== 字段分级 ==========
+
+# A. 系统核心字段：不可在 UI 编辑
+CONFIG_CORE_FIELDS = {"config_id", "created_at"}
+RUN_CORE_FIELDS = {"run_id", "config_id", "question_set_id", "question_set_name",
+                   "question_set_source", "batch_results_file", "raw_results_file",
+                   "started_at", "status"}
+
+# B. 轻量必填字段（创建时要求）
+CONFIG_REQUIRED_FIELDS = {"config_name", "knowledge_base_version", "workflow_version"}
+
+# C. 可选实验字段（允许为空）
+CONFIG_OPTIONAL_FIELDS = {"source_description", "chunk_strategy", "chunk_size", "chunk_overlap",
+                          "embedding_model", "retrieval_mode", "semantic_weight", "keyword_weight",
+                          "top_k", "score_threshold", "rerank_enabled", "rerank_model",
+                          "changed_variable", "retrieval_config", "notes"}
+
+# B+C 可编辑字段
+CONFIG_EDITABLE_FIELDS = CONFIG_REQUIRED_FIELDS | CONFIG_OPTIONAL_FIELDS
+
+
+def _protect_core_fields(existing: dict, updates: dict, core_fields: set) -> dict:
+    """从 updates 中移除核心字段，返回安全的更新字典。"""
+    safe = {}
+    for k, v in updates.items():
+        if k in core_fields:
+            continue  # 跳过核心字段
+        safe[k] = v
+    return safe
+
+
 # ========== Config Profile 管理 ==========
 
 def create_config_profile(
@@ -83,8 +114,12 @@ def create_config_profile(
     changed_variable: str = "",
     retrieval_config: str = "",
     notes: str = "",
+    **kwargs,
 ) -> dict:
     """创建新的配置方案。
+
+    必填：config_name, knowledge_base_version, workflow_version
+    其余均为可选，允许为空。
 
     Returns:
         dict: 配置信息，包含 config_id 等
@@ -105,6 +140,12 @@ def create_config_profile(
         "created_at": datetime.now().isoformat(),
     }
 
+    # 可选实验字段：只写入非空值，缺失字段不自动填充默认值
+    for field in CONFIG_OPTIONAL_FIELDS:
+        val = kwargs.get(field)
+        if val is not None and str(val).strip():
+            config[field] = val
+
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     return config
 
@@ -118,12 +159,39 @@ def load_config_profile(config_id: str) -> dict:
 
 
 def update_config_profile(config_id: str, updates: dict) -> dict:
-    """更新配置方案。"""
+    """更新配置方案（内部使用，不校验字段）。"""
     config = load_config_profile(config_id)
     if config is None:
         raise ValueError(f"配置方案不存在: {config_id}")
 
     config.update(updates)
+
+    config_path = CONFIG_PROFILES_DIR / f"{config_id}.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    return config
+
+
+def update_config_profile_safe(config_id: str, updates: dict, edit_note: str = "") -> dict:
+    """安全编辑配置方案：仅允许编辑描述性字段，保护核心字段。
+
+    Args:
+        config_id: 配置方案 ID
+        updates: 要更新的字段（核心字段会被自动忽略）
+        edit_note: 可选的修改说明
+
+    Returns:
+        dict: 更新后的配置
+    """
+    config = load_config_profile(config_id)
+    if config is None:
+        raise ValueError(f"配置方案不存在: {config_id}")
+
+    # 只保留可编辑字段
+    safe_updates = _protect_core_fields(config, updates, CONFIG_CORE_FIELDS)
+    config.update(safe_updates)
+    config["updated_at"] = datetime.now().isoformat()
+    if edit_note:
+        config["edit_note"] = edit_note
 
     config_path = CONFIG_PROFILES_DIR / f"{config_id}.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -209,12 +277,54 @@ def load_experiment_run(run_id: str) -> dict:
 
 
 def update_experiment_run(run_id: str, updates: dict) -> dict:
-    """更新运行记录。"""
+    """更新运行记录（内部使用，不校验字段）。"""
     manifest = load_experiment_run(run_id)
     if manifest is None:
         raise ValueError(f"运行记录不存在: {run_id}")
 
     manifest.update(updates)
+
+    manifest_path = EXPERIMENTS_DIR / run_id / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def update_run_snapshot(run_id: str, snapshot_updates: dict, edit_note: str = "") -> dict:
+    """安全编辑某次运行的配置快照：仅编辑描述性字段，保护核心关联字段。
+
+    保存前将旧快照存入 snapshot_edit_history 以便追溯。
+
+    Args:
+        run_id: 运行 ID
+        snapshot_updates: 要更新的 config_snapshot 字段（核心字段会被忽略）
+        edit_note: 可选的修改说明
+
+    Returns:
+        dict: 更新后的 manifest
+    """
+    manifest = load_experiment_run(run_id)
+    if manifest is None:
+        raise ValueError(f"运行记录不存在: {run_id}")
+
+    snapshot = dict(manifest.get("config_snapshot", {}))
+
+    # 保存修改前快照
+    if "snapshot_edit_history" not in manifest:
+        manifest["snapshot_edit_history"] = []
+    manifest["snapshot_edit_history"].append({
+        "before": snapshot.copy(),
+        "edited_at": datetime.now().isoformat(),
+        "edit_note": edit_note or "手动修正配置记录",
+    })
+
+    # 只保留可编辑字段，跳过核心字段
+    safe_updates = _protect_core_fields(snapshot, snapshot_updates, CONFIG_CORE_FIELDS)
+    snapshot.update(safe_updates)
+    snapshot["snapshot_updated_at"] = datetime.now().isoformat()
+    if edit_note:
+        snapshot["snapshot_edit_note"] = edit_note
+
+    manifest["config_snapshot"] = snapshot
 
     manifest_path = EXPERIMENTS_DIR / run_id / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

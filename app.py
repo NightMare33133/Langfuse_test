@@ -46,7 +46,7 @@ def build_retrieval_bar_chart(metrics: dict):
     )])
     fig.update_layout(
         yaxis_title="百分比 (%)", yaxis_range=[0, 100],
-        height=360, margin=dict(t=20, b=30),
+        height=360, margin=dict(t=40, b=30),
     )
     return fig
 
@@ -65,7 +65,7 @@ def build_strict_qa_bar_chart(metrics: dict):
     )])
     fig.update_layout(
         yaxis_title="百分比 (%)", yaxis_range=[0, 100],
-        height=360, margin=dict(t=20, b=30),
+        height=360, margin=dict(t=40, b=30),
     )
     return fig
 
@@ -84,7 +84,7 @@ def build_grounded_qa_bar_chart(metrics: dict):
     )])
     fig.update_layout(
         yaxis_title="百分比 (%)", yaxis_range=[0, 100],
-        height=360, margin=dict(t=20, b=30),
+        height=360, margin=dict(t=40, b=30),
     )
     return fig
 
@@ -100,7 +100,7 @@ def build_answer_pye(valid_results: list, label_correct="正确", label_incorrec
         hole=0.4,
         textinfo="label+value+percent",
     )])
-    fig.update_layout(height=340, margin=dict(t=20, b=20))
+    fig.update_layout(height=340, margin=dict(t=40, b=20))
     return fig
 
 
@@ -129,7 +129,7 @@ def build_retrieval_per_question_chart(valid_results: list):
     )
     fig.update_layout(
         height=max(280, len(df) * 36 + 80),
-        margin=dict(t=20, b=30, l=10),
+        margin=dict(t=40, b=30, l=10),
         xaxis_title="", yaxis_title="",
     )
     return fig
@@ -160,7 +160,7 @@ def build_per_question_chart(valid_results: list):
     )
     fig.update_layout(
         height=max(280, len(df) * 36 + 80),
-        margin=dict(t=20, b=30, l=10),
+        margin=dict(t=40, b=30, l=10),
         xaxis_title="", yaxis_title="",
     )
     return fig
@@ -1110,9 +1110,26 @@ PISP和AISP的区别?
                     else:
                         mode_tag = "[旧版]"
 
-                    # 生成显示标签：优先题集名称
+                    # 生成显示标签：优先题集名称，附带时间戳和 set_id 后缀确保唯一
                     if info["has_set_info"] and info["set_name"]:
-                        label = f"{mode_tag} {info['set_name']} · {q_count} 题"
+                        # 从 set_id 提取时间戳用于区分同名题集
+                        # set_id 格式: qs_YYYYMMDD_HHMMSSffffff_slug
+                        _sid = info.get("set_id", "")
+                        _ts_display = ""
+                        if _sid:
+                            _parts = _sid.split("_", 3)
+                            if len(_parts) >= 3:
+                                _date_part = _parts[1]  # YYYYMMDD
+                                _time_part = _parts[2]  # HHMMSSffffff
+                                if len(_date_part) == 8 and len(_time_part) >= 6:
+                                    _ts_display = f"{_date_part[:4]}-{_date_part[4:6]}-{_date_part[6:8]} {_time_part[:2]}:{_time_part[2:4]}"
+                        # 用 set_id 时间戳微秒部分做短后缀，确保同名题集可区分
+                        # 取 HHMMSSffffff 中的后 8 位（含微秒）
+                        _sid_short = ""
+                        if _sid and len(_sid) > 20:
+                            _sid_short = f" · qs...{_sid[12:20]}"
+                        _ts_part = f" · {_ts_display}" if _ts_display else ""
+                        label = f"{mode_tag} {info['set_name']} · {q_count} 题{_ts_part}{_sid_short}"
                     else:
                         # 旧版文件，回退显示文件名
                         label = f"{mode_tag} {f.stem} · {q_count} 题 [旧版题集]"
@@ -3392,6 +3409,7 @@ with tab_experiment:
         backfill_manifest_from_batch, migrate_judged_results, migrate_processed_samples,
         EXPERIMENTS_DIR,
     )
+    from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
 
     # ---------- 自动迁移：从 batch 文件回填 manifest ----------
     _all_runs = list_experiment_runs()
@@ -3468,28 +3486,339 @@ with tab_experiment:
     st.markdown("---")
     st.markdown(f"##### 配置方案: {selected_config.get('config_name', '未命名')}")
 
-    # 可读字段卡片
+    def _display_val(val):
+        """显示字段值，空值显示为'未记录'。"""
+        if val is None or str(val).strip() == "":
+            return "未记录"
+        return str(val)
+
+    # 摘要字段卡片
     card_col1, card_col2 = st.columns(2)
     with card_col1:
         st.markdown(f"**配置名称**: {selected_config.get('config_name', '')}")
-        st.markdown(f"**配置 ID**: `{selected_config.get('config_id', '')}`")
-        st.markdown(f"**知识库版本**: {selected_config.get('knowledge_base_version', '')}")
-        st.markdown(f"**工作流版本**: {selected_config.get('workflow_version', '') or '未指定'}")
+        st.markdown(f"**知识库版本**: {_display_val(selected_config.get('knowledge_base_version'))}")
+        st.markdown(f"**工作流版本**: {_display_val(selected_config.get('workflow_version'))}")
     with card_col2:
-        st.markdown(f"**本次改动**: {selected_config.get('changed_variable', '') or '未指定'}")
-        st.markdown(f"**检索配置**: {selected_config.get('retrieval_config', '') or '未指定'}")
-        st.markdown(f"**备注**: {selected_config.get('notes', '') or '无'}")
-        st.markdown(f"**创建时间**: {selected_config.get('created_at', '')}")
+        st.markdown(f"**检索模式**: {_display_val(selected_config.get('retrieval_mode'))}")
+        _topk = selected_config.get('top_k', '')
+        _rerank = selected_config.get('rerank_enabled', '')
+        st.markdown(f"**Top K**: {_display_val(_topk) if _topk else '未记录'}　**Rerank**: {_display_val(_rerank) if _rerank else '未记录'}")
+        st.markdown(f"**备注**: {_display_val(selected_config.get('notes'))}")
+    _updated = selected_config.get('updated_at', '')
+    _created = selected_config.get('created_at', '')
+    st.caption(f"创建时间: {_created[:19] if _created else '未知'}" +
+               (f"　最后编辑: {_updated[:19]}" if _updated else ""))
 
-    # 原始 JSON 快照
-    with st.expander("查看配置快照（JSON）", expanded=False):
+    # 编辑配置说明
+    with st.expander("编辑/查看配置详情", expanded=False):
+        with st.form("edit_config_form"):
+            st.markdown("**可编辑字段**（核心字段 config_id / created_at 不可修改）")
+            ec_col1, ec_col2 = st.columns(2)
+            with ec_col1:
+                ec_name = st.text_input("配置名称 *", value=selected_config.get("config_name", ""), key="ec_name")
+                ec_kb = st.text_input("知识库版本 *", value=selected_config.get("knowledge_base_version", ""), key="ec_kb")
+                ec_wf = st.text_input("工作流版本 *", value=selected_config.get("workflow_version", ""), key="ec_wf")
+                ec_changed = st.text_input("本次改动", value=selected_config.get("changed_variable", ""), key="ec_changed")
+                ec_ret = st.text_input("检索配置", value=selected_config.get("retrieval_config", ""), key="ec_ret")
+            with ec_col2:
+                ec_source = st.text_input("文档/数据来源", value=selected_config.get("source_description", ""), key="ec_source")
+                ec_chunk = st.text_input("分块策略", value=selected_config.get("chunk_strategy", ""), key="ec_chunk")
+                ec_embed = st.text_input("Embedding 模型", value=selected_config.get("embedding_model", ""), key="ec_embed")
+                ec_mode = st.text_input("检索模式", value=selected_config.get("retrieval_mode", ""), key="ec_mode")
+                ec_topk = st.text_input("Top K", value=str(selected_config.get("top_k", "")), key="ec_topk")
+                ec_rerank = st.text_input("Rerank 模型", value=selected_config.get("rerank_model", ""), key="ec_rerank")
+            ec_notes = st.text_area("备注", value=selected_config.get("notes", ""), key="ec_notes", height=68)
+            ec_note = st.text_input("修改说明（可选）", value="", key="ec_edit_note",
+                                    help="简要说明本次修改原因，如：补录 Rerank 配置")
+            ec_submit = st.form_submit_button("保存配置修改", type="primary")
+
+        if ec_submit:
+            from experiment import update_config_profile_safe
+            updates = {
+                "config_name": ec_name,
+                "knowledge_base_version": ec_kb,
+                "workflow_version": ec_wf,
+                "changed_variable": ec_changed,
+                "retrieval_config": ec_ret,
+                "source_description": ec_source,
+                "chunk_strategy": ec_chunk,
+                "embedding_model": ec_embed,
+                "retrieval_mode": ec_mode,
+                "notes": ec_notes,
+            }
+            # 数值字段：空字符串时不写入
+            if ec_topk.strip():
+                try:
+                    updates["top_k"] = int(ec_topk)
+                except ValueError:
+                    updates["top_k"] = ec_topk
+            if ec_rerank.strip():
+                updates["rerank_model"] = ec_rerank
+            update_config_profile_safe(selected_config_id, updates, edit_note=ec_note)
+            st.success("配置已保存，config_id 未变。")
+            st.rerun()
+
+    # 技术详情（核心字段只读）
+    with st.expander("技术详情（只读）", expanded=False):
+        st.markdown(f"**config_id**: `{selected_config.get('config_id', '')}`")
+        st.markdown(f"**created_at**: {selected_config.get('created_at', '')}")
+        if selected_config.get('updated_at'):
+            st.markdown(f"**updated_at**: {selected_config['updated_at']}")
+        if selected_config.get('edit_note'):
+            st.markdown(f"**edit_note**: {selected_config['edit_note']}")
         st.json(selected_config)
+
+    # ---------- 配置方案总览 ----------
+    config_runs = list_runs_by_config(selected_config_id)
+
+    if config_runs:
+        st.markdown("---")
+        st.markdown(f"##### 配置方案总览（{selected_config.get('config_name', '')}）")
+
+        # 收集所有 run 的状态和 Judge 结果
+        _all_run_statuses = []
+        _all_judge_results_raw = []
+        _total_questions = 0
+        _total_batch_success = 0
+        _total_batch_total = 0
+        _total_raw = 0
+        _total_processed = 0
+        _total_judge = 0
+        _status_counts = {}
+        _latest_run = None
+        _latest_time = ""
+
+        for run in config_runs:
+            rid = run.get("run_id", "")
+            rs = get_run_status(
+                rid,
+                batch_dir=str(BATCH_DIR),
+                raw_dir=str(RAW_DIR),
+                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                judged_file=str(JUDGED_FILE),
+            )
+            _all_run_statuses.append(rs)
+            _total_questions += run.get("question_count", 0)
+            _total_batch_success += rs.get("batch_success", 0)
+            _total_batch_total += rs.get("batch_total", 0)
+            _total_raw += rs.get("raw_count", 0)
+            _total_processed += rs.get("processed_count", 0)
+            _total_judge += rs.get("judge_count", 0)
+
+            run_status = run.get("status", "unknown")
+            _status_counts[run_status] = _status_counts.get(run_status, 0) + 1
+
+            started = run.get("started_at", "")
+            if started > _latest_time:
+                _latest_time = started
+                _latest_run = run
+
+            # 收集 Judge 结果（带 run_id 标记）
+            for r in rs.get("judge_results", []):
+                r_copy = dict(r)
+                r_copy["_source_run_id"] = rid
+                _all_judge_results_raw.append(r_copy)
+
+        # 去重：同一 trace_id 保留最新且无 error 的结果
+        # 优先级：无 error > 有 error；同优先级时后出现的覆盖先出现的（后出现 = 更新的 run）
+        _seen_trace = {}
+        for r in _all_judge_results_raw:
+            tid = r.get("trace_id", "")
+            if not tid:
+                continue
+            existing = _seen_trace.get(tid)
+            if existing is None:
+                _seen_trace[tid] = r
+            elif "error" in existing and "error" not in r:
+                # 新结果无 error，覆盖旧的有 error 结果
+                _seen_trace[tid] = r
+            else:
+                # 后出现的 run 更新，覆盖（即使都有 error 或都无 error）
+                _seen_trace[tid] = r
+        all_judge_results = list(_seen_trace.values())
+
+        # 概览指标
+        ov_col1, ov_col2, ov_col3, ov_col4 = st.columns(4)
+        with ov_col1:
+            st.metric("总运行次数", len(config_runs))
+            _status_parts = [f"{k}: {v}" for k, v in _status_counts.items()]
+            if _status_parts:
+                st.caption("状态: " + " / ".join(_status_parts))
+        with ov_col2:
+            st.metric("题目总数", _total_questions)
+            st.metric("Batch 成功", f"{_total_batch_success}/{_total_batch_total}")
+        with ov_col3:
+            st.metric("Raw 总数", _total_raw)
+            st.metric("Processed 总数", _total_processed)
+        with ov_col4:
+            st.metric("Judge 已评测", _total_judge)
+            if _latest_run:
+                _latest_qs = _latest_run.get("question_set_name", "") or "—"
+                st.caption(f"最近运行: {_latest_time[:19]}")
+                st.caption(f"题集: {_latest_qs}")
+
+        # 累计 Judge 指标（按 track 加权汇总，去重后）
+        valid_all = [r for r in all_judge_results if "error" not in r]
+        error_all = [r for r in all_judge_results if "error" in r]
+
+        retrieval_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_RETRIEVAL]
+        strict_qa_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_STRICT_QA]
+        grounded_qa_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_GROUNDED_QA]
+
+        st.markdown("---")
+        st.markdown("**累计 Judge 指标**")
+        st.caption("按样本加权汇总（命中总数 / 有效样本数），去重后统计。不同评测轨道不混合。")
+
+        has_any_track = retrieval_all or strict_qa_all or grounded_qa_all
+        if not has_any_track:
+            st.info("暂无数据")
+        else:
+            track_col1, track_col2, track_col3 = st.columns(3)
+
+            if retrieval_all:
+                with track_col1:
+                    st.markdown("**检索评测**")
+                    n = len(retrieval_all)
+                    t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_all) / n
+                    t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_all) / n
+                    t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_all) / n
+                    st.metric("Top1 Hit", f"{t1:.0%}")
+                    st.metric("Top3 Hit", f"{t3:.0%}")
+                    st.metric("Top5 Hit", f"{t5:.0%}")
+                    st.caption(f"有效样本数 n={n}")
+            else:
+                with track_col1:
+                    st.markdown("**检索评测**")
+                    st.info("暂无数据")
+
+            if strict_qa_all:
+                with track_col2:
+                    st.markdown("**严格问答**")
+                    n = len(strict_qa_all)
+                    acc = sum(r.get("answer_correct", 0) for r in strict_qa_all) / n
+                    st.metric("Answer Correctness", f"{acc:.0%}")
+                    st.caption(f"有效样本数 n={n}")
+            else:
+                with track_col2:
+                    st.markdown("**严格问答**")
+                    st.info("暂无数据")
+
+            if grounded_qa_all:
+                with track_col3:
+                    st.markdown("**合理性问答**")
+                    n = len(grounded_qa_all)
+                    acc = sum(r.get("answer_correct", 0) for r in grounded_qa_all) / n
+                    st.metric("Answer Groundedness", f"{acc:.0%}")
+                    st.caption(f"有效样本数 n={n}")
+            else:
+                with track_col3:
+                    st.markdown("**合理性问答**")
+                    st.info("暂无数据")
+
+        # 累计可视化
+        st.markdown("**配置方案累计结果**")
+
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            if retrieval_all:
+                n = len(retrieval_all)
+                _cum_ret_m = {
+                    "top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in retrieval_all) / n,
+                    "top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in retrieval_all) / n,
+                    "top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in retrieval_all) / n,
+                }
+                st.caption(f"检索命中率 (n={n})")
+                fig_cum_ret = build_retrieval_bar_chart(_cum_ret_m)
+                st.plotly_chart(fig_cum_ret, use_container_width=True, key="cum_ret_bar")
+            else:
+                st.info("暂无检索评测数据")
+
+        with chart_col2:
+            if strict_qa_all or grounded_qa_all:
+                # QA 累计指标图
+                qa_labels = []
+                qa_values = []
+                if strict_qa_all:
+                    n = len(strict_qa_all)
+                    qa_labels.append(f"严格问答 (n={n})")
+                    qa_values.append(sum(r.get("answer_correct", 0) for r in strict_qa_all) / n * 100)
+                if grounded_qa_all:
+                    n = len(grounded_qa_all)
+                    qa_labels.append(f"合理性问答 (n={n})")
+                    qa_values.append(sum(r.get("answer_correct", 0) for r in grounded_qa_all) / n * 100)
+                fig_qa_cum = go.Figure(data=[go.Bar(
+                    x=qa_labels, y=qa_values,
+                    marker_color="#17becf",
+                    text=[f"{v:.1f}%" for v in qa_values], textposition="auto",
+                )])
+                fig_qa_cum.update_layout(
+                    yaxis_title="百分比 (%)", yaxis_range=[0, 100],
+                    height=360, margin=dict(t=40, b=30),
+                )
+                st.plotly_chart(fig_qa_cum, use_container_width=True, key="cum_qa_bar")
+            else:
+                st.info("暂无问答评测数据")
+
+        # 轨道分布和结果状态分布
+        dist_col1, dist_col2 = st.columns(2)
+        with dist_col1:
+            st.markdown("**Judge 轨道分布**")
+            dist_labels = []
+            dist_values = []
+            if retrieval_all:
+                dist_labels.append("检索评测")
+                dist_values.append(len(retrieval_all))
+            if strict_qa_all:
+                dist_labels.append("严格问答")
+                dist_values.append(len(strict_qa_all))
+            if grounded_qa_all:
+                dist_labels.append("合理性问答")
+                dist_values.append(len(grounded_qa_all))
+            if error_all:
+                dist_labels.append("错误")
+                dist_values.append(len(error_all))
+            if dist_labels:
+                fig_track_dist = go.Figure(data=[go.Pie(
+                    labels=dist_labels, values=dist_values,
+                    hole=0.4, textinfo="label+value+percent",
+                )])
+                fig_track_dist.update_layout(height=300, margin=dict(t=40, b=20))
+                st.plotly_chart(fig_track_dist, use_container_width=True, key="cum_track_dist")
+
+        with dist_col2:
+            st.markdown("**结果状态分布**")
+            hit_count = sum(1 for r in retrieval_all if r.get("retrieval_top1_hit"))
+            miss_count = len(retrieval_all) - hit_count
+            qa_correct = sum(1 for r in strict_qa_all + grounded_qa_all if r.get("answer_correct"))
+            qa_wrong = len(strict_qa_all + grounded_qa_all) - qa_correct
+            status_labels = []
+            status_values = []
+            if hit_count:
+                status_labels.append("检索 Top1 命中")
+                status_values.append(hit_count)
+            if miss_count:
+                status_labels.append("检索 Top1 未命中")
+                status_values.append(miss_count)
+            if qa_correct:
+                status_labels.append("QA 回答正确")
+                status_values.append(qa_correct)
+            if qa_wrong:
+                status_labels.append("QA 回答错误")
+                status_values.append(qa_wrong)
+            if error_all:
+                status_labels.append("评测错误")
+                status_values.append(len(error_all))
+            if status_labels:
+                fig_status_dist = go.Figure(data=[go.Pie(
+                    labels=status_labels, values=status_values,
+                    hole=0.4, textinfo="label+value+percent",
+                )])
+                fig_status_dist.update_layout(height=300, margin=dict(t=40, b=20))
+                st.plotly_chart(fig_status_dist, use_container_width=True, key="cum_status_dist")
 
     # ---------- 运行记录 ----------
     st.markdown("---")
     st.markdown(f"##### 运行记录（配置: {selected_config.get('config_name', '')}）")
-
-    config_runs = list_runs_by_config(selected_config_id)
 
     if not config_runs:
         st.info("该配置方案暂无运行记录。在「批量提问」页面使用此配置开始提问后，运行记录将自动记录在此。")
@@ -3577,6 +3906,23 @@ with tab_experiment:
                 with status_col4:
                     st.metric("Judge", judge_count)
 
+                # 流程完成率进度条
+                _denom = max(question_count, 1)
+                _batch_rate = batch_success / max(batch_total, 1) if batch_total > 0 else 0
+                _proc_rate = processed_count / _denom
+                _judge_rate = judge_count / _denom
+
+                prog_col1, prog_col2, prog_col3 = st.columns(3)
+                with prog_col1:
+                    st.caption(f"Batch 成功率: {_batch_rate:.0%}")
+                    st.progress(min(_batch_rate, 1.0))
+                with prog_col2:
+                    st.caption(f"样本准备率: {_proc_rate:.0%} ({processed_count}/{_denom})")
+                    st.progress(min(_proc_rate, 1.0))
+                with prog_col3:
+                    st.caption(f"Judge 覆盖率: {_judge_rate:.0%} ({judge_count}/{_denom})")
+                    st.progress(min(_judge_rate, 1.0))
+
                 # 关联文件
                 st.markdown("**关联文件**")
                 batch_file = run.get("batch_results_file")
@@ -3600,8 +3946,6 @@ with tab_experiment:
 
                     judge_results = run_status.get("judge_results", [])
                     if judge_results:
-                        from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
-
                         # 计算指标
                         valid_results = [r for r in judge_results if "error" not in r]
                         if valid_results:
@@ -3643,6 +3987,282 @@ with tab_experiment:
                                     st.metric("Answer Grounded", f"{acc:.0%}")
                                     st.caption(f"样本数: {n}")
 
-                # 配置快照
-                with st.expander("配置快照详情", expanded=False):
-                    st.json(run.get("config_snapshot", {}))
+                # ========== 评测结果可视化 ==========
+                if judge_count > 0:
+                    judge_results_viz = run_status.get("judge_results", [])
+                    if judge_results_viz:
+                        valid_viz = [r for r in judge_results_viz if "error" not in r]
+                        error_viz = [r for r in judge_results_viz if "error" in r]
+
+                        st.markdown("---")
+                        st.markdown("##### 评测结果可视化")
+
+                        # 检索评测轨道
+                        retrieval_viz = [r for r in valid_viz if r.get("evaluation_track") == TRACK_RETRIEVAL]
+                        strict_qa_viz = [r for r in valid_viz if r.get("evaluation_track") == TRACK_STRICT_QA]
+                        grounded_qa_viz = [r for r in valid_viz if r.get("evaluation_track") == TRACK_GROUNDED_QA]
+
+                        # -- 检索评测图表 --
+                        if retrieval_viz:
+                            st.markdown("**检索评测**")
+                            ret_chart_col1, ret_chart_col2 = st.columns(2)
+                            with ret_chart_col1:
+                                n = len(retrieval_viz)
+                                _ret_m = {
+                                    "top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in retrieval_viz) / n,
+                                    "top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in retrieval_viz) / n,
+                                    "top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in retrieval_viz) / n,
+                                }
+                                st.plotly_chart(build_retrieval_bar_chart(_ret_m), use_container_width=True, key=f"exp_ret_bar_{run_id}")
+                            with ret_chart_col2:
+                                pq_fig = build_retrieval_per_question_chart(retrieval_viz)
+                                if pq_fig:
+                                    st.plotly_chart(pq_fig, use_container_width=True, key=f"exp_ret_pq_{run_id}")
+                                else:
+                                    st.info("无有效评测数据")
+                        else:
+                            st.info("当前运行无检索评测轨道数据")
+
+                        # -- QA 指标卡片 --
+                        if strict_qa_viz or grounded_qa_viz:
+                            qa_chart_col1, qa_chart_col2 = st.columns(2)
+                            if strict_qa_viz:
+                                with qa_chart_col1:
+                                    n = len(strict_qa_viz)
+                                    acc = sum(r.get("answer_correct", 0) for r in strict_qa_viz) / n
+                                    st.plotly_chart(build_strict_qa_bar_chart({"answer_correct_rate": acc}), use_container_width=True, key=f"exp_strict_qa_{run_id}")
+                                    st.caption(f"严格问答样本数: {n}")
+                            if grounded_qa_viz:
+                                with qa_chart_col2:
+                                    n = len(grounded_qa_viz)
+                                    acc = sum(r.get("answer_correct", 0) for r in grounded_qa_viz) / n
+                                    st.plotly_chart(build_grounded_qa_bar_chart({"answer_correct_rate": acc}), use_container_width=True, key=f"exp_grounded_qa_{run_id}")
+                                    st.caption(f"合理性问答样本数: {n}")
+
+                        # -- 结果分布 --
+                        st.markdown("**结果分布**")
+                        dist_col1, dist_col2 = st.columns(2)
+                        with dist_col1:
+                            # 按评测轨道分布
+                            track_labels = []
+                            track_values = []
+                            if retrieval_viz:
+                                track_labels.append("检索评测")
+                                track_values.append(len(retrieval_viz))
+                            if strict_qa_viz:
+                                track_labels.append("严格问答")
+                                track_values.append(len(strict_qa_viz))
+                            if grounded_qa_viz:
+                                track_labels.append("合理性问答")
+                                track_values.append(len(grounded_qa_viz))
+                            if error_viz:
+                                track_labels.append("错误")
+                                track_values.append(len(error_viz))
+                            if track_labels:
+                                fig_dist = go.Figure(data=[go.Pie(
+                                    labels=track_labels, values=track_values,
+                                    hole=0.4, textinfo="label+value+percent",
+                                )])
+                                fig_dist.update_layout(height=300, margin=dict(t=40, b=20))
+                                st.plotly_chart(fig_dist, use_container_width=True, key=f"exp_dist_{run_id}")
+                        with dist_col2:
+                            # 检索命中分布（仅检索轨道）
+                            if retrieval_viz:
+                                hit_count = sum(1 for r in retrieval_viz if r.get("retrieval_top1_hit"))
+                                miss_count = len(retrieval_viz) - hit_count
+                                fig_hit = go.Figure(data=[go.Pie(
+                                    labels=["Top1 命中", "Top1 未命中"],
+                                    values=[hit_count, miss_count],
+                                    marker_colors=["#2ca02c", "#d62728"],
+                                    hole=0.4, textinfo="label+value+percent",
+                                )])
+                                fig_hit.update_layout(height=300, margin=dict(t=40, b=20))
+                                st.plotly_chart(fig_hit, use_container_width=True, key=f"exp_hit_{run_id}")
+                            elif strict_qa_viz or grounded_qa_viz:
+                                all_qa = strict_qa_viz + grounded_qa_viz
+                                correct_count = sum(1 for r in all_qa if r.get("answer_correct"))
+                                wrong_count = len(all_qa) - correct_count
+                                fig_ans = go.Figure(data=[go.Pie(
+                                    labels=["回答正确", "回答错误"],
+                                    values=[correct_count, wrong_count],
+                                    marker_colors=["#2ca02c", "#d62728"],
+                                    hole=0.4, textinfo="label+value+percent",
+                                )])
+                                fig_ans.update_layout(height=300, margin=dict(t=40, b=20))
+                                st.plotly_chart(fig_ans, use_container_width=True, key=f"exp_ans_{run_id}")
+
+                        # -- 逐题评测明细 --
+                        st.markdown("##### 逐题评测明细")
+                        detail_col1, detail_col2 = st.columns(2)
+                        with detail_col1:
+                            track_options = ["全部"]
+                            if retrieval_viz:
+                                track_options.append("retrieval")
+                            if strict_qa_viz:
+                                track_options.append("strict_qa")
+                            if grounded_qa_viz:
+                                track_options.append("grounded_qa")
+                            filter_track = st.selectbox(
+                                "按评测轨道筛选", track_options,
+                                key=f"exp_detail_track_{run_id}",
+                            )
+                        with detail_col2:
+                            filter_status = st.selectbox(
+                                "按结果状态筛选", ["全部", "成功", "失败", "错误"],
+                                key=f"exp_detail_status_{run_id}",
+                            )
+
+                        # 筛选
+                        detail_results = judge_results_viz.copy()
+                        if filter_track != "全部":
+                            detail_results = [r for r in detail_results if r.get("evaluation_track") == filter_track]
+                        if filter_status == "成功":
+                            detail_results = [r for r in detail_results if "error" not in r and r.get("answer_correct")]
+                        elif filter_status == "失败":
+                            detail_results = [r for r in detail_results if "error" not in r and not r.get("answer_correct")]
+                        elif filter_status == "错误":
+                            detail_results = [r for r in detail_results if "error" in r]
+
+                        if detail_results:
+                            detail_rows = []
+                            for r in detail_results:
+                                tid = r.get("trace_id", "")
+                                detail_rows.append({
+                                    "问题": (r.get("question", "") or "")[:50],
+                                    "trace_id": tid[:12] + "..." if len(tid) > 12 else tid,
+                                    "评测轨道": r.get("evaluation_track", ""),
+                                    "Top1": "✓" if r.get("retrieval_top1_hit") else ("✗" if r.get("retrieval_top1_hit") is not None else ""),
+                                    "Top3": "✓" if r.get("retrieval_top3_hit") else ("✗" if r.get("retrieval_top3_hit") is not None else ""),
+                                    "Top5": "✓" if r.get("retrieval_top5_hit") else ("✗" if r.get("retrieval_top5_hit") is not None else ""),
+                                    "answer_correct": "✓" if r.get("answer_correct") else ("✗" if r.get("answer_correct") is not None else ""),
+                                    "reason": (r.get("reason", "") or "")[:60],
+                                    "error": (r.get("error", "") or "")[:40],
+                                })
+                            st.dataframe(detail_rows, use_container_width=True, key=f"exp_detail_df_{run_id}")
+                            st.caption(f"共 {len(detail_results)} 条记录")
+                        else:
+                            st.info("无匹配的评测记录")
+
+                # 配置快照 + 修正
+                snapshot = run.get("config_snapshot", {})
+                with st.expander("配置快照详情（可修正）", expanded=False):
+                    st.json(snapshot)
+                    st.markdown("---")
+                    st.markdown("**修正本次运行的配置记录**")
+                    st.caption("仅修正描述性字段，不影响其他运行或配置方案。用于补录旧 run 的实际参数。")
+                    with st.form(f"edit_snapshot_{run_id}"):
+                        ss_col1, ss_col2 = st.columns(2)
+                        with ss_col1:
+                            ss_kb = st.text_input("知识库版本", value=snapshot.get("knowledge_base_version", ""), key=f"ss_kb_{run_id}")
+                            ss_wf = st.text_input("工作流版本", value=snapshot.get("workflow_version", ""), key=f"ss_wf_{run_id}")
+                            ss_topk = st.text_input("Top K", value=str(snapshot.get("top_k", "")), key=f"ss_topk_{run_id}")
+                            ss_rerank = st.text_input("Rerank 模型", value=snapshot.get("rerank_model", ""), key=f"ss_rerank_{run_id}")
+                        with ss_col2:
+                            ss_embed = st.text_input("Embedding 模型", value=snapshot.get("embedding_model", ""), key=f"ss_embed_{run_id}")
+                            ss_mode = st.text_input("检索模式", value=snapshot.get("retrieval_mode", ""), key=f"ss_mode_{run_id}")
+                            ss_chunk = st.text_input("分块策略", value=snapshot.get("chunk_strategy", ""), key=f"ss_chunk_{run_id}")
+                            ss_notes = st.text_area("备注", value=snapshot.get("notes", ""), key=f"ss_notes_{run_id}", height=68)
+                        ss_note = st.text_input("修正说明", value="", key=f"ss_note_{run_id}",
+                                                help="如：补录实际使用的 Rerank 配置")
+                        ss_submit = st.form_submit_button("保存修正", type="primary")
+
+                    if ss_submit:
+                        from experiment import update_run_snapshot
+                        ss_updates = {
+                            "knowledge_base_version": ss_kb,
+                            "workflow_version": ss_wf,
+                            "embedding_model": ss_embed,
+                            "retrieval_mode": ss_mode,
+                            "chunk_strategy": ss_chunk,
+                            "notes": ss_notes,
+                        }
+                        if ss_topk.strip():
+                            try:
+                                ss_updates["top_k"] = int(ss_topk)
+                            except ValueError:
+                                ss_updates["top_k"] = ss_topk
+                        if ss_rerank.strip():
+                            ss_updates["rerank_model"] = ss_rerank
+                        update_run_snapshot(run_id, ss_updates, edit_note=ss_note)
+                        st.success(f"本次运行的配置记录已修正，不影响其他运行。")
+                        st.rerun()
+
+        # ========== 运行历史 ==========
+        if len(config_runs) >= 1:
+            st.markdown("---")
+            with st.expander("运行历史（点击展开）", expanded=False):
+                st.markdown(f"**配置 {selected_config.get('config_name', '')} 下共 {len(config_runs)} 次运行**")
+
+                # 收集每次运行的指标（按最新运行时间倒序）
+                history_rows = []
+                history_metrics = []  # (run_time, t1, t3, t5, qa_acc)
+                for run in config_runs:
+                    rid = run.get("run_id", "")
+                    rs = get_run_status(
+                        rid,
+                        batch_dir=str(BATCH_DIR),
+                        raw_dir=str(RAW_DIR),
+                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        judged_file=str(JUDGED_FILE),
+                    )
+                    j_results = rs.get("judge_results", [])
+                    valid_j = [r for r in j_results if "error" not in r]
+                    retrieval_j = [r for r in valid_j if r.get("evaluation_track") == TRACK_RETRIEVAL]
+                    strict_qa_j = [r for r in valid_j if r.get("evaluation_track") == TRACK_STRICT_QA]
+
+                    t1 = t3 = t5 = qa_acc = None
+                    if retrieval_j:
+                        n = len(retrieval_j)
+                        t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_j) / n
+                        t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_j) / n
+                        t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_j) / n
+                    if strict_qa_j:
+                        n = len(strict_qa_j)
+                        qa_acc = sum(r.get("answer_correct", 0) for r in strict_qa_j) / n
+
+                    run_time = run.get("started_at", "")[:19]
+                    history_rows.append({
+                        "运行 ID": rid,
+                        "运行时间": run_time,
+                        "题集": rs.get("question_set_name") or run.get("question_set_name", "") or "旧版",
+                        "题数": run.get("question_count", 0),
+                        "Judge 数": rs.get("judge_count", 0),
+                        "Top1": f"{t1:.0%}" if t1 is not None else "N/A",
+                        "Top3": f"{t3:.0%}" if t3 is not None else "N/A",
+                        "Top5": f"{t5:.0%}" if t5 is not None else "N/A",
+                        "QA 正确率": f"{qa_acc:.0%}" if qa_acc is not None else "N/A",
+                    })
+                    if t1 is not None:
+                        history_metrics.append((run_time, t1, t3, t5))
+
+                # 按运行时间倒序
+                history_rows.sort(key=lambda x: x["运行时间"], reverse=True)
+                st.dataframe(history_rows, use_container_width=True)
+
+                # 轻量时间趋势图：横轴运行时间，纵轴 Top1/Top3/Top5
+                if len(history_metrics) >= 2:
+                    history_metrics.sort(key=lambda x: x[0])  # 按时间正序
+                    trend_times = [m[0] for m in history_metrics]
+                    trend_t1 = [m[1] * 100 for m in history_metrics]
+                    trend_t3 = [m[2] * 100 for m in history_metrics]
+                    trend_t5 = [m[3] * 100 for m in history_metrics]
+
+                    fig_trend = go.Figure()
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_times, y=trend_t1, mode="lines+markers",
+                        name="Top1 Hit", line=dict(color="#1f77b4"),
+                    ))
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_times, y=trend_t3, mode="lines+markers",
+                        name="Top3 Hit", line=dict(color="#2ca02c"),
+                    ))
+                    fig_trend.add_trace(go.Scatter(
+                        x=trend_times, y=trend_t5, mode="lines+markers",
+                        name="Top5 Hit", line=dict(color="#9467bd"),
+                    ))
+                    fig_trend.update_layout(
+                        yaxis_title="百分比 (%)", yaxis_range=[0, 100],
+                        height=350, margin=dict(t=40, b=30),
+                    )
+                    st.caption("检索指标变化趋势")
+                    st.plotly_chart(fig_trend, use_container_width=True, key="history_trend")
