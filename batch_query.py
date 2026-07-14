@@ -1,6 +1,13 @@
-"""批量提问模块 — 调用 Dify chat-messages API 逐条提问并收集结果。
+"""批量提问模块 — 调用 Dify Workflow API 逐条提问并收集结果。
 
-输出格式与 parser.py 的 sample 结构兼容，可直接作为"样本列表"和"评测"的输入。
+用户选择题集和 RAG 配置方案后，通过 Dify chat-messages API（blocking 模式）批量提问。
+输出格式与 parser.py 的 sample 结构兼容，携带 run_id、config_id、question_id 等关联信息。
+
+输出：
+- data/batch/batch_results_<时间戳>.jsonl — 完整结果（含成功/失败状态）
+- data/raw/batch_qa_<时间戳>.jsonl — 仅成功结果（供样本准备解析）
+
+注意：batch_qa_* trace_id 是本模块生成的文件标识，不是 Langfuse trace_id。
 """
 
 import json

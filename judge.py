@@ -1,7 +1,15 @@
 """
-Judge LLM module - evaluates RAG samples using an LLM judge.
+Judge 评测模块 — 使用 LLM 对结构化样本进行自动评分。
 
-Uses OpenAI-compatible chat completions API via requests.
+使用 OpenAI 兼容的 chat completions API。
+
+评测轨道：
+- retrieval（检索评测）：有金标准证据，计算 Top1/Top3/Top5 Hit
+- strict_qa（严格问答）：有 reference_answer，评判回答正确性
+- grounded_qa（合理性问答）：无参考答案，基于检索内容判断合理性
+- not_evaluable（不可评测）：缺少金标准证据的检索评测题
+
+三层优化：结果跳过、内容级去重（compute_content_hash）、规则预筛选（pre_screen）。
 """
 
 import hashlib

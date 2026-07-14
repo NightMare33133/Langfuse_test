@@ -1,9 +1,15 @@
 """
-Langfuse JSONL export parser - reusable functions for parsing Langfuse traces.
+样本准备模块 — 解析 Dify / Langfuse 记录为结构化样本，回填参考答案和运行元数据。
 
-Supports both of the Langfuse export shapes currently seen in this project:
-1. Events export: one observation per line, `input`/`output` often stored as JSON strings.
-2. API export: one trace root plus child observations, `input`/`output` already parsed.
+支持两种 Langfuse 导出格式：
+1. Events export: 一行一个 observation，input/output 通常是 JSON 字符串
+2. API export: 一行一个 trace 根节点加子 observation，input/output 已解析
+
+核心流程：
+- 按 traceId 聚合 observations → 构建结构化样本
+- 从题目库回填 reference_answer、source_excerpt、question_mode 等
+- 从 user_id (rag_eval:<run_id>:<question_id>) 回填 run_id、question_set_id 等元数据
+- 产出 processed samples（使用真实 Langfuse trace_id），供 Judge 评测消费
 """
 
 import json
