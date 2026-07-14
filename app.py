@@ -338,6 +338,285 @@ def _compute_subset_metrics(results, has_ref_filter):
     }
 
 
+# ---------- 评测详情渲染（Judge 页与运行看板共享） ----------
+
+def render_retrieval_result_detail(result: dict, sample: dict, key_prefix: str = ""):
+    """渲染单条检索评测详情。Judge 页和运行看板共用。"""
+    _tid = result.get("trace_id", "")
+    _q = result.get("question", "(无问题)")
+    _t1 = result.get("retrieval_top1_hit")
+    _t3 = result.get("retrieval_top3_hit")
+    _t5 = result.get("retrieval_top5_hit")
+    _hit_pos = result.get("hit_evidence_position")
+
+    _result_status = build_result_status(result)
+    _icon = _result_status["icon"]
+    _title = _result_status["title"]
+
+    _sample = sample or {}
+    _has_sample = bool(_sample)
+
+    with st.expander(f"{_icon} {_q[:45]}{'...' if len(_q) > 45 else ''} ｜{_title}"):
+        # 1. 问题
+        st.markdown(f"**问题**: {_q}")
+
+        # 2. 金标准证据
+        _gold = (_sample.get("source_excerpt") or "").strip()
+        if not _gold:
+            _gold = (_sample.get("reference_answer") or "").strip()
+        if _gold:
+            st.markdown("**金标准证据**")
+            st.code(_gold[:1000], language=None)
+        elif not _has_sample:
+            st.caption("未找到关联样本，无法显示金标准证据")
+
+        # 3. 实际检索结果（TopK）
+        _retrieval_results = _sample.get("retrieval_results") or []
+        if _retrieval_results:
+            st.markdown("**实际检索结果**")
+            for _rr in sorted(_retrieval_results, key=lambda x: x.get("position", 999)):
+                _pos = _rr.get("position", "?")
+                _score = _rr.get("score")
+                _doc_name = _rr.get("document_name") or ""
+                _content = (_rr.get("content") or "")[:300]
+                _is_hit = (_hit_pos is not None and _pos == _hit_pos)
+
+                _pos_label = f"Top{_pos}"
+                _score_label = f"(score: {_score:.4f})" if _score is not None else ""
+                _hit_label = " **命中金标准证据**" if _is_hit else ""
+
+                with st.expander(f"{_pos_label} {_doc_name} {_score_label}{_hit_label}", expanded=_is_hit):
+                    if _is_hit:
+                        st.success("命中金标准证据")
+                    st.caption(f"文档: {_doc_name}" if _doc_name else "")
+                    st.code(_content, language=None)
+                    if len(_rr.get("content") or "") > 300:
+                        with st.expander("展开完整内容"):
+                            st.text(_rr.get("content", ""))
+
+        # 4. Top1/Top3/Top5 判定与 Judge 原因
+        st.markdown("**检索命中判定**")
+        st.markdown(f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
+        st.markdown(f"**Judge 原因**: {result.get('reason', '(无)')}")
+
+        # 5. 最终回答（辅助参考）
+        if _has_sample:
+            _final = _sample.get("final_answer") or "(无)"
+            st.markdown("**最终回答（辅助参考）**")
+            st.code(_final[:500], language=None)
+
+        # 错误信息
+        if result.get("error"):
+            st.error(f"评测错误: {result['error']}")
+
+        st.caption(f"trace_id: `{_tid}`")
+
+
+def render_strict_qa_result_detail(result: dict, sample: dict, key_prefix: str = ""):
+    """渲染单条严格问答详情。Judge 页和运行看板共用。"""
+    _tid = result.get("trace_id", "")
+    _q = result.get("question", "(无问题)")
+
+    _result_status = build_result_status(result)
+    _icon = _result_status["icon"]
+    _title = _result_status["title"]
+
+    _sample = sample or {}
+    _has_sample = bool(_sample)
+
+    with st.expander(f"{_icon} {_q[:50]}{'...' if len(_q) > 50 else ''} ｜{_title}"):
+        st.markdown(f"**问题**: {_q}")
+
+        # 最终回答
+        _final = _sample.get("final_answer") or "(无)" if _has_sample else "(未找到关联样本)"
+        st.markdown("**最终回答**")
+        st.code(_final[:1500], language=None)
+
+        # 参考答案
+        _ref = (_sample.get("reference_answer") or "").strip() if _has_sample else ""
+        if _ref:
+            st.markdown("**参考答案**")
+            st.code(_ref[:1500], language=None)
+
+        # 检索诊断（辅助）
+        _has_excerpt = bool((_sample.get("source_excerpt") or "").strip()) if _has_sample else False
+        _has_topk = (result.get("retrieval_top1_hit") is not None
+                     or result.get("retrieval_top3_hit") is not None
+                     or result.get("retrieval_top5_hit") is not None)
+        if _has_excerpt and _has_topk:
+            with st.expander("检索诊断（辅助）", expanded=False):
+                st.caption("辅助诊断，不计入严格回答正确率；用于定位回答错误是否由检索失败造成。")
+                _t1 = result.get("retrieval_top1_hit")
+                _t3 = result.get("retrieval_top3_hit")
+                _t5 = result.get("retrieval_top5_hit")
+                _hit_pos = result.get("hit_evidence_position")
+
+                st.markdown("**TopK 命中状态**")
+                st.markdown(f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
+
+                _retrieval_results = _sample.get("retrieval_results") or []
+                if _retrieval_results:
+                    st.markdown("**实际检索结果**")
+                    for _rr in sorted(_retrieval_results, key=lambda x: x.get("position", 999)):
+                        _pos = _rr.get("position", "?")
+                        _score = _rr.get("score")
+                        _doc_name = _rr.get("document_name") or ""
+                        _content = (_rr.get("content") or "")[:300]
+                        _is_hit = (_hit_pos is not None and _pos == _hit_pos)
+
+                        _pos_label = f"Top{_pos}"
+                        _score_label = f"(score: {_score:.4f})" if _score is not None else ""
+                        _hit_label = " **命中金标准证据**" if _is_hit else ""
+
+                        with st.expander(f"{_pos_label} {_doc_name} {_score_label}{_hit_label}", expanded=_is_hit):
+                            if _is_hit:
+                                st.success("命中金标准证据")
+                            st.caption(f"文档: {_doc_name}" if _doc_name else "")
+                            st.code(_content, language=None)
+                            if len(_rr.get("content") or "") > 300:
+                                with st.expander("展开完整内容"):
+                                    st.text(_rr.get("content", ""))
+
+                _gold = (_sample.get("source_excerpt") or "").strip()
+                if _gold:
+                    st.markdown("**金标准证据**")
+                    st.code(_gold[:500], language=None)
+
+        st.markdown(f"**Judge 原因**: {result.get('reason', '(无)')}")
+
+        if result.get("error"):
+            st.error(f"评测错误: {result['error']}")
+
+        st.caption(f"trace_id: `{_tid}`")
+
+
+def render_grounded_qa_result_detail(result: dict, sample: dict, key_prefix: str = ""):
+    """渲染单条合理性问答详情。Judge 页和运行看板共用。"""
+    _tid = result.get("trace_id", "")
+    _q = result.get("question", "(无问题)")
+
+    _result_status = build_result_status(result)
+    _icon = _result_status["icon"]
+    _title = _result_status["title"]
+
+    _sample = sample or {}
+    _has_sample = bool(_sample)
+
+    with st.expander(f"{_icon} {_q[:50]}{'...' if len(_q) > 50 else ''} ｜{_title}"):
+        st.markdown(f"**问题**: {_q}")
+
+        _final = _sample.get("final_answer") or "(无)" if _has_sample else "(未找到关联样本)"
+        st.markdown("**最终回答**")
+        st.code(_final[:1500], language=None)
+
+        st.markdown(f"**Judge 原因**: {result.get('reason', '(无)')}")
+
+        if result.get("error"):
+            st.error(f"评测错误: {result['error']}")
+
+        st.caption(f"trace_id: `{_tid}`")
+
+
+def render_judge_result_detail(result: dict, sample: dict, key_prefix: str = ""):
+    """根据 evaluation_track 分派到对应的详情渲染函数。"""
+    track = result.get("evaluation_track", "")
+    if track == TRACK_RETRIEVAL:
+        render_retrieval_result_detail(result, sample, key_prefix)
+    elif track == TRACK_STRICT_QA:
+        render_strict_qa_result_detail(result, sample, key_prefix)
+    elif track == TRACK_GROUNDED_QA:
+        render_grounded_qa_result_detail(result, sample, key_prefix)
+    else:
+        # 通用回退：显示基本信息
+        _q = result.get("question", "(无问题)")
+        _tid = result.get("trace_id", "")
+        with st.expander(f"❓ {_q[:50]} ｜{track or '未知'}"):
+            st.markdown(f"**问题**: {_q}")
+            if result.get("error"):
+                st.error(f"评测错误: {result['error']}")
+            st.markdown(f"**Judge 原因**: {result.get('reason', '(无)')}")
+            st.caption(f"trace_id: `{_tid}` | evaluation_track: {track}")
+
+
+def render_judge_results_list(results: list, sample_map: dict, key_prefix: str = "jr",
+                               page_size: int = 20):
+    """渲染 Judge 结果详情列表，带筛选和分页。Judge 页和运行看板共用。
+
+    Args:
+        results: 当前 run 的 Judge result 列表
+        sample_map: {trace_id: sample_dict} 映射
+        key_prefix: Streamlit widget key 前缀
+        page_size: 每页渲染数量
+    """
+    if not results:
+        st.info("暂无评测结果")
+        return
+
+    from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
+
+    # 筛选控件
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        track_options = ["全部"]
+        tracks_present = set(r.get("evaluation_track", "") for r in results)
+        if TRACK_RETRIEVAL in tracks_present:
+            track_options.append("retrieval")
+        if TRACK_STRICT_QA in tracks_present:
+            track_options.append("strict_qa")
+        if TRACK_GROUNDED_QA in tracks_present:
+            track_options.append("grounded_qa")
+        filter_track = st.selectbox("按评测轨道筛选", track_options, key=f"{key_prefix}_track")
+    with filter_col2:
+        filter_status = st.selectbox(
+            "按结果状态筛选", ["全部", "命中/正确", "未命中/错误", "错误"],
+            key=f"{key_prefix}_status",
+        )
+    with filter_col3:
+        st.markdown("")
+        st.markdown("")
+
+    # 应用筛选
+    filtered = list(results)
+    if filter_track != "全部":
+        filtered = [r for r in filtered if r.get("evaluation_track") == filter_track]
+    if filter_status == "命中/正确":
+        filtered = [r for r in filtered if "error" not in r and (
+            r.get("retrieval_top1_hit") or r.get("answer_correct"))]
+    elif filter_status == "未命中/错误":
+        filtered = [r for r in filtered if "error" not in r and (
+            not r.get("retrieval_top1_hit") and not r.get("answer_correct"))]
+    elif filter_status == "错误":
+        filtered = [r for r in filtered if "error" in r]
+
+    st.caption(f"筛选后 {len(filtered)} 条结果（共 {len(results)} 条）")
+
+    if not filtered:
+        st.info("无匹配的评测结果")
+        return
+
+    # 分页
+    total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+    if total_pages > 1:
+        page_col1, page_col2, _ = st.columns([1, 1, 4])
+        with page_col1:
+            page_num = st.number_input(
+                "页码", min_value=1, max_value=total_pages, value=1, key=f"{key_prefix}_page",
+            )
+        with page_col2:
+            st.markdown("")
+            st.caption(f"共 {total_pages} 页")
+        start_idx = (page_num - 1) * page_size
+        page_results = filtered[start_idx:start_idx + page_size]
+    else:
+        page_results = filtered
+
+    # 渲染每条详情
+    for r in page_results:
+        tid = r.get("trace_id", "")
+        sample = sample_map.get(tid, {})
+        render_judge_result_detail(r, sample, key_prefix)
+
+
 st.set_page_config(page_title="Langfuse RAG 评测工具", layout="wide")
 st.title("Langfuse RAG 评测工具")
 
@@ -3322,69 +3601,12 @@ Judge 有三层减少重复调用的机制：
                             else:
                                 st.info("无有效评测数据")
 
-                        # 检索评测详情（按展示顺序：问题 → 金标准证据 → 实际检索结果 → TopK 判定 → 最终回答）
+                        # 检索评测详情
                         st.markdown("##### 检索评测详情")
                         for r in _sa:
                             _tid = r.get("trace_id", "")
                             _sample = _sample_map.get(_tid, {})
-                            _q = r.get("question", "(无问题)")
-                            _t1 = r.get("retrieval_top1_hit")
-                            _t3 = r.get("retrieval_top3_hit")
-                            _t5 = r.get("retrieval_top5_hit")
-                            _hit_pos = r.get("hit_evidence_position")
-
-                            # 使用 build_result_status 获取状态信息
-                            _result_status = build_result_status(r)
-                            _icon = _result_status["icon"]
-                            _title = _result_status["title"]
-
-                            with st.expander(f"{_icon} {_q[:45]}{'...' if len(_q) > 45 else ''} ｜{_title}"):
-                                # 1. 问题
-                                st.markdown(f"**问题**: {_q}")
-
-                                # 2. 金标准证据
-                                _gold = (_sample.get("source_excerpt") or "").strip()
-                                if not _gold:
-                                    _gold = (_sample.get("reference_answer") or "").strip()
-                                if _gold:
-                                    st.markdown("**金标准证据**")
-                                    st.code(_gold[:1000], language=None)
-
-                                # 3. 实际检索结果（TopK）
-                                _retrieval_results = _sample.get("retrieval_results") or []
-                                if _retrieval_results:
-                                    st.markdown("**实际检索结果**")
-                                    for _rr in sorted(_retrieval_results, key=lambda x: x.get("position", 999)):
-                                        _pos = _rr.get("position", "?")
-                                        _score = _rr.get("score")
-                                        _doc_name = _rr.get("document_name") or ""
-                                        _content = (_rr.get("content") or "")[:300]
-                                        _is_hit = (_hit_pos is not None and _pos == _hit_pos)
-
-                                        # 标签
-                                        _pos_label = f"Top{_pos}"
-                                        _score_label = f"(score: {_score:.4f})" if _score is not None else ""
-                                        _hit_label = " **命中金标准证据**" if _is_hit else ""
-
-                                        with st.expander(f"{_pos_label} {_doc_name} {_score_label}{_hit_label}", expanded=_is_hit):
-                                            if _is_hit:
-                                                st.success("命中金标准证据")
-                                            st.caption(f"文档: {_doc_name}" if _doc_name else "")
-                                            st.code(_content, language=None)
-                                            if len(_rr.get("content") or "") > 300:
-                                                with st.expander("展开完整内容"):
-                                                    st.text(_rr.get("content", ""))
-
-                                # 4. Top1/Top3/Top5 判定与 Judge 原因
-                                st.markdown("**检索命中判定**")
-                                st.markdown(f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
-                                st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-
-                                # 5. 最终回答（辅助参考）
-                                _final = _sample.get("final_answer") or "(无)"
-                                st.markdown("**最终回答（辅助参考）**")
-                                st.code(_final[:500], language=None)
-                                st.caption(f"trace_id: `{_tid}`")
+                            render_retrieval_result_detail(r, _sample, f"judge_ret_{_tid[:8]}")
                     tab_idx += 1
 
                 # 严格问答详情
@@ -3432,73 +3654,7 @@ Judge 有三层减少重复调用的机制：
                         for r in _sa:
                             _tid = r.get("trace_id", "")
                             _sample = _sample_map.get(_tid, {})
-                            _q = r.get("question", "(无问题)")
-
-                            # 使用 build_result_status 获取状态信息
-                            _result_status = build_result_status(r)
-                            _icon = _result_status["icon"]
-                            _title = _result_status["title"]
-
-                            with st.expander(f"{_icon} {_q[:50]}{'...' if len(_q) > 50 else ''} ｜{_title}"):
-                                st.markdown(f"**问题**: {_q}")
-                                _final = _sample.get("final_answer") or "(无)"
-                                st.markdown("**最终回答**")
-                                st.code(_final[:1500], language=None)
-                                _ref = (_sample.get("reference_answer") or "").strip()
-                                if _ref:
-                                    st.markdown("**参考答案**")
-                                    st.code(_ref[:1500], language=None)
-
-                                # 检索诊断（辅助）：仅当有 source_excerpt 且有有效 TopK 判定时显示
-                                _has_excerpt = bool((_sample.get("source_excerpt") or "").strip())
-                                _has_topk = (r.get("retrieval_top1_hit") is not None
-                                             or r.get("retrieval_top3_hit") is not None
-                                             or r.get("retrieval_top5_hit") is not None)
-                                if _has_excerpt and _has_topk:
-                                    with st.expander("检索诊断（辅助）", expanded=False):
-                                        st.caption("辅助诊断，不计入严格回答正确率；用于定位回答错误是否由检索失败造成。")
-                                        _t1 = r.get("retrieval_top1_hit")
-                                        _t3 = r.get("retrieval_top3_hit")
-                                        _t5 = r.get("retrieval_top5_hit")
-                                        _hit_pos = r.get("hit_evidence_position")
-
-                                        # TopK 命中状态
-                                        st.markdown("**TopK 命中状态**")
-                                        st.markdown(f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
-
-                                        # 实际检索结果
-                                        _retrieval_results = _sample.get("retrieval_results") or []
-                                        if _retrieval_results:
-                                            st.markdown("**实际检索结果**")
-                                            for _rr in sorted(_retrieval_results, key=lambda x: x.get("position", 999)):
-                                                _pos = _rr.get("position", "?")
-                                                _score = _rr.get("score")
-                                                _doc_name = _rr.get("document_name") or ""
-                                                _content = (_rr.get("content") or "")[:300]
-                                                _is_hit = (_hit_pos is not None and _pos == _hit_pos)
-
-                                                # 标签
-                                                _pos_label = f"Top{_pos}"
-                                                _score_label = f"(score: {_score:.4f})" if _score is not None else ""
-                                                _hit_label = " **命中金标准证据**" if _is_hit else ""
-
-                                                with st.expander(f"{_pos_label} {_doc_name} {_score_label}{_hit_label}", expanded=_is_hit):
-                                                    if _is_hit:
-                                                        st.success("命中金标准证据")
-                                                    st.caption(f"文档: {_doc_name}" if _doc_name else "")
-                                                    st.code(_content, language=None)
-                                                    if len(_rr.get("content") or "") > 300:
-                                                        with st.expander("展开完整内容"):
-                                                            st.text(_rr.get("content", ""))
-
-                                        # 金标准证据
-                                        _gold = (_sample.get("source_excerpt") or "").strip()
-                                        if _gold:
-                                            st.markdown("**金标准证据**")
-                                            st.code(_gold[:500], language=None)
-
-                                st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-                                st.caption(f"trace_id: `{_tid}`")
+                            render_strict_qa_result_detail(r, _sample, f"judge_strict_{_tid[:8]}")
                     tab_idx += 1
 
                 # 合理性问答详情
@@ -3527,20 +3683,7 @@ Judge 有三层减少重复调用的机制：
                         for r in _sa:
                             _tid = r.get("trace_id", "")
                             _sample = _sample_map.get(_tid, {})
-                            _q = r.get("question", "(无问题)")
-
-                            # 使用 build_result_status 获取状态信息
-                            _result_status = build_result_status(r)
-                            _icon = _result_status["icon"]
-                            _title = _result_status["title"]
-
-                            with st.expander(f"{_icon} {_q[:50]}{'...' if len(_q) > 50 else ''} ｜{_title}"):
-                                st.markdown(f"**问题**: {_q}")
-                                _final = _sample.get("final_answer") or "(无)"
-                                st.markdown("**最终回答**")
-                                st.code(_final[:1500], language=None)
-                                st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-                                st.caption(f"trace_id: `{_tid}`")
+                            render_grounded_qa_result_detail(r, _sample, f"judge_grounded_{_tid[:8]}")
                     tab_idx += 1
 
                 # 缺少金标准详情
@@ -4204,6 +4347,30 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         valid_viz = [r for r in judge_results_viz if "error" not in r]
                         error_viz = [r for r in judge_results_viz if "error" in r]
 
+                        # 加载当前 run 的 processed samples 构建 sample_map
+                        _run_sample_map = {}
+                        _proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+                        if _proc_path.exists():
+                            try:
+                                with _proc_path.open("r", encoding="utf-8") as _pf:
+                                    for _pline in _pf:
+                                        if not _pline.strip():
+                                            continue
+                                        _pobj = json.loads(_pline)
+                                        _p_run_id = _pobj.get("run_id", "")
+                                        if not _p_run_id:
+                                            _p_uid = _pobj.get("user_id", "")
+                                            if _p_uid.startswith("rag_eval:"):
+                                                _p_parts = _p_uid.split(":", 2)
+                                                if len(_p_parts) == 3:
+                                                    _p_run_id = _p_parts[1]
+                                        if _p_run_id == run_id:
+                                            _ptid = _pobj.get("trace_id", "")
+                                            if _ptid:
+                                                _run_sample_map[_ptid] = _pobj
+                            except (json.JSONDecodeError, IOError):
+                                pass
+
                         st.markdown("---")
                         st.markdown("##### 评测结果可视化")
 
@@ -4301,57 +4468,13 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 fig_ans.update_layout(height=300, margin=dict(t=40, b=20))
                                 st.plotly_chart(fig_ans, use_container_width=True, key=f"exp_ans_{run_id}")
 
-                        # -- 逐题评测明细 --
-                        st.markdown("##### 逐题评测明细")
-                        detail_col1, detail_col2 = st.columns(2)
-                        with detail_col1:
-                            track_options = ["全部"]
-                            if retrieval_viz:
-                                track_options.append("retrieval")
-                            if strict_qa_viz:
-                                track_options.append("strict_qa")
-                            if grounded_qa_viz:
-                                track_options.append("grounded_qa")
-                            filter_track = st.selectbox(
-                                "按评测轨道筛选", track_options,
-                                key=f"exp_detail_track_{run_id}",
-                            )
-                        with detail_col2:
-                            filter_status = st.selectbox(
-                                "按结果状态筛选", ["全部", "成功", "失败", "错误"],
-                                key=f"exp_detail_status_{run_id}",
-                            )
-
-                        # 筛选
-                        detail_results = judge_results_viz.copy()
-                        if filter_track != "全部":
-                            detail_results = [r for r in detail_results if r.get("evaluation_track") == filter_track]
-                        if filter_status == "成功":
-                            detail_results = [r for r in detail_results if "error" not in r and r.get("answer_correct")]
-                        elif filter_status == "失败":
-                            detail_results = [r for r in detail_results if "error" not in r and not r.get("answer_correct")]
-                        elif filter_status == "错误":
-                            detail_results = [r for r in detail_results if "error" in r]
-
-                        if detail_results:
-                            detail_rows = []
-                            for r in detail_results:
-                                tid = r.get("trace_id", "")
-                                detail_rows.append({
-                                    "问题": (r.get("question", "") or "")[:50],
-                                    "trace_id": tid[:12] + "..." if len(tid) > 12 else tid,
-                                    "评测轨道": r.get("evaluation_track", ""),
-                                    "Top1": "✓" if r.get("retrieval_top1_hit") else ("✗" if r.get("retrieval_top1_hit") is not None else ""),
-                                    "Top3": "✓" if r.get("retrieval_top3_hit") else ("✗" if r.get("retrieval_top3_hit") is not None else ""),
-                                    "Top5": "✓" if r.get("retrieval_top5_hit") else ("✗" if r.get("retrieval_top5_hit") is not None else ""),
-                                    "answer_correct": "✓" if r.get("answer_correct") else ("✗" if r.get("answer_correct") is not None else ""),
-                                    "reason": (r.get("reason", "") or "")[:60],
-                                    "error": (r.get("error", "") or "")[:40],
-                                })
-                            st.dataframe(detail_rows, use_container_width=True, key=f"exp_detail_df_{run_id}")
-                            st.caption(f"共 {len(detail_results)} 条记录")
-                        else:
-                            st.info("无匹配的评测记录")
+                        # -- 评测详情（本次运行） --
+                        st.markdown("---")
+                        st.markdown("##### 评测详情（本次运行）")
+                        render_judge_results_list(
+                            judge_results_viz, _run_sample_map,
+                            key_prefix=f"exp_detail_{run_id}", page_size=20,
+                        )
 
                 # 配置快照 + 修正
                 snapshot = run.get("config_snapshot", {})
