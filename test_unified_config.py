@@ -4,8 +4,8 @@
 测试内容：
 1. 新建配置后 JSON 同时含有编辑页所需的全部字段
 2. 旧格式配置可正常加载、显示和编辑
-3. 批量提问创建的配置，在实验版本编辑页字段和值完全一致
-4. 在实验版本编辑后的配置，在批量提问历史配置摘要中同步体现
+3. 批量提问创建的配置，在运行看板编辑页字段和值完全一致
+4. 在运行看板编辑后的配置，在批量提问历史配置摘要中同步体现
 5. 核心字段不可由任意表单修改
 6. 不调用任何外部 API
 """
@@ -161,7 +161,7 @@ def test_old_config_loads():
 
 
 def test_consistency_between_tabs():
-    """批量提问创建的配置与实验版本编辑页字段一致。"""
+    """批量提问创建的配置与运行看板编辑页字段一致。"""
     print("=" * 60)
     print("测试跨 Tab 字段一致性")
     print("=" * 60)
@@ -191,7 +191,7 @@ def test_consistency_between_tabs():
             config = create_config_profile(**filtered)
             loaded = load_config_profile(config["config_id"])
 
-            # 模拟实验版本编辑页读取（同一字段、同一值）
+            # 模拟运行看板编辑页读取（同一字段、同一值）
             for key, label, required, widget, placeholder, help_text in CONFIG_FIELD_SCHEMA:
                 display_val = get_config_display_value(loaded, key)
                 expected = batch_values.get(key)
@@ -203,7 +203,7 @@ def test_consistency_between_tabs():
 
             print("[OK] 批量创建的配置在编辑页显示一致")
 
-            # 模拟实验版本编辑（更新部分字段）
+            # 模拟运行看板编辑（更新部分字段）
             updated = update_config_profile_safe(config["config_id"], {
                 "top_k": 10,
                 "notes": "编辑后备注",

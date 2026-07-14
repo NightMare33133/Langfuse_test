@@ -1,5 +1,5 @@
 """
-实验版本可视化增强测试。
+运行看板可视化增强测试。
 
 测试内容：
 1. 当前 run 过滤：Judge 结果只显示当前 run 的数据
@@ -635,7 +635,7 @@ def test_error_results_handling():
 def main():
     """运行所有测试。"""
     print("=" * 60)
-    print("实验版本可视化增强测试")
+    print("运行看板可视化增强测试")
     print("=" * 60)
     print()
 

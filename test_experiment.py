@@ -1,5 +1,5 @@
 """
-实验版本管理测试。
+运行看板管理测试。
 
 测试内容：
 1. 同一 config_profile 创建两次运行，两个 run_id 必须不同
@@ -302,7 +302,7 @@ def test_dify_user_field():
 def main():
     """运行所有测试。"""
     print("=" * 60)
-    print("实验版本管理测试")
+    print("运行看板管理测试")
     print("=" * 60)
     print()
 

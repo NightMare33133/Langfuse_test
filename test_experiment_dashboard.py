@@ -1,5 +1,5 @@
 """
-实验版本看板测试。
+运行看板看板测试。
 
 测试内容：
 1. Langfuse user_id 可正确解析 run_id/question_id
@@ -260,7 +260,7 @@ def test_legacy_data_display():
 def main():
     """运行所有测试。"""
     print("=" * 60)
-    print("实验版本看板测试")
+    print("运行看板看板测试")
     print("=" * 60)
     print()
 

@@ -377,7 +377,7 @@ samples = st.session_state.get("samples")
 summary = st.session_state.get("summary") or {}
 
 # --- Tabs ---
-tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "实验版本"])
+tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板"])
 
 # ========== Tab: 题目生成 ==========
 with tab_qgen:
@@ -1348,7 +1348,7 @@ PISP和AISP的区别?
                     selected_config = load_config_profile(selected_config_id)
                     if selected_config:
                         st.caption(f"当前使用历史配置: **{selected_config.get('config_name', '')}**")
-                        # 只读摘要（与实验版本一致）
+                        # 只读摘要（与运行看板编辑一致）
                         with st.container(border=True):
                             st.markdown("**当前配置（只读）**")
                             render_config_form(selected_config, key_prefix="ro_batch", disabled=True)
@@ -3396,13 +3396,13 @@ Judge 有三层减少重复调用的机制：
                     mime="text/markdown",
                 )
 
-# ========== Tab: 实验版本 ==========
+# ========== Tab: 运行看板 ==========
 with tab_experiment:
-    st.subheader("实验版本管理")
-    st.caption("指定配置方案的运行看板：查看配置参数、运行记录、评测状态和指标")
+    st.subheader("配置与运行看板")
+    st.caption("按评测配置查看累计结果、运行历史和单次运行详情。")
 
     # ---------- 模块说明 ----------
-    with st.expander("实验版本说明（点击展开）", expanded=False):
+    with st.expander("运行看板说明（点击展开）", expanded=False):
         st.markdown("""
 **一句话总览：** 选择一个 RAG 配置方案，查看使用该配置的所有运行记录及其评测状态。
 

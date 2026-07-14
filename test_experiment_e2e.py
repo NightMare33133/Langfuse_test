@@ -1,5 +1,5 @@
 """
-实验版本看板端到端测试。
+运行看板看板端到端测试。
 
 模拟真实文件链路：
 题集 JSONL → batch_results.jsonl → raw JSONL → processed samples JSONL → judged results JSONL
@@ -29,9 +29,9 @@ from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA
 
 
 def test_e2e_experiment_pipeline():
-    """端到端测试实验版本看板。"""
+    """端到端测试运行看板看板。"""
     print("=" * 60)
-    print("端到端测试实验版本看板")
+    print("端到端测试运行看板看板")
     print("=" * 60)
 
     with tempfile.TemporaryDirectory() as tmpdir:

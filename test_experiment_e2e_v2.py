@@ -1,5 +1,5 @@
 """
-实验版本看板端到端测试 v2。
+运行看板看板端到端测试 v2。
 
 模拟真实情况：batch pseudo trace_id 与 Langfuse trace_id 不同。
 
