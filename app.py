@@ -1384,36 +1384,209 @@ PISP和AISP的区别?
 
     # --- Dify API config ---
     with st.expander("Dify API 配置", expanded=False):
-        dify_col1, dify_col2 = st.columns(2)
-        with dify_col1:
-            dify_api_key = st.text_input(
-                "Dify API Key", type="password",
-                value=os.getenv("DIFY_API_KEY", ""),
-                key="batch_dify_key",
-            )
-        with dify_col2:
-            dify_base_url = st.text_input(
-                "Dify Base URL",
-                value=os.getenv("DIFY_API_BASE", "http://localhost/v1"),
-                key="batch_dify_url",
-            )
-        opt_col1, opt_col2 = st.columns(2)
-        with opt_col1:
-            dify_timeout = st.number_input(
-                "请求超时（秒）", min_value=10, max_value=300, value=60, key="batch_timeout"
-            )
-        with opt_col2:
-            dify_delay = st.number_input(
-                "请求间隔（秒）", min_value=0.0, max_value=10.0, value=1.0, step=0.5, key="batch_delay",
-                help="每次请求之间的等待时间，避免过快调用"
-            )
+        from dify_connection import (
+            list_connection_profiles, load_connection_profile,
+            create_connection_profile, update_connection_profile, delete_connection_profile,
+            get_connection_api_key, has_connection_api_key, mask_api_key,
+        )
+
+        _env_api_key = os.getenv("DIFY_API_KEY", "")
+        _env_base_url = os.getenv("DIFY_API_BASE", "http://localhost/v1")
+
+        # 连接配置来源选择
+        dify_conn_source = st.radio(
+            "连接配置来源",
+            ["使用已保存连接配置", "临时手动填写"],
+            horizontal=True,
+            key="dify_conn_source",
+        )
+
+        # 初始化变量
+        dify_api_key = ""
+        dify_base_url = _env_base_url
+        dify_timeout = 60
+        dify_delay = 1.0
+        _selected_profile_id = ""
+        _selected_profile_name = ""
+        _selected_profile_desc = ""
+
+        if dify_conn_source == "使用已保存连接配置":
+            profiles = list_connection_profiles()
+            if not profiles:
+                st.info("暂无已保存的连接配置，请选择「临时手动填写」或创建新配置。")
+                dify_conn_source = "临时手动填写"
+            else:
+                # 下拉选择
+                profile_options = []
+                for p in profiles:
+                    pid = p.get("profile_id", "")
+                    pname = p.get("profile_name", "未命名")
+                    purl = pdesc = ""
+                    if pid:
+                        purl = p.get("base_url", "")
+                        pdesc = p.get("workflow_description", "")
+                    label = f"{pname} · {purl}"
+                    if pdesc:
+                        label += f" · {pdesc}"
+                    profile_options.append((pid, label))
+
+                _selected_profile_id = st.selectbox(
+                    "选择连接配置",
+                    options=[c[0] for c in profile_options],
+                    format_func=lambda x: next((c[1] for c in profile_options if c[0] == x), x),
+                    key="dify_selected_profile",
+                )
+
+                if _selected_profile_id:
+                    _sel_meta = load_connection_profile(_selected_profile_id)
+                    if _sel_meta:
+                        _selected_profile_name = _sel_meta.get("profile_name", "")
+                        _selected_profile_desc = _sel_meta.get("workflow_description", "")
+                        dify_base_url = _sel_meta.get("base_url", _env_base_url)
+                        dify_timeout = _sel_meta.get("timeout_seconds", 60)
+                        dify_delay = _sel_meta.get("request_interval_seconds", 1.0)
+
+                        # 显示掩码 API Key
+                        _saved_key = get_connection_api_key(_selected_profile_id)
+                        if _saved_key:
+                            dify_api_key = _saved_key
+                            st.caption(f"API Key: `{mask_api_key(_saved_key)}`（已从安全存储读取）")
+                        else:
+                            st.warning("该配置未保存 API Key，请在下方手动输入。")
+                            _manual_key = st.text_input(
+                                "临时 API Key", type="password", key="dify_temp_key_for_profile",
+                                help="仅本次会话使用，不写入磁盘",
+                            )
+                            if _manual_key:
+                                dify_api_key = _manual_key
+
+                        st.caption(f"Base URL: `{dify_base_url}` | 超时: {dify_timeout}s | 间隔: {dify_delay}s")
+
+                # 管理操作
+                mgmt_col1, mgmt_col2, mgmt_col3 = st.columns(3)
+                with mgmt_col1:
+                    if st.button("新建连接配置", key="dify_new_profile"):
+                        st.session_state["dify_show_new_profile_form"] = True
+                with mgmt_col2:
+                    if st.button("编辑连接配置", key="dify_edit_profile", disabled=not _selected_profile_id):
+                        st.session_state["dify_show_edit_profile_form"] = True
+                with mgmt_col3:
+                    if st.button("删除连接配置", key="dify_delete_profile", disabled=not _selected_profile_id):
+                        st.session_state["dify_show_delete_confirm"] = True
+
+                # 新建配置表单
+                if st.session_state.get("dify_show_new_profile_form"):
+                    with st.form("new_dify_profile_form"):
+                        st.markdown("**新建连接配置**")
+                        np_name = st.text_input("配置名称 *", placeholder="例如：金融知识库工作流-v2", key="np_name")
+                        np_url = st.text_input("Base URL *", value=_env_base_url, key="np_url")
+                        np_key = st.text_input("API Key *", type="password", key="np_key")
+                        np_desc = st.text_input("工作流说明（可选）", key="np_desc")
+                        np_timeout = st.number_input("超时（秒）", value=60, min_value=10, max_value=300, key="np_timeout")
+                        np_interval = st.number_input("请求间隔（秒）", value=1.0, min_value=0.0, max_value=10.0, step=0.5, key="np_interval")
+                        np_submit = st.form_submit_button("保存")
+                    if np_submit and np_name and np_url and np_key:
+                        create_connection_profile(np_name, np_url, np_key, np_desc, np_timeout, np_interval)
+                        st.success(f"连接配置「{np_name}」已保存（API Key 已安全存储）")
+                        st.session_state["dify_show_new_profile_form"] = False
+                        st.rerun()
+
+                # 编辑配置表单
+                if st.session_state.get("dify_show_edit_profile_form") and _selected_profile_id:
+                    _edit_meta = load_connection_profile(_selected_profile_id)
+                    if _edit_meta:
+                        with st.form("edit_dify_profile_form"):
+                            st.markdown(f"**编辑连接配置: {_edit_meta.get('profile_name', '')}**")
+                            ep_name = st.text_input("配置名称", value=_edit_meta.get("profile_name", ""), key="ep_name")
+                            ep_url = st.text_input("Base URL", value=_edit_meta.get("base_url", ""), key="ep_url")
+                            ep_key = st.text_input("API Key（留空则保留现有）", type="password", key="ep_key")
+                            ep_desc = st.text_input("工作流说明", value=_edit_meta.get("workflow_description", ""), key="ep_desc")
+                            ep_timeout = st.number_input("超时（秒）", value=_edit_meta.get("timeout_seconds", 60), min_value=10, max_value=300, key="ep_timeout")
+                            ep_interval = st.number_input("请求间隔（秒）", value=_edit_meta.get("request_interval_seconds", 1.0), min_value=0.0, max_value=10.0, step=0.5, key="ep_interval")
+                            ep_clear = st.checkbox("清除已保存的 API Key", key="ep_clear_key")
+                            ep_submit = st.form_submit_button("保存修改")
+                        if ep_submit:
+                            update_connection_profile(
+                                _selected_profile_id,
+                                {"profile_name": ep_name, "base_url": ep_url, "workflow_description": ep_desc,
+                                 "timeout_seconds": ep_timeout, "request_interval_seconds": ep_interval},
+                                api_key=ep_key if ep_key else None,
+                                clear_key=ep_clear,
+                            )
+                            st.success("连接配置已更新")
+                            st.session_state["dify_show_edit_profile_form"] = False
+                            st.rerun()
+
+                # 删除确认
+                if st.session_state.get("dify_show_delete_confirm") and _selected_profile_id:
+                    _del_meta = load_connection_profile(_selected_profile_id)
+                    st.warning(f"确认删除连接配置「{_del_meta.get('profile_name', '') if _del_meta else ''}」？已保存的 API Key 将一并删除。历史运行记录不受影响。")
+                    dc_col1, dc_col2 = st.columns(2)
+                    with dc_col1:
+                        if st.button("确认删除", key="dify_confirm_delete", type="primary"):
+                            delete_connection_profile(_selected_profile_id)
+                            st.success("已删除")
+                            st.session_state["dify_show_delete_confirm"] = False
+                            st.rerun()
+                    with dc_col2:
+                        if st.button("取消", key="dify_cancel_delete"):
+                            st.session_state["dify_show_delete_confirm"] = False
+                            st.rerun()
+
+        if dify_conn_source == "临时手动填写":
+            st.caption("本次填写的密钥仅用于当前会话，不会写入磁盘。如需保存，请勾选下方选项。")
+            tm_col1, tm_col2 = st.columns(2)
+            with tm_col1:
+                dify_api_key = st.text_input(
+                    "Dify API Key", type="password",
+                    value=_env_api_key,
+                    key="batch_dify_key",
+                    help="来自 .env 的默认值" if _env_api_key else "",
+                )
+            with tm_col2:
+                dify_base_url = st.text_input(
+                    "Dify Base URL",
+                    value=_env_base_url,
+                    key="batch_dify_url",
+                )
+            opt_col1, opt_col2 = st.columns(2)
+            with opt_col1:
+                dify_timeout = st.number_input(
+                    "请求超时（秒）", min_value=10, max_value=300, value=60, key="batch_timeout"
+                )
+            with opt_col2:
+                dify_delay = st.number_input(
+                    "请求间隔（秒）", min_value=0.0, max_value=10.0, value=1.0, step=0.5, key="batch_delay",
+                    help="每次请求之间的等待时间，避免过快调用"
+                )
+
+            # 保存为命名配置
+            _save_as_profile = st.checkbox("保存为命名连接配置", key="dify_save_as_profile")
+            if _save_as_profile:
+                sp_col1, sp_col2 = st.columns(2)
+                with sp_col1:
+                    _save_name = st.text_input("配置名称", placeholder="例如：金融知识库工作流-v2", key="dify_save_name")
+                with sp_col2:
+                    _save_desc = st.text_input("工作流说明（可选）", key="dify_save_desc")
+                if st.button("保存连接配置", key="dify_save_profile_btn"):
+                    if _save_name and dify_api_key and dify_base_url:
+                        create_connection_profile(_save_name, dify_base_url, dify_api_key, _save_desc, dify_timeout, dify_delay)
+                        st.success(f"连接配置「{_save_name}」已保存（API Key 已安全存储）")
+                        st.rerun()
+                    else:
+                        st.warning("请填写配置名称、API Key 和 Base URL")
+
+        # 环境变量提示
+        if not dify_api_key and _env_api_key:
+            st.caption("将使用 .env 中的 `DIFY_API_KEY` 作为默认密钥。")
+            dify_api_key = _env_api_key
 
     # --- Run batch query ---
     st.divider()
 
     if st.button("开始提问", type="primary", disabled=len(questions_list) == 0, key="batch_run"):
         if not dify_api_key:
-            st.error("请填写 Dify API Key")
+            st.error("请填写 Dify API Key（选择已保存连接配置或临时手动填写）")
         elif not questions_list:
             st.error("没有可提问的问题")
         else:
@@ -1458,13 +1631,21 @@ PISP和AISP的区别?
             run_id = run_result["run_id"]
             run_dir = run_result["run_dir"]
 
-            # 更新 manifest 添加题集信息
+            # 更新 manifest 添加题集信息和连接配置元数据（不含 API Key）
+            _manifest_updates = {}
             if _q_set_id or _q_set_name:
+                _manifest_updates["question_set_id"] = _q_set_id
+                _manifest_updates["question_set_name"] = _q_set_name
+            if _selected_profile_id:
+                _manifest_updates["dify_connection_profile_id"] = _selected_profile_id
+                _manifest_updates["dify_connection_profile_name"] = _selected_profile_name
+                _manifest_updates["dify_base_url"] = dify_base_url
+                _manifest_updates["dify_workflow_description"] = _selected_profile_desc
+            elif dify_base_url:
+                _manifest_updates["dify_base_url"] = dify_base_url
+            if _manifest_updates:
                 from experiment import update_experiment_run
-                update_experiment_run(run_id, {
-                    "question_set_id": _q_set_id,
-                    "question_set_name": _q_set_name,
-                })
+                update_experiment_run(run_id, _manifest_updates)
 
             # 确保每个问题有 question_id
             question_ids = []
