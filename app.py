@@ -1,5 +1,6 @@
 import streamlit as st
 from pathlib import Path
+from datetime import datetime
 import json
 import io
 import os
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
 from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref, build_result_status
-from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS, MODE_RETRIEVAL, MODE_QA, MODE_LABELS
+from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS, MODE_RETRIEVAL, MODE_QA, MODE_LABELS, build_question_set_name
 from batch_query import run_batch_query, save_batch_results, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -403,6 +404,19 @@ with tab_qgen:
         else:
             st.info("💬 **全流程问答评测模式**：生成的题目将用于测试完整问答能力。题目特点：可包含综合分析题、对比题、推理题，适合后续 Judge 严格评测。")
 
+        # 题集名称
+        if qgen_uploaded:
+            _default_set_name = build_question_set_name(qgen_uploaded.name, mode_val)
+        else:
+            _default_set_name = ""
+        qgen_set_name = st.text_input(
+            "题集名称",
+            value=_default_set_name,
+            placeholder="例如：IS5010期末复习_检索评测",
+            key="qgen_set_name_input",
+            help="用于标识这一套题，默认由文件名和出题模式生成"
+        )
+
         cfg_col1, cfg_col2, cfg_col3, cfg_col4 = st.columns(4)
         with cfg_col1:
             qgen_num = st.select_slider("生成题目数量", options=[5, 10, 15, 20], value=10, key="qgen_num")
@@ -703,10 +717,21 @@ with tab_qgen:
                         st.session_state["generated_questions"] = questions
                         st.session_state["qgen_last_generated_mode"] = mode_val  # 保存当前模式
 
+                        # 获取题集名称（从 widget 读取）
+                        _set_name = st.session_state.get("qgen_set_name_input", "") or \
+                                    build_question_set_name(qgen_uploaded.name, mode_val)
+
                         # 保存到文件
-                        output_path, fname = save_questions(questions)
+                        output_path, fname, set_id = save_questions(
+                            questions,
+                            question_set_name=_set_name,
+                            source_document_name=qgen_uploaded.name,
+                            question_mode=mode_val,
+                        )
                         st.session_state["qgen_saved_file"] = fname
                         st.session_state["qgen_saved_path"] = str(output_path)
+                        st.session_state["qgen_set_id"] = set_id
+                        st.session_state["qgen_generated_set_name"] = _set_name
 
                         # 验证文件是否保存成功
                         if output_path.exists():
@@ -717,6 +742,7 @@ with tab_qgen:
                                 expanded=False,
                             )
                             st.success(f"✅ 题目已自动保存到：`data/questions/{fname}`（{file_size} 字节）")
+                            st.caption(f"题集 ID: `{set_id}` | 题集名称: `{_set_name}`")
                         else:
                             gen_status.update(label="生成完成但保存失败", state="error")
                             st.error(f"题目生成成功，但文件保存失败：{output_path}")
@@ -1016,37 +1042,55 @@ PISP和AISP的区别?
             if not history_files:
                 st.warning("暂无历史记录，请先在「题目生成」或「批量提问」中生成/保存过结果")
             else:
-                # 预读每个文件的前几行，检测 question_mode 分布
-                def _detect_file_mode(filepath):
-                    """读取文件前10行，检测 question_mode 分布。"""
-                    modes = {MODE_RETRIEVAL: 0, MODE_QA: 0, "unknown": 0}
+                # 预读每个文件，检测 question_mode、question_set_name、题目数
+                def _detect_file_info(filepath):
+                    """读取文件前20行，检测模式、题集名称、题目数。"""
+                    info = {
+                        "modes": {MODE_RETRIEVAL: 0, MODE_QA: 0, "unknown": 0},
+                        "set_name": "",
+                        "set_id": "",
+                        "question_count": 0,
+                        "has_set_info": False,
+                    }
                     try:
                         with filepath.open("r", encoding="utf-8") as f:
                             for i, line in enumerate(f):
-                                if i >= 10:
-                                    break
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                info["question_count"] += 1
+                                if i >= 20:
+                                    continue
                                 try:
-                                    obj = json.loads(line.strip())
+                                    obj = json.loads(line)
                                     mode = obj.get("question_mode", "")
                                     if mode == MODE_RETRIEVAL:
-                                        modes[MODE_RETRIEVAL] += 1
+                                        info["modes"][MODE_RETRIEVAL] += 1
                                     elif mode == MODE_QA:
-                                        modes[MODE_QA] += 1
+                                        info["modes"][MODE_QA] += 1
                                     else:
-                                        modes["unknown"] += 1
+                                        info["modes"]["unknown"] += 1
+
+                                    # 获取题集信息
+                                    if obj.get("question_set_name") and not info["set_name"]:
+                                        info["set_name"] = obj["question_set_name"]
+                                        info["set_id"] = obj.get("question_set_id", "")
+                                        info["has_set_info"] = True
                                 except json.JSONDecodeError:
                                     continue
                     except Exception:
                         pass
-                    return modes
+                    return info
 
-                # 为每个文件生成带模式标签的显示名
-                file_mode_cache = {}
+                # 为每个文件生成带模式标签和题集名称的显示名
+                file_info_cache = {}
                 file_labels = []
                 for f in history_files:
-                    modes = _detect_file_mode(f)
-                    file_mode_cache[f] = modes
+                    info = _detect_file_info(f)
+                    file_info_cache[f] = info
+                    modes = info["modes"]
                     total_sampled = sum(modes.values())
+                    q_count = info["question_count"]
 
                     # 生成模式标签
                     if total_sampled == 0:
@@ -1054,27 +1098,39 @@ PISP和AISP的区别?
                     elif modes[MODE_RETRIEVAL] > 0 and modes[MODE_QA] > 0:
                         mode_tag = "[混合]"
                     elif modes[MODE_RETRIEVAL] > 0 and modes["unknown"] == 0:
-                        mode_tag = "[检索评测题]"
+                        mode_tag = "[检索评测]"
                     elif modes[MODE_QA] > 0 and modes["unknown"] == 0:
-                        mode_tag = "[全流程问答题]"
+                        mode_tag = "[全流程问答]"
                     elif modes["unknown"] > 0 and modes[MODE_RETRIEVAL] == 0 and modes[MODE_QA] == 0:
-                        mode_tag = "[旧版/未知模式]"
+                        mode_tag = "[旧版]"
                     elif modes[MODE_RETRIEVAL] > 0:
-                        mode_tag = "[检索评测题+旧版]"
+                        mode_tag = "[检索评测+旧版]"
                     elif modes[MODE_QA] > 0:
-                        mode_tag = "[全流程问答题+旧版]"
+                        mode_tag = "[全流程问答+旧版]"
                     else:
-                        mode_tag = "[旧版/未知模式]"
+                        mode_tag = "[旧版]"
 
-                    file_labels.append(f"{mode_tag} {f.parent.name}/{f.name}")
+                    # 生成显示标签：优先题集名称
+                    if info["has_set_info"] and info["set_name"]:
+                        label = f"{mode_tag} {info['set_name']} · {q_count} 题"
+                    else:
+                        # 旧版文件，回退显示文件名
+                        label = f"{mode_tag} {f.stem} · {q_count} 题 [旧版题集]"
+
+                    file_labels.append(label)
 
                 selected_idx = st.selectbox(
-                    "选择历史文件",
+                    "选择历史题集",
                     range(len(file_labels)),
                     format_func=lambda i: file_labels[i],
                     key="batch_history_file",
                 )
                 selected_file = history_files[selected_idx]
+                selected_info = file_info_cache[selected_file]
+
+                # 显示次级信息
+                st.caption(f"文件: `{selected_file.name}` | 生成时间: {datetime.fromtimestamp(selected_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}")
+
                 try:
                     raw_lines = selected_file.read_text(encoding="utf-8").strip().split("\n")
                     for line in raw_lines:
@@ -1089,11 +1145,15 @@ PISP和AISP的区别?
                                     item["source_excerpt"] = obj["source_excerpt"]
                                 if obj.get("question_mode"):
                                     item["question_mode"] = obj["question_mode"]
+                                if obj.get("question_set_id"):
+                                    item["question_set_id"] = obj["question_set_id"]
+                                if obj.get("question_set_name"):
+                                    item["question_set_name"] = obj["question_set_name"]
                                 questions_list.append(item)
                         except json.JSONDecodeError:
                             continue
 
-                    st.success(f"从 {selected_file.name} 加载了 {len(questions_list)} 个问题")
+                    st.success(f"从 `{selected_file.name}` 加载了 {len(questions_list)} 个问题")
 
                     # 统计并展示 question_mode 分布
                     mode_counts = {MODE_RETRIEVAL: 0, MODE_QA: 0, "unknown": 0}
@@ -1330,6 +1390,15 @@ PISP和AISP的区别?
                 _config_id = config_result["config_id"]
 
             # 创建运行记录
+            # 从 questions_list 中提取题集信息
+            _q_set_id = ""
+            _q_set_name = ""
+            for q in questions_list:
+                if q.get("question_set_id"):
+                    _q_set_id = q["question_set_id"]
+                    _q_set_name = q.get("question_set_name", "")
+                    break
+
             run_result = create_experiment_run(
                 config_id=_config_id,
                 question_set_source=st.session_state.get("batch_q_source", ""),
@@ -1337,6 +1406,14 @@ PISP和AISP的区别?
             )
             run_id = run_result["run_id"]
             run_dir = run_result["run_dir"]
+
+            # 更新 manifest 添加题集信息
+            if _q_set_id or _q_set_name:
+                from experiment import update_experiment_run
+                update_experiment_run(run_id, {
+                    "question_set_id": _q_set_id,
+                    "question_set_name": _q_set_name,
+                })
 
             # 确保每个问题有 question_id
             question_ids = []
@@ -3283,12 +3360,12 @@ Judge 有三层减少重复调用的机制：
 # ========== Tab: 实验版本 ==========
 with tab_experiment:
     st.subheader("实验版本管理")
-    st.caption("RAG 配置方案 + 测试运行记录，便于区分和追溯不同配置下的测试结果")
+    st.caption("指定配置方案的运行看板：查看配置参数、运行记录、评测状态和指标")
 
     # ---------- 模块说明 ----------
     with st.expander("实验版本说明（点击展开）", expanded=False):
         st.markdown("""
-**一句话总览：** 将 RAG 配置（知识库版本、检索配置等）与测试运行分离管理，同一配置可复用于多次批量测试。
+**一句话总览：** 选择一个 RAG 配置方案，查看使用该配置的所有运行记录及其评测状态。
 
 ---
 
@@ -3301,139 +3378,271 @@ with tab_experiment:
 
 ---
 
-**如何使用？**
-
-1. 在「批量提问」页面展开「RAG 配置方案」
-2. 选择「新建配置方案」或「使用历史配置」
-3. 开始提问时自动创建运行记录并关联配置
-4. 在本页面查看所有配置方案和运行记录
-
----
-
 **与 Langfuse 的关联**
 
 - 每道题生成唯一 `question_id`
 - Dify API 调用时设置 `user` 字段为 `rag_eval:<run_id>:<question_id>`
-- 后续可通过 Langfuse trace 的 `user_id` 精确关联运行记录
+- 样本准备解析时自动从 `user_id` 回填 `run_id`、`question_id` 等元数据
 """)
 
-    # ---------- RAG 配置方案 ----------
-    from experiment import list_config_profiles, list_experiment_runs, list_runs_by_config
+    # ---------- 导入 ----------
+    from experiment import (
+        list_config_profiles, list_experiment_runs, list_runs_by_config,
+        load_config_profile, get_run_status, get_judge_metrics_by_run,
+        backfill_manifest_from_batch, migrate_judged_results, migrate_processed_samples,
+        EXPERIMENTS_DIR,
+    )
 
+    # ---------- 自动迁移：从 batch 文件回填 manifest ----------
+    _all_runs = list_experiment_runs()
+    _migrated_count = 0
+    for _run in _all_runs:
+        if not _run.get("question_set_id"):
+            if backfill_manifest_from_batch(_run["run_id"], batch_dir=str(BATCH_DIR)):
+                _migrated_count += 1
+    if _migrated_count > 0:
+        st.toast(f"已自动回填 {_migrated_count} 条运行记录的题集信息")
+
+    # ---------- 数据迁移工具 ----------
+    with st.expander("数据迁移工具", expanded=False):
+        st.caption("为历史数据回填 run_id、config_id 等元数据，便于实验看板关联")
+        mig_col1, mig_col2 = st.columns(2)
+        with mig_col1:
+            if st.button("迁移 Judge 结果（回填 run_id）", key="migrate_judged"):
+                with st.spinner("正在迁移..."):
+                    result = migrate_judged_results(
+                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        judged_file=str(JUDGED_FILE),
+                        backup=True,
+                    )
+                    if result["migrated"] > 0:
+                        st.success(f"已迁移 {result['migrated']} 条 Judge 结果，备份: {result['backup_path']}")
+                    else:
+                        st.info("无需迁移或迁移失败")
+        with mig_col2:
+            if st.button("迁移 Processed 样本（回填 config_id）", key="migrate_processed"):
+                with st.spinner("正在迁移..."):
+                    result = migrate_processed_samples(
+                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        experiments_dir=str(EXPERIMENTS_DIR),
+                        backup=True,
+                    )
+                    if result["migrated"] > 0:
+                        st.success(f"已迁移 {result['migrated']} 条样本，备份: {result['backup_path']}")
+                    else:
+                        st.info("无需迁移或迁移失败")
+
+    # ---------- 选择配置方案 ----------
     st.markdown("---")
-    st.markdown("##### RAG 配置方案")
+    st.markdown("##### 选择配置方案")
 
     configs = list_config_profiles()
 
     if not configs:
         st.info("暂无配置方案。在「批量提问」页面创建配置后，将自动记录在此。")
-    else:
-        st.markdown(f"**共 {len(configs)} 个配置方案**")
+        st.stop()
 
-        # 配置方案表格
-        config_table = []
-        for cfg in configs:
-            # 统计使用该配置的运行次数
-            runs_count = len(list_runs_by_config(cfg.get("config_id", "")))
-            config_table.append({
-                "配置名称": cfg.get("config_name", "未命名"),
-                "配置ID": cfg.get("config_id", ""),
-                "知识库版本": cfg.get("knowledge_base_version", ""),
-                "工作流版本": cfg.get("workflow_version", ""),
-                "本次改动": cfg.get("changed_variable", ""),
-                "使用次数": runs_count,
-                "创建时间": cfg.get("created_at", "")[:19],
-            })
+    # 构建下拉选项
+    config_options = []
+    for cfg in configs:
+        runs_count = len(list_runs_by_config(cfg.get("config_id", "")))
+        label = f"{cfg.get('config_name', '未命名')} | {cfg.get('knowledge_base_version', '')} | {runs_count} 次运行"
+        config_options.append((cfg.get("config_id"), label))
 
-        st.dataframe(config_table, use_container_width=True)
+    selected_config_id = st.selectbox(
+        "选择配置方案",
+        options=[c[0] for c in config_options],
+        format_func=lambda x: next((c[1] for c in config_options if c[0] == x), x),
+        key="exp_selected_config",
+    )
 
-        # 配置详情展开
-        for cfg in configs:
-            config_id = cfg.get("config_id", "")
-            config_name = cfg.get("config_name", "未命名")
-            runs = list_runs_by_config(config_id)
+    if not selected_config_id:
+        st.stop()
 
-            with st.expander(f"{config_name} | {config_id} | 使用 {len(runs)} 次", expanded=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**配置名称**: {cfg.get('config_name', '')}")
-                    st.markdown(f"**知识库版本**: {cfg.get('knowledge_base_version', '')}")
-                    st.markdown(f"**工作流版本**: {cfg.get('workflow_version', '') or '未指定'}")
-                    st.markdown(f"**本次改动**: {cfg.get('changed_variable', '')}")
-                with col2:
-                    st.markdown(f"**检索配置**: {cfg.get('retrieval_config', '') or '未指定'}")
-                    st.markdown(f"**备注**: {cfg.get('notes', '') or '无'}")
-                    st.markdown(f"**创建时间**: {cfg.get('created_at', '')}")
+    # ---------- 配置方案卡片 ----------
+    selected_config = load_config_profile(selected_config_id)
+    if not selected_config:
+        st.error(f"配置方案不存在: {selected_config_id}")
+        st.stop()
 
-                # 显示使用该配置的运行
-                if runs:
-                    st.markdown("---")
-                    st.markdown(f"**使用该配置的运行** ({len(runs)} 次):")
-                    for run in runs:
-                        run_id = run.get("run_id", "")
-                        run_status = run.get("status", "")
-                        status_icon = "✅" if run_status == "completed" else "⏳"
-                        st.caption(f"  {status_icon} `{run_id}` | 题目数: {run.get('question_count', 0)} | {run.get('started_at', '')[:19]}")
-
-    # ---------- 测试运行记录 ----------
     st.markdown("---")
-    st.markdown("##### 测试运行记录")
+    st.markdown(f"##### 配置方案: {selected_config.get('config_name', '未命名')}")
 
-    runs = list_experiment_runs()
+    # 可读字段卡片
+    card_col1, card_col2 = st.columns(2)
+    with card_col1:
+        st.markdown(f"**配置名称**: {selected_config.get('config_name', '')}")
+        st.markdown(f"**配置 ID**: `{selected_config.get('config_id', '')}`")
+        st.markdown(f"**知识库版本**: {selected_config.get('knowledge_base_version', '')}")
+        st.markdown(f"**工作流版本**: {selected_config.get('workflow_version', '') or '未指定'}")
+    with card_col2:
+        st.markdown(f"**本次改动**: {selected_config.get('changed_variable', '') or '未指定'}")
+        st.markdown(f"**检索配置**: {selected_config.get('retrieval_config', '') or '未指定'}")
+        st.markdown(f"**备注**: {selected_config.get('notes', '') or '无'}")
+        st.markdown(f"**创建时间**: {selected_config.get('created_at', '')}")
 
-    if not runs:
-        st.info("暂无运行记录。在「批量提问」页面开始提问后，运行记录将自动记录在此。")
+    # 原始 JSON 快照
+    with st.expander("查看配置快照（JSON）", expanded=False):
+        st.json(selected_config)
+
+    # ---------- 运行记录 ----------
+    st.markdown("---")
+    st.markdown(f"##### 运行记录（配置: {selected_config.get('config_name', '')}）")
+
+    config_runs = list_runs_by_config(selected_config_id)
+
+    if not config_runs:
+        st.info("该配置方案暂无运行记录。在「批量提问」页面使用此配置开始提问后，运行记录将自动记录在此。")
     else:
-        st.markdown(f"**共 {len(runs)} 次运行**")
+        st.markdown(f"**共 {len(config_runs)} 次运行**")
 
         # 运行记录表格
         run_table = []
-        for run in runs:
-            # 获取配置快照中的名称
-            config_snapshot = run.get("config_snapshot", {})
-            config_name = config_snapshot.get("config_name", "未知配置")
+        for run in config_runs:
+            # 获取真实状态
+            run_status = get_run_status(
+                run["run_id"],
+                batch_dir=str(BATCH_DIR),
+                raw_dir=str(RAW_DIR),
+                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                judged_file=str(JUDGED_FILE),
+            )
             run_table.append({
-                "运行ID": run.get("run_id", ""),
-                "配置方案": config_name,
-                "配置ID": run.get("config_id", ""),
-                "题目来源": run.get("question_set_source", ""),
-                "题目数量": run.get("question_count", 0),
+                "运行 ID": run.get("run_id", ""),
+                "题集名称": run_status.get("question_set_name") or run.get("question_set_name", "") or "旧版题集",
+                "题集 ID": run_status.get("question_set_id") or run.get("question_set_id", "") or "—",
+                "题目数": run.get("question_count", 0),
+                "Batch": f"{run_status.get('batch_success', 0)}/{run_status.get('batch_total', 0)}",
+                "Processed": run_status.get("processed_count", 0),
+                "Judge": run_status.get("judge_count", 0),
                 "创建时间": run.get("started_at", "")[:19],
-                "状态": run.get("status", ""),
             })
 
         st.dataframe(run_table, use_container_width=True)
 
-        # 运行详情展开
-        for run in runs:
+        # 运行详情和状态看板
+        for run in config_runs:
             run_id = run.get("run_id", "")
-            config_snapshot = run.get("config_snapshot", {})
-            config_name = config_snapshot.get("config_name", "未知配置")
-            run_status = run.get("status", "created")
-            status_icon = "✅" if run_status == "completed" else "⏳"
 
-            with st.expander(f"{status_icon} {run_id} | {config_name}", expanded=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**运行ID**: {run_id}")
-                    st.markdown(f"**配置方案**: {config_name}")
-                    st.markdown(f"**配置ID**: {run.get('config_id', '')}")
+            # 获取真实状态
+            run_status = get_run_status(
+                run_id,
+                batch_dir=str(BATCH_DIR),
+                raw_dir=str(RAW_DIR),
+                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                judged_file=str(JUDGED_FILE),
+            )
+
+            q_set_name = run_status.get("question_set_name") or run.get("question_set_name", "") or "旧版题集"
+            q_set_id = run_status.get("question_set_id") or run.get("question_set_id", "")
+            batch_success = run_status.get("batch_success", 0)
+            batch_total = run_status.get("batch_total", 0)
+            processed_count = run_status.get("processed_count", 0)
+            judge_count = run_status.get("judge_count", 0)
+            question_count = run.get("question_count", 0)
+
+            # 状态图标
+            if judge_count > 0:
+                status_icon = "✅"
+            elif batch_success > 0:
+                status_icon = "⏳"
+            else:
+                status_icon = "❌"
+
+            with st.expander(f"{status_icon} {run_id} | 题集: {q_set_name}", expanded=False):
+                # 基本信息
+                info_col1, info_col2 = st.columns(2)
+                with info_col1:
+                    st.markdown(f"**运行 ID**: `{run_id}`")
+                    st.markdown(f"**题集名称**: {q_set_name}")
+                    st.markdown(f"**题集 ID**: `{q_set_id or '未指定'}`")
                     st.markdown(f"**题目来源**: {run.get('question_set_source', '') or '未指定'}")
-                with col2:
-                    st.markdown(f"**题目数量**: {run.get('question_count', 0)}")
+                with info_col2:
+                    st.markdown(f"**题目数量**: {question_count}")
                     st.markdown(f"**创建时间**: {run.get('started_at', '')}")
-                    st.markdown(f"**状态**: {run_status}")
+                    st.markdown(f"**状态**: {run.get('status', '')}")
+                    st.markdown(f"**配置 ID**: `{run.get('config_id', '')}`")
 
-                # 显示关联的文件
+                # 运行状态看板
                 st.markdown("---")
-                st.markdown(f"**运行目录**: `data/experiments/{run_id}/`")
+                st.markdown("**运行状态看板**")
+
+                status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+                with status_col1:
+                    st.metric("Batch", f"{batch_success}/{batch_total}")
+                with status_col2:
+                    st.metric("Raw", run_status.get("raw_count", 0))
+                with status_col3:
+                    st.metric("样本准备", processed_count)
+                with status_col4:
+                    st.metric("Judge", judge_count)
+
+                # 关联文件
+                st.markdown("**关联文件**")
                 batch_file = run.get("batch_results_file")
                 raw_file = run.get("raw_results_file")
-                if batch_file:
-                    st.markdown(f"**批量结果文件**: `{batch_file}`")
-                if raw_file:
-                    st.markdown(f"**原始结果文件**: `{raw_file}`")
+                file_col1, file_col2 = st.columns(2)
+                with file_col1:
+                    if batch_file:
+                        st.markdown(f"Batch 结果: `{batch_file}`")
+                    else:
+                        st.caption("Batch 结果: 无")
+                with file_col2:
+                    if raw_file:
+                        st.markdown(f"Raw 结果: `{raw_file}`")
+                    else:
+                        st.caption("Raw 结果: 无")
 
-                # 配置快照详情
+                # Judge 指标
+                if judge_count > 0:
+                    st.markdown("---")
+                    st.markdown("**Judge 评测指标**")
+
+                    judge_results = run_status.get("judge_results", [])
+                    if judge_results:
+                        from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
+
+                        # 计算指标
+                        valid_results = [r for r in judge_results if "error" not in r]
+                        if valid_results:
+                            metrics = compute_metrics(judge_results)
+
+                            # 按轨道分组
+                            retrieval_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_RETRIEVAL]
+                            strict_qa_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_STRICT_QA]
+                            grounded_qa_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_GROUNDED_QA]
+
+                            # 显示指标
+                            metric_cols = st.columns(3)
+
+                            if retrieval_results:
+                                with metric_cols[0]:
+                                    st.markdown("**检索评测**")
+                                    n = len(retrieval_results)
+                                    t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_results) / n
+                                    t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_results) / n
+                                    t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_results) / n
+                                    st.metric("Top1 Hit", f"{t1:.0%}")
+                                    st.metric("Top3 Hit", f"{t3:.0%}")
+                                    st.metric("Top5 Hit", f"{t5:.0%}")
+                                    st.caption(f"样本数: {n}")
+
+                            if strict_qa_results:
+                                with metric_cols[1]:
+                                    st.markdown("**严格问答**")
+                                    n = len(strict_qa_results)
+                                    acc = sum(r.get("answer_correct", 0) for r in strict_qa_results) / n
+                                    st.metric("Answer Correctness", f"{acc:.0%}")
+                                    st.caption(f"样本数: {n}")
+
+                            if grounded_qa_results:
+                                with metric_cols[2]:
+                                    st.markdown("**合理性问答**")
+                                    n = len(grounded_qa_results)
+                                    acc = sum(r.get("answer_correct", 0) for r in grounded_qa_results) / n
+                                    st.metric("Answer Grounded", f"{acc:.0%}")
+                                    st.caption(f"样本数: {n}")
+
+                # 配置快照
                 with st.expander("配置快照详情", expanded=False):
-                    st.json(config_snapshot)
+                    st.json(run.get("config_snapshot", {}))

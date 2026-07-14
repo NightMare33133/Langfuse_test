@@ -118,7 +118,8 @@ def normalize_questions(items):
             entry = {"question": q}
             # 保留所有额外元数据
             for key in ("reference_answer", "source_excerpt", "difficulty", "topic",
-                        "question_id", "question_mode", "run_id", "config_id"):
+                        "question_id", "question_mode", "run_id", "config_id",
+                        "question_set_id", "question_set_name"):
                 val = item.get(key)
                 if val:
                     entry[key] = val
@@ -136,7 +137,8 @@ def normalize_questions(items):
 
 def query_to_sample(question, dify_result, index, timestamp,
                     reference_answer="", source_excerpt="", question_mode="",
-                    question_id="", run_id="", config_id="", dify_user=""):
+                    question_id="", run_id="", config_id="", dify_user="",
+                    question_set_id="", question_set_name=""):
     """将单次提问结果转换为 parser.py 兼容的 sample 结构。
 
     Args:
@@ -151,6 +153,8 @@ def query_to_sample(question, dify_result, index, timestamp,
         run_id: 运行ID（如有）
         config_id: 配置方案ID（如有）
         dify_user: Dify 调用的 user 字段（如有）
+        question_set_id: 题集ID（如有）
+        question_set_name: 题集名称（如有）
     """
     retrieval_results = _map_retriever_resources(dify_result.get("retriever_resources", []))
     retrieval_query = question  # Dify 不单独返回 retrieval_query，用原始问题代替
@@ -184,6 +188,10 @@ def query_to_sample(question, dify_result, index, timestamp,
         sample["run_id"] = run_id
     if config_id:
         sample["config_id"] = config_id
+    if question_set_id:
+        sample["question_set_id"] = question_set_id
+    if question_set_name:
+        sample["question_set_name"] = question_set_name
     return sample
 
 
@@ -224,6 +232,8 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
         source_excerpt = item.get("source_excerpt", "")
         question_mode = item.get("question_mode", "")
         question_id = item.get("question_id") or (question_ids[i] if question_ids and i < len(question_ids) else "")
+        question_set_id = item.get("question_set_id", "")
+        question_set_name = item.get("question_set_name", "")
 
         # 构建 Dify user 字段
         if run_id and question_id:
@@ -242,6 +252,8 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
                 run_id=run_id,
                 config_id=config_id,
                 dify_user=dify_user,
+                question_set_id=question_set_id,
+                question_set_name=question_set_name,
             )
             yield i, total, {
                 "success": True,

@@ -333,28 +333,91 @@ def load_question_index(questions_dir=None):
     return by_id, by_text
 
 
-_BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode")
+_BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode",
+                    "question_set_id", "question_set_name")
+
+
+def parse_rag_eval_user_id(user_id: str) -> dict:
+    """解析 rag_eval:<run_id>:<question_id> 格式的 user_id。
+
+    Returns:
+        dict: {"run_id": str, "question_id": str} 或空 dict
+    """
+    if not user_id or not isinstance(user_id, str):
+        return {}
+
+    # 格式: rag_eval:<run_id>:<question_id>
+    if user_id.startswith("rag_eval:"):
+        parts = user_id.split(":", 2)
+        if len(parts) == 3:
+            return {
+                "run_id": parts[1],
+                "question_id": parts[2],
+            }
+
+    return {}
+
+
+def extract_experiment_metadata_from_samples(samples: list) -> dict:
+    """从样本中提取实验元数据统计。
+
+    Returns:
+        dict: {
+            "total_samples": int,
+            "identified_runs": dict[str, int],  # run_id -> count
+            "identified_count": int,
+            "unidentified_count": int,
+        }
+    """
+    stats = {
+        "total_samples": len(samples),
+        "identified_runs": {},
+        "identified_count": 0,
+        "unidentified_count": 0,
+    }
+
+    for s in samples:
+        user_id = s.get("user_id", "")
+        parsed = parse_rag_eval_user_id(user_id)
+        if parsed.get("run_id"):
+            run_id = parsed["run_id"]
+            stats["identified_runs"][run_id] = stats["identified_runs"].get(run_id, 0) + 1
+            stats["identified_count"] += 1
+        else:
+            stats["unidentified_count"] += 1
+
+    return stats
 
 
 def backfill_reference_answers(samples, questions_dir=None):
     """尝试为样本回填 reference_answer 等题目元数据。
 
     匹配规则：
-    1. 按 question_id 精确匹配（如果样本有 question_id）
-    2. 按 question 文本精确匹配
+    1. 从 user_id 解析 run_id/question_id（如果格式为 rag_eval:run_id:question_id）
+    2. 按 question_id 精确匹配（如果样本有 question_id）
+    3. 按 question 文本精确匹配
 
     返回 (samples, stats)：
     - samples: 原地修改后的样本列表
-    - stats: {"total": N, "backfilled": M, "already_has": K}
+    - stats: {"total": N, "backfilled": M, "already_has": K, "run_id_parsed": int}
     """
     by_id, by_text = load_question_index(questions_dir)
 
     if not by_id and not by_text:
-        return samples, {"total": len(samples), "backfilled": 0, "already_has": 0}
+        return samples, {"total": len(samples), "backfilled": 0, "already_has": 0, "run_id_parsed": 0}
 
-    stats = {"total": len(samples), "backfilled": 0, "already_has": 0}
+    stats = {"total": len(samples), "backfilled": 0, "already_has": 0, "run_id_parsed": 0}
 
     for s in samples:
+        # 从 user_id 解析 run_id/question_id
+        user_id = s.get("user_id", "")
+        parsed = parse_rag_eval_user_id(user_id)
+        if parsed.get("run_id"):
+            s["run_id"] = parsed["run_id"]
+            stats["run_id_parsed"] += 1
+        if parsed.get("question_id") and not s.get("question_id"):
+            s["question_id"] = parsed["question_id"]
+
         # 已有 reference_answer 的跳过
         if (s.get("reference_answer") or "").strip():
             stats["already_has"] += 1

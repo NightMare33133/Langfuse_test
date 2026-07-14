@@ -340,6 +340,12 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
         "retrieval_evaluable": evaluation_track == TRACK_RETRIEVAL,
     }
 
+    # 透传元数据字段（不得改变评分逻辑）
+    for meta_key in ("run_id", "config_id", "question_id", "question_set_id", "question_set_name"):
+        val = sample.get(meta_key)
+        if val:
+            result[meta_key] = val
+
     # 不可评测的检索题：缺少金标准证据
     if evaluation_track == TRACK_NOT_EVALUABLE:
         result["retrieval_top1_hit"] = 0
@@ -375,10 +381,16 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
     content_cache = {}  # content_hash -> result dict (without trace_id/question)
     total = len(samples)
 
+    # 元数据字段列表（需要从 sample 透传到 result）
+    META_KEYS = ("run_id", "config_id", "question_id", "question_set_id", "question_set_name")
+
     for i, sample in enumerate(samples):
         # 确保样本有 evaluation_track 字段
         if "evaluation_track" not in sample:
             sample["evaluation_track"] = classify_evaluation_track(sample)
+
+        # 提取当前样本的元数据
+        sample_meta = {k: sample.get(k) for k in META_KEYS if sample.get(k)}
 
         # 规则预筛选
         prescreened = pre_screen(sample)
@@ -390,6 +402,7 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
                 "evaluation_track": sample["evaluation_track"],
                 "_prescreened": True,
                 **prescreened,
+                **sample_meta,  # 透传元数据
             }
             if progress_callback:
                 progress_callback(i + 1, total, result)
@@ -407,6 +420,7 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
                 "evaluation_track": sample["evaluation_track"],
                 "_content_cached": True,
                 **cached,
+                **sample_meta,  # 透传元数据（覆盖缓存中的值）
             }
             if progress_callback:
                 progress_callback(i + 1, total, result)
@@ -422,7 +436,8 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
                 if k not in (
                     "trace_id", "question", "question_mode",
                     "evaluation_track", "retrieval_evaluable",
-                    "has_reference", "_prompt", "_raw_response"
+                    "has_reference", "_prompt", "_raw_response",
+                    *META_KEYS  # 排除元数据字段
                 )
             }
         if progress_callback:

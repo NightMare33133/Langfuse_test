@@ -51,7 +51,7 @@ def test_save_and_verify(mode, count=10, temp_dir=None):
 
     # 使用临时目录保存
     with patch('question_generator.QUESTIONS_DIR', temp_dir):
-        output_path, fname = save_questions(questions)
+        output_path, fname, _set_id = save_questions(questions)
     print(f"保存到: {output_path}")
 
     # 验证文件存在

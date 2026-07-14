@@ -15,7 +15,9 @@ Question generation strategy:
 """
 
 import json
+import random
 import re
+import string
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +36,34 @@ MODE_LABELS = {
     MODE_RETRIEVAL: "检索评测",
     MODE_QA: "全流程问答评测",
 }
+
+
+def generate_question_set_id(name: str = "") -> str:
+    """生成唯一 question_set_id。
+
+    格式: qs_<YYYYMMDD_HHMMSSffffff>_<slug>
+    """
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S") + f"{now.microsecond:06d}"
+
+    if name:
+        slug = re.sub(r'[^\w\u4e00-\u9fff]', '_', name.strip())
+        slug = re.sub(r'_+', '_', slug).strip('_')[:20]
+    else:
+        slug = "unnamed"
+
+    return f"qs_{timestamp}_{slug}"
+
+
+def build_question_set_name(source_filename: str, mode: str) -> str:
+    """根据源文件名和出题模式生成默认题集名称。
+
+    例如: IS5010期末复习_检索评测
+    """
+    # 提取文件名（不含扩展名）
+    stem = Path(source_filename).stem if source_filename else "未命名"
+    mode_label = MODE_LABELS.get(mode, "未知模式")
+    return f"{stem}_{mode_label}"
 
 # Chunking parameters
 MAX_CHUNK_CHARS = 3000   # Target max chars per chunk
@@ -676,18 +706,54 @@ def generate_questions(content, api_key, base_url, model,
 
 # ========== Save / Export ==========
 
-def save_questions(questions, filename=None):
+def save_questions(questions, filename=None, question_set_id=None,
+                   question_set_name=None, source_document_name=None,
+                   question_mode=None):
     """Save questions to JSONL file in data/questions/.
 
-    Returns (output_path, filename).
+    Args:
+        questions: 题目列表
+        filename: 可选文件名，默认自动生成
+        question_set_id: 题集 ID（可选，自动生成）
+        question_set_name: 题集名称（可选）
+        source_document_name: 源文档名称（可选）
+        question_mode: 出题模式（可选）
+
+    Returns:
+        (output_path, filename, question_set_id)
     """
     QUESTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 生成 question_set_id
+    if question_set_id is None:
+        question_set_id = generate_question_set_id(question_set_name or "")
+
+    # 生成文件名
     if filename is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"questions_{ts}.jsonl"
+        if question_set_name:
+            slug = re.sub(r'[^\w\u4e00-\u9fff]', '_', question_set_name.strip())
+            slug = re.sub(r'_+', '_', slug).strip('_')[:20]
+            filename = f"questions_{slug}_{ts}.jsonl"
+        else:
+            filename = f"questions_{ts}.jsonl"
 
     output_path = QUESTIONS_DIR / filename
+
+    # 确保文件名唯一
+    if output_path.exists():
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        stem = output_path.stem
+        output_path = QUESTIONS_DIR / f"{stem}_{suffix}.jsonl"
+        filename = output_path.name
+
+    # 为每道题添加题集字段
+    for q in questions:
+        q["question_set_id"] = question_set_id
+        if question_set_name:
+            q["question_set_name"] = question_set_name
+        if source_document_name:
+            q["source_document_name"] = source_document_name
 
     # 写入文件
     with output_path.open("w", encoding="utf-8") as f:
@@ -698,9 +764,23 @@ def save_questions(questions, filename=None):
     if not output_path.exists():
         raise IOError(f"文件写入失败: {output_path}")
 
-    print(f"[save_questions] 已保存 {len(questions)} 道题目到: {output_path}")
+    # 保存题集 manifest
+    manifest = {
+        "question_set_id": question_set_id,
+        "question_set_name": question_set_name or "未命名题集",
+        "question_mode": question_mode or "",
+        "source_document_name": source_document_name or "",
+        "question_count": len(questions),
+        "created_at": datetime.now().isoformat(),
+        "filename": output_path.name,
+    }
+    manifest_path = QUESTIONS_DIR / f"{output_path.stem}_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return output_path, filename
+    print(f"[save_questions] 已保存 {len(questions)} 道题目到: {output_path}")
+    print(f"[save_questions] question_set_id: {question_set_id}")
+
+    return output_path, filename, question_set_id
 
 
 def export_csv_bytes(questions):
