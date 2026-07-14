@@ -74,7 +74,7 @@ def _ensure_unique_dir(base_id: str, parent_dir: Path) -> tuple:
     return new_id, dir_path
 
 
-# ========== 字段分级 ==========
+# ========== 配置字段统一 Schema ==========
 
 # A. 系统核心字段：不可在 UI 编辑
 CONFIG_CORE_FIELDS = {"config_id", "created_at"}
@@ -82,17 +82,55 @@ RUN_CORE_FIELDS = {"run_id", "config_id", "question_set_id", "question_set_name"
                    "question_set_source", "batch_results_file", "raw_results_file",
                    "started_at", "status"}
 
-# B. 轻量必填字段（创建时要求）
-CONFIG_REQUIRED_FIELDS = {"config_name", "knowledge_base_version", "workflow_version"}
+# 配置字段 schema：key -> (label, required, widget, placeholder, help)
+# widget: "text" | "textarea" | "number" | "select"
+CONFIG_FIELD_SCHEMA = [
+    ("config_name",          "配置名称",       True,  "text",     "例如：chunk_size 优化测试", "必填"),
+    ("knowledge_base_version","知识库版本",    True,  "text",     "例如：fintech_kb_v2",       "必填，可填写自由文本"),
+    ("workflow_version",     "工作流版本",     True,  "text",     "例如：chatflow_v2",         "必填"),
+    ("source_description",   "文档/数据来源",  False, "text",     "例如：IS5010 期末复习 MD",  ""),
+    ("chunk_strategy",       "分块策略",       False, "text",     "例如：按章节切分 / 512 tokens", ""),
+    ("embedding_model",      "Embedding 模型", False, "text",     "例如：bge-large-zh-v1.5",   ""),
+    ("retrieval_mode",       "检索模式",       False, "text",     "例如：hybrid / semantic",    ""),
+    ("retrieval_config",     "检索配置说明",   False, "text",     "例如：hybrid / top_k=5 / reranker=on", ""),
+    ("top_k",                "Top K",          False, "number",   "例如：5",                   "整数"),
+    ("rerank_model",         "Rerank 模型",    False, "text",     "例如：bge-reranker-v2-m3",  ""),
+    ("changed_variable",     "本次改动",       False, "text",     "例如：chunk_size: 1000 -> 500", ""),
+    ("notes",                "备注",           False, "textarea", "其他需要记录的信息",         ""),
+]
 
-# C. 可选实验字段（允许为空）
-CONFIG_OPTIONAL_FIELDS = {"source_description", "chunk_strategy", "chunk_size", "chunk_overlap",
-                          "embedding_model", "retrieval_mode", "semantic_weight", "keyword_weight",
-                          "top_k", "score_threshold", "rerank_enabled", "rerank_model",
-                          "changed_variable", "retrieval_config", "notes"}
-
-# B+C 可编辑字段
+# B+C 可编辑字段集合（从 schema 自动生成）
+CONFIG_REQUIRED_FIELDS = {f[0] for f in CONFIG_FIELD_SCHEMA if f[2]}
+CONFIG_OPTIONAL_FIELDS = {f[0] for f in CONFIG_FIELD_SCHEMA if not f[2]}
 CONFIG_EDITABLE_FIELDS = CONFIG_REQUIRED_FIELDS | CONFIG_OPTIONAL_FIELDS
+
+
+def get_config_summary(config: dict) -> str:
+    """生成配置摘要文本，用于列表显示。"""
+    parts = []
+    parts.append(config.get("config_name", "未命名"))
+    parts.append(config.get("knowledge_base_version", "") or "未记录")
+    mode = config.get("retrieval_mode", "")
+    topk = config.get("top_k", "")
+    rerank = config.get("rerank_model", "")
+    extras = []
+    if mode:
+        extras.append(mode)
+    if topk:
+        extras.append(f"top_k={topk}")
+    if rerank:
+        extras.append(f"rerank={rerank}")
+    if extras:
+        parts.append(" / ".join(extras))
+    return " | ".join(parts)
+
+
+def get_config_display_value(config: dict, key: str) -> str:
+    """获取配置字段的显示值，空值返回'未记录'。"""
+    val = config.get(key)
+    if val is None or str(val).strip() == "":
+        return "未记录"
+    return str(val)
 
 
 def _protect_core_fields(existing: dict, updates: dict, core_fields: set) -> dict:

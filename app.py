@@ -25,6 +25,92 @@ BATCH_DIR = Path(__file__).parent / "data" / "batch"
 QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
 
 
+# ---------- 配置表单统一 helper ----------
+
+def render_config_form(config: dict, key_prefix: str, disabled: bool = False) -> dict:
+    """根据 CONFIG_FIELD_SCHEMA 渲染配置表单，返回 {field_key: value} 字典。
+
+    Args:
+        config: 当前配置值（用于回填）
+        key_prefix: Streamlit widget key 前缀（避免冲突）
+        disabled: 是否只读模式
+
+    Returns:
+        dict: 各字段的当前值
+    """
+    from experiment import CONFIG_FIELD_SCHEMA
+
+    values = {}
+    required_fields = []
+    optional_fields = []
+
+    for key, label, required, widget, placeholder, help_text in CONFIG_FIELD_SCHEMA:
+        if required:
+            required_fields.append((key, label, required, widget, placeholder, help_text))
+        else:
+            optional_fields.append((key, label, required, widget, placeholder, help_text))
+
+    # 必填字段
+    st.markdown("**必填字段**")
+    req_col1, req_col2 = st.columns(2)
+    for i, (key, label, _, widget, placeholder, help_text) in enumerate(required_fields):
+        with (req_col1 if i % 2 == 0 else req_col2):
+            display_label = f"{label} *" if not disabled else label
+            val = config.get(key, "")
+            if widget == "textarea":
+                values[key] = st.text_area(
+                    display_label, value=str(val),
+                    placeholder=placeholder, key=f"{key_prefix}_{key}",
+                    height=68, disabled=disabled, help=help_text,
+                )
+            else:
+                values[key] = st.text_input(
+                    display_label, value=str(val),
+                    placeholder=placeholder, key=f"{key_prefix}_{key}",
+                    disabled=disabled, help=help_text,
+                )
+
+    # 可选字段（折叠区）
+    with st.expander("补充实验参数（可选）", expanded=False):
+        opt_col1, opt_col2 = st.columns(2)
+        for i, (key, label, _, widget, placeholder, help_text) in enumerate(optional_fields):
+            with (opt_col1 if i % 2 == 0 else opt_col2):
+                val = config.get(key, "")
+                if widget == "textarea":
+                    values[key] = st.text_area(
+                        label, value=str(val) if val is not None else "",
+                        placeholder=placeholder, key=f"{key_prefix}_{key}",
+                        height=68, disabled=disabled, help=help_text,
+                    )
+                elif widget == "number":
+                    # number_input 需要 int 值
+                    num_val = val if isinstance(val, (int, float)) else 0
+                    values[key] = st.number_input(
+                        label, value=int(num_val), min_value=0, step=1,
+                        key=f"{key_prefix}_{key}", disabled=disabled, help=help_text,
+                    )
+                else:
+                    values[key] = st.text_input(
+                        label, value=str(val) if val is not None else "",
+                        placeholder=placeholder, key=f"{key_prefix}_{key}",
+                        disabled=disabled, help=help_text,
+                    )
+
+    return values
+
+
+def collect_config_updates(form_values: dict) -> dict:
+    """从表单值收集更新字典，过滤空值和零值。"""
+    updates = {}
+    for key, val in form_values.items():
+        if isinstance(val, (int, float)):
+            if val > 0:
+                updates[key] = val
+        elif isinstance(val, str) and val.strip():
+            updates[key] = val.strip()
+    return updates
+
+
 # ---------- 评测结果可视化 / 导出辅助函数 ----------
 
 def build_retrieval_bar_chart(metrics: dict):
@@ -1229,6 +1315,8 @@ PISP和AISP的区别?
         from experiment import (
             create_config_profile, load_config_profile, list_config_profiles,
             create_experiment_run, update_experiment_run, ensure_question_id,
+            get_config_summary, get_config_display_value,
+            CONFIG_FIELD_SCHEMA,
         )
 
         # 配置来源选择
@@ -1240,17 +1328,14 @@ PISP和AISP的区别?
         )
 
         if config_source == "使用历史配置":
-            # 加载历史配置列表
             historical_configs = list_config_profiles()
             if not historical_configs:
                 st.warning("暂无历史配置，请选择「新建配置方案」")
                 config_source = "新建配置方案"
             else:
-                # 构建下拉选项
                 config_options = []
                 for cfg in historical_configs:
-                    label = f"{cfg.get('config_name', '未命名')} | {cfg.get('knowledge_base_version', '')} | {cfg.get('changed_variable', '')[:30]}"
-                    config_options.append((cfg.get("config_id"), label))
+                    config_options.append((cfg.get("config_id"), get_config_summary(cfg)))
 
                 selected_config_id = st.selectbox(
                     "选择历史配置",
@@ -1259,89 +1344,31 @@ PISP和AISP的区别?
                     key="batch_selected_config",
                 )
 
-                # 回填配置字段
                 if selected_config_id:
                     selected_config = load_config_profile(selected_config_id)
                     if selected_config:
                         st.caption(f"当前使用历史配置: **{selected_config.get('config_name', '')}**")
-                        exp_name = selected_config.get("config_name", "")
-                        exp_kb_version = selected_config.get("knowledge_base_version", "")
-                        exp_workflow_version = selected_config.get("workflow_version", "")
-                        exp_changed = selected_config.get("changed_variable", "")
-                        exp_retrieval_config = selected_config.get("retrieval_config", "")
-                        exp_notes = selected_config.get("notes", "")
-
-                        # 显示只读字段
+                        # 只读摘要（与实验版本一致）
                         with st.container(border=True):
                             st.markdown("**当前配置（只读）**")
-                            ro_col1, ro_col2 = st.columns(2)
-                            with ro_col1:
-                                st.text_input("配置名称", value=exp_name, disabled=True, key="ro_exp_name")
-                                st.text_input("知识库版本", value=exp_kb_version, disabled=True, key="ro_exp_kb")
-                                st.text_input("工作流版本", value=exp_workflow_version, disabled=True, key="ro_exp_wf")
-                            with ro_col2:
-                                st.text_input("本次改动", value=exp_changed, disabled=True, key="ro_exp_changed")
-                                st.text_input("检索配置", value=exp_retrieval_config, disabled=True, key="ro_exp_retrieval")
-                                st.text_area("备注", value=exp_notes, disabled=True, height=68, key="ro_exp_notes")
-
+                            render_config_form(selected_config, key_prefix="ro_batch", disabled=True)
                         # 另存为新方案
                         if st.button("基于此配置另存为新方案", key="batch_save_as_new"):
                             st.session_state["batch_config_source"] = "新建配置方案"
-                            st.session_state["batch_exp_name"] = f"{exp_name} (副本)"
-                            st.session_state["batch_exp_kb_version"] = exp_kb_version
-                            st.session_state["batch_exp_workflow_version"] = exp_workflow_version
-                            st.session_state["batch_exp_changed"] = exp_changed
-                            st.session_state["batch_exp_retrieval_config"] = exp_retrieval_config
-                            st.session_state["batch_exp_notes"] = exp_notes
+                            for key, _, _, _, _, _ in CONFIG_FIELD_SCHEMA:
+                                val = selected_config.get(key, "")
+                                st.session_state[f"batch_new_{key}"] = f"{val} (副本)" if key == "config_name" else val
                             st.rerun()
 
         if config_source == "新建配置方案":
             st.caption("创建新的 RAG 配置方案，可在此后的多次批量测试中复用")
-            exp_col1, exp_col2 = st.columns(2)
-            with exp_col1:
-                exp_name = st.text_input(
-                    "配置名称",
-                    placeholder="例如：chunk_size 优化测试",
-                    key="batch_exp_name",
-                    help="必填（留空将使用'未命名配置'）"
-                )
-                exp_kb_version = st.text_input(
-                    "知识库版本",
-                    placeholder="例如：fintech_kb_v2",
-                    key="batch_exp_kb_version",
-                    help="必填（留空将使用'未指定'）"
-                )
-                exp_workflow_version = st.text_input(
-                    "工作流版本（可选）",
-                    placeholder="例如：chatflow_v2",
-                    key="batch_exp_workflow_version",
-                )
-            with exp_col2:
-                exp_changed = st.text_input(
-                    "本次改动",
-                    placeholder="例如：chunk_size: 1000 -> 500",
-                    key="batch_exp_changed",
-                    help="必填（留空将使用'未指定'）"
-                )
-                exp_retrieval_config = st.text_input(
-                    "检索配置摘要（可选）",
-                    placeholder="例如：hybrid / top_k=5 / reranker=on",
-                    key="batch_exp_retrieval_config",
-                )
-                exp_notes = st.text_area(
-                    "备注（可选）",
-                    placeholder="其他需要记录的信息",
-                    key="batch_exp_notes",
-                    height=68,
-                )
-
+            # 使用统一 schema 渲染表单
+            _new_config_values = render_config_form({}, key_prefix="batch_new")
             # 必填字段检查提示
-            if not exp_name:
+            if not _new_config_values.get("config_name", "").strip():
                 st.warning("建议填写配置名称，否则将使用'未命名配置'")
-            if not exp_kb_version:
+            if not _new_config_values.get("knowledge_base_version", "").strip():
                 st.warning("建议填写知识库版本")
-            if not exp_changed:
-                st.warning("建议填写本次改动")
 
     # --- Dify API config ---
     with st.expander("Dify API 配置", expanded=False):
@@ -1388,22 +1415,17 @@ PISP和AISP的区别?
                     st.error("请选择历史配置")
                     st.stop()
             else:
-                # 创建新配置方案
-                _exp_name = st.session_state.get("batch_exp_name", "") or "未命名配置"
-                _exp_kb_version = st.session_state.get("batch_exp_kb_version", "") or "未指定"
-                _exp_workflow_version = st.session_state.get("batch_exp_workflow_version", "")
-                _exp_changed = st.session_state.get("batch_exp_changed", "") or "未指定"
-                _exp_retrieval_config = st.session_state.get("batch_exp_retrieval_config", "")
-                _exp_notes = st.session_state.get("batch_exp_notes", "")
+                # 创建新配置方案（从统一 schema 的 session_state 读取）
+                _form_vals = {}
+                for _key, _, _, _, _, _ in CONFIG_FIELD_SCHEMA:
+                    _form_vals[_key] = st.session_state.get(f"batch_new_{_key}", "")
+                # 必填字段兜底
+                if not str(_form_vals.get("config_name", "")).strip():
+                    _form_vals["config_name"] = "未命名配置"
+                if not str(_form_vals.get("knowledge_base_version", "")).strip():
+                    _form_vals["knowledge_base_version"] = "未指定"
 
-                config_result = create_config_profile(
-                    config_name=_exp_name,
-                    knowledge_base_version=_exp_kb_version,
-                    workflow_version=_exp_workflow_version,
-                    changed_variable=_exp_changed,
-                    retrieval_config=_exp_retrieval_config,
-                    notes=_exp_notes,
-                )
+                config_result = create_config_profile(**collect_config_updates(_form_vals))
                 _config_id = config_result["config_id"]
 
             # 创建运行记录
@@ -3407,6 +3429,7 @@ with tab_experiment:
         list_config_profiles, list_experiment_runs, list_runs_by_config,
         load_config_profile, get_run_status, get_judge_metrics_by_run,
         backfill_manifest_from_batch, migrate_judged_results, migrate_processed_samples,
+        get_config_display_value, get_config_summary,
         EXPERIMENTS_DIR,
     )
     from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
@@ -3486,24 +3509,18 @@ with tab_experiment:
     st.markdown("---")
     st.markdown(f"##### 配置方案: {selected_config.get('config_name', '未命名')}")
 
-    def _display_val(val):
-        """显示字段值，空值显示为'未记录'。"""
-        if val is None or str(val).strip() == "":
-            return "未记录"
-        return str(val)
-
-    # 摘要字段卡片
+    # 摘要字段卡片（使用统一 schema）
     card_col1, card_col2 = st.columns(2)
     with card_col1:
-        st.markdown(f"**配置名称**: {selected_config.get('config_name', '')}")
-        st.markdown(f"**知识库版本**: {_display_val(selected_config.get('knowledge_base_version'))}")
-        st.markdown(f"**工作流版本**: {_display_val(selected_config.get('workflow_version'))}")
+        st.markdown(f"**配置名称**: {get_config_display_value(selected_config, 'config_name')}")
+        st.markdown(f"**知识库版本**: {get_config_display_value(selected_config, 'knowledge_base_version')}")
+        st.markdown(f"**工作流版本**: {get_config_display_value(selected_config, 'workflow_version')}")
     with card_col2:
-        st.markdown(f"**检索模式**: {_display_val(selected_config.get('retrieval_mode'))}")
-        _topk = selected_config.get('top_k', '')
-        _rerank = selected_config.get('rerank_enabled', '')
-        st.markdown(f"**Top K**: {_display_val(_topk) if _topk else '未记录'}　**Rerank**: {_display_val(_rerank) if _rerank else '未记录'}")
-        st.markdown(f"**备注**: {_display_val(selected_config.get('notes'))}")
+        st.markdown(f"**检索模式**: {get_config_display_value(selected_config, 'retrieval_mode')}")
+        _topk = get_config_display_value(selected_config, 'top_k')
+        _rerank = get_config_display_value(selected_config, 'rerank_model')
+        st.markdown(f"**Top K**: {_topk}　**Rerank**: {_rerank}")
+        st.markdown(f"**备注**: {get_config_display_value(selected_config, 'notes')}")
     _updated = selected_config.get('updated_at', '')
     _created = selected_config.get('created_at', '')
     st.caption(f"创建时间: {_created[:19] if _created else '未知'}" +
@@ -3513,47 +3530,14 @@ with tab_experiment:
     with st.expander("编辑/查看配置详情", expanded=False):
         with st.form("edit_config_form"):
             st.markdown("**可编辑字段**（核心字段 config_id / created_at 不可修改）")
-            ec_col1, ec_col2 = st.columns(2)
-            with ec_col1:
-                ec_name = st.text_input("配置名称 *", value=selected_config.get("config_name", ""), key="ec_name")
-                ec_kb = st.text_input("知识库版本 *", value=selected_config.get("knowledge_base_version", ""), key="ec_kb")
-                ec_wf = st.text_input("工作流版本 *", value=selected_config.get("workflow_version", ""), key="ec_wf")
-                ec_changed = st.text_input("本次改动", value=selected_config.get("changed_variable", ""), key="ec_changed")
-                ec_ret = st.text_input("检索配置", value=selected_config.get("retrieval_config", ""), key="ec_ret")
-            with ec_col2:
-                ec_source = st.text_input("文档/数据来源", value=selected_config.get("source_description", ""), key="ec_source")
-                ec_chunk = st.text_input("分块策略", value=selected_config.get("chunk_strategy", ""), key="ec_chunk")
-                ec_embed = st.text_input("Embedding 模型", value=selected_config.get("embedding_model", ""), key="ec_embed")
-                ec_mode = st.text_input("检索模式", value=selected_config.get("retrieval_mode", ""), key="ec_mode")
-                ec_topk = st.text_input("Top K", value=str(selected_config.get("top_k", "")), key="ec_topk")
-                ec_rerank = st.text_input("Rerank 模型", value=selected_config.get("rerank_model", ""), key="ec_rerank")
-            ec_notes = st.text_area("备注", value=selected_config.get("notes", ""), key="ec_notes", height=68)
+            ec_values = render_config_form(selected_config, key_prefix="ecfg")
             ec_note = st.text_input("修改说明（可选）", value="", key="ec_edit_note",
                                     help="简要说明本次修改原因，如：补录 Rerank 配置")
             ec_submit = st.form_submit_button("保存配置修改", type="primary")
 
         if ec_submit:
             from experiment import update_config_profile_safe
-            updates = {
-                "config_name": ec_name,
-                "knowledge_base_version": ec_kb,
-                "workflow_version": ec_wf,
-                "changed_variable": ec_changed,
-                "retrieval_config": ec_ret,
-                "source_description": ec_source,
-                "chunk_strategy": ec_chunk,
-                "embedding_model": ec_embed,
-                "retrieval_mode": ec_mode,
-                "notes": ec_notes,
-            }
-            # 数值字段：空字符串时不写入
-            if ec_topk.strip():
-                try:
-                    updates["top_k"] = int(ec_topk)
-                except ValueError:
-                    updates["top_k"] = ec_topk
-            if ec_rerank.strip():
-                updates["rerank_model"] = ec_rerank
+            updates = collect_config_updates(ec_values)
             update_config_profile_safe(selected_config_id, updates, edit_note=ec_note)
             st.success("配置已保存，config_id 未变。")
             st.rerun()
