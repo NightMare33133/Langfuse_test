@@ -3302,27 +3302,45 @@ Judge 有三层减少重复调用的机制：
                         _prefix = f"[{_p}]" if _p is not None else ""
                         _score = f" (score: {_s})" if _s is not None else ""
                         _raw_lines.append(f"{_prefix}{_t}{_score}: {_c}")
-                    _raw_retrieval_text = "\n".join(_raw_lines)
+                    raw_retrieval_chars = sum(len(line) for line in _raw_lines)
                 else:
-                    _raw_retrieval_text = "(无检索结果)"
-                raw_prompt = template
-                raw_prompt = raw_prompt.replace("{question}", sample_preview.get("question") or "(无)")
-                raw_prompt = raw_prompt.replace("{retrieval_query}", sample_preview.get("retrieval_query") or "(无)")
-                raw_prompt = raw_prompt.replace("{retrieval_results}", _raw_retrieval_text)
-                raw_prompt = raw_prompt.replace("{final_answer}", sample_preview.get("final_answer") or "(无)")
-                if _has_ref:
-                    raw_prompt = raw_prompt.replace("{reference_answer}", sample_preview.get("reference_answer") or "(无)")
-                    raw_prompt = raw_prompt.replace("{source_excerpt}", sample_preview.get("source_excerpt") or "(无)")
+                    raw_retrieval_chars = 0
 
                 # 实际版本：清洗 metadata + 分层截断（build_judge_prompt 内部会自动选模板）
                 actual_prompt = build_judge_prompt(sample_preview)
+                # 检索正文：用 build_judge_prompt 的内部格式化计算清洗后长度
+                from judge import _format_single_result, classify_evaluation_track, get_gold_evidence, TRACK_RETRIEVAL
+                if _raw_results:
+                    _cleaned_lines = []
+                    for i, r in enumerate(_raw_results):
+                        _cleaned_lines.append(
+                            f"--- 检索结果 {i + 1} ---\n"
+                            + _format_single_result(r, i)
+                        )
+                    cleaned_retrieval_chars = sum(len(line) + 2 for line in _cleaned_lines)  # +2 for \n\n join
+                else:
+                    cleaned_retrieval_chars = 0
 
-                save_chars = len(raw_prompt) - len(actual_prompt)
-                pct = save_chars / len(raw_prompt) * 100 if len(raw_prompt) > 0 else 0
+                # 检索正文统计
+                if raw_retrieval_chars > 0 and cleaned_retrieval_chars > 0:
+                    diff = cleaned_retrieval_chars - raw_retrieval_chars
+                    if diff >= 0:
+                        ratio_text = f"增加 {diff / raw_retrieval_chars * 100:.0f}%"
+                    else:
+                        ratio_text = f"节省 {-diff / raw_retrieval_chars * 100:.0f}%"
+                    st.caption(
+                        f"检索结果正文：原始 {raw_retrieval_chars} 字符"
+                        f" → 清洗/截断后 {cleaned_retrieval_chars} 字符"
+                        f"（{ratio_text}）"
+                    )
+                elif raw_retrieval_chars == 0:
+                    st.caption("检索结果正文：无检索结果")
+
+                # 最终 Prompt 统计
                 st.caption(
-                    f"原始 {len(raw_prompt)} 字符 → 清洗+截断后 {len(actual_prompt)} 字符"
-                    f"（省 {pct:.0f}%）。"
-                    f"策略：去除 metadata 块，分层保留正文 — "
+                    f"最终 Judge Prompt：{len(actual_prompt)} 字符"
+                    f"（含模板、评测查询、金标准证据与格式标签）"
+                    f"。策略：去除 metadata 块，分层保留正文 — "
                     f"Top-1: 2000字，Top-2/3: 1200字，Top-4/5: 1000字"
                 )
                 with st.expander("查看处理后的 prompt 示例"):
