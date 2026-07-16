@@ -549,6 +549,167 @@ def _run_sort(questions_dir):
     return [file_info_cache[f]["set_name"] or f.stem for f in history_files]
 
 
+def _is_question_set(filepath):
+    """与 app.py 中完全一致的题集判断逻辑。"""
+    # 条件 A：有 manifest
+    manifest_path = filepath.parent / f"{filepath.stem}_manifest.json"
+    if manifest_path.exists():
+        return True
+    # 条件 B：内容中有 question_set_id
+    try:
+        with filepath.open("r", encoding="utf-8") as f:
+            checked = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                checked += 1
+                if checked > 3:
+                    break
+                try:
+                    obj = json.loads(line)
+                    if obj.get("question_set_id"):
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def test_filter_non_question_set_files():
+    """测试过滤非题集文件：batch_results、raw/processed/judged 文件不出现在选择器中。"""
+    print("=" * 60)
+    print("测试过滤非题集文件")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        questions_dir = Path(tmpdir)
+
+        # 1. 真正的题集（有 manifest）
+        qs_with_manifest = questions_dir / "questions_合同_20260714_100000.jsonl"
+        with qs_with_manifest.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "question": "合同问题1", "reference_answer": "答案1",
+                "question_mode": "retrieval",
+                "question_set_id": "qs_20260714_100000000000_合同",
+                "question_set_name": "合同题集",
+            }, ensure_ascii=False) + "\n")
+        manifest = {
+            "question_set_id": "qs_20260714_100000000000_合同",
+            "question_set_name": "合同题集",
+            "question_count": 1,
+            "created_at": "2026-07-14T10:00:00",
+        }
+        (questions_dir / "questions_合同_20260714_100000_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # 2. 真正的题集（无 manifest，但有 question_set_id）
+        qs_no_manifest = questions_dir / "questions_IS5010_20260713_120000.jsonl"
+        with qs_no_manifest.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "question": "IS5010问题1", "reference_answer": "答案1",
+                "question_mode": "retrieval",
+                "question_set_id": "qs_20260713_120000000000_IS5010",
+                "question_set_name": "IS5010题集",
+            }, ensure_ascii=False) + "\n")
+
+        # 3. 旧格式题集（无 question_set_id，无 manifest）→ 不应出现
+        qs_old = questions_dir / "questions_20260708_111748.jsonl"
+        with qs_old.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "question": "旧问题1", "reference_answer": "旧答案1",
+            }, ensure_ascii=False) + "\n")
+
+        # 4. batch_results 文件 → 不应出现
+        batch_results = questions_dir / "batch_results_20260714_120000.jsonl"
+        with batch_results.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "question": "批量问题1",
+                "success": True,
+                "sample": {"final_answer": "批量回答1"},
+            }, ensure_ascii=False) + "\n")
+
+        # 5. batch_qa raw 文件 → 不应出现
+        batch_qa = questions_dir / "batch_qa_20260714_120000.jsonl"
+        with batch_qa.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "trace_id": "batch_qa_abc123",
+                "question": "批量QA问题1",
+                "final_answer": "批量QA回答1",
+            }, ensure_ascii=False) + "\n")
+
+        # 6. eval_results 文件 → 不应出现
+        eval_results = questions_dir / "eval_results_20260714_120000.jsonl"
+        with eval_results.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "trace_id": "eval_abc123",
+                "question": "评测问题1",
+                "retrieval_top1_hit": 1,
+            }, ensure_ascii=False) + "\n")
+
+        # 7. langfuse_samples 文件 → 不应出现
+        langfuse = questions_dir / "langfuse_samples.jsonl"
+        with langfuse.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "trace_id": "lf_abc123",
+                "question": "Langfuse问题1",
+            }, ensure_ascii=False) + "\n")
+
+        # 8. run 目录中的 batch_results → 不应出现在题集选择器
+        run_dir = questions_dir / "run_20260716_113807_821034_测试"
+        run_dir.mkdir()
+        run_batch = run_dir / "batch_results.jsonl"
+        with run_batch.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "question": "运行内批量问题1",
+                "success": True,
+            }, ensure_ascii=False) + "\n")
+
+        # 模拟选择器过滤逻辑
+        all_files = list(questions_dir.glob("*.jsonl"))
+        filtered_files = [f for f in all_files if _is_question_set(f)]
+
+        all_names = sorted([f.name for f in all_files])
+        filtered_names = sorted([f.name for f in filtered_files])
+
+        print(f"  全部文件 ({len(all_files)}): {all_names}")
+        print(f"  过滤后 ({len(filtered_files)}): {filtered_names}")
+
+        # 验证：应保留的文件
+        assert qs_with_manifest in filtered_files, \
+            f"有 manifest 的题集应保留: {qs_with_manifest.name}"
+        assert qs_no_manifest in filtered_files, \
+            f"有 question_set_id 的题集应保留: {qs_no_manifest.name}"
+        print("[OK] 真正的题集被保留")
+
+        # 验证：应排除的文件
+        assert batch_results not in filtered_files, \
+            f"batch_results 不应出现: {batch_results.name}"
+        assert batch_qa not in filtered_files, \
+            f"batch_qa 不应出现: {batch_qa.name}"
+        assert eval_results not in filtered_files, \
+            f"eval_results 不应出现: {eval_results.name}"
+        assert langfuse not in filtered_files, \
+            f"langfuse_samples 不应出现: {langfuse.name}"
+        assert qs_old not in filtered_files, \
+            f"无 manifest 且无 question_set_id 的旧文件不应出现: {qs_old.name}"
+        print("[OK] 非题集文件被正确排除")
+
+        # 验证：run 目录内的 batch_results 不在 glob 范围内
+        assert run_batch not in all_files, \
+            f"run 目录内的文件不应被 glob 到: {run_batch.name}"
+        print("[OK] run 目录内的 batch_results 不被扫描")
+
+        # 验证：恰好保留 2 个题集
+        assert len(filtered_files) == 2, \
+            f"应恰好保留 2 个题集，实际 {len(filtered_files)} 个: {filtered_names}"
+        print("[OK] 恰好保留 2 个题集")
+
+    print()
+
+
 def main():
     print("=" * 60)
     print("历史题集选择器测试")
@@ -560,6 +721,7 @@ def main():
     test_selection_uses_index_not_label()
     test_history_sort_by_created_at()
     test_label_uniqueness_with_real_data()
+    test_filter_non_question_set_files()
 
     print("=" * 60)
     print("[OK] 所有测试通过！")

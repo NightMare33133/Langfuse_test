@@ -455,11 +455,19 @@ def backfill_manifest_from_batch(run_id: str, batch_dir=None) -> bool:
         return False
 
     batch_file = manifest.get("batch_results_file")
-    if not batch_file or not batch_dir:
+    if not batch_file:
         return False
 
-    batch_path = Path(batch_dir) / batch_file
-    if not batch_path.exists():
+    # 优先查找 run 目录，fallback 到全局 batch 目录
+    batch_path = None
+    run_local = EXPERIMENTS_DIR / run_id / batch_file
+    if run_local.exists():
+        batch_path = run_local
+    elif batch_dir:
+        global_path = Path(batch_dir) / batch_file
+        if global_path.exists():
+            batch_path = global_path
+    if batch_path is None:
         return False
 
     # 从 batch 文件读取第一条成功记录的题集信息
@@ -688,30 +696,37 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
     question_set_id = manifest.get("question_set_id", "")
     question_set_name = manifest.get("question_set_name", "")
 
-    # Batch 状态
+    # Batch 状态（优先查找 run 目录，fallback 到全局 batch 目录）
     batch_success = 0
     batch_total = 0
     batch_file = manifest.get("batch_results_file")
-    if batch_file and batch_dir:
-        batch_path = Path(batch_dir) / batch_file
-        if batch_path.exists():
-            try:
-                with batch_path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        obj = json.loads(line)
-                        batch_total += 1
-                        if obj.get("success"):
-                            batch_success += 1
-                        # 从 batch 中提取题集信息（如果 manifest 没有）
-                        if not question_set_id:
-                            sample = obj.get("sample", {})
-                            if sample.get("question_set_id"):
-                                question_set_id = sample["question_set_id"]
-                                question_set_name = sample.get("question_set_name", "")
-            except (json.JSONDecodeError, IOError):
-                pass
+    batch_path = None
+    if batch_file:
+        run_local = EXPERIMENTS_DIR / run_id / batch_file
+        if run_local.exists():
+            batch_path = run_local
+        elif batch_dir:
+            global_path = Path(batch_dir) / batch_file
+            if global_path.exists():
+                batch_path = global_path
+    if batch_path is not None:
+        try:
+            with batch_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    batch_total += 1
+                    if obj.get("success"):
+                        batch_success += 1
+                    # 从 batch 中提取题集信息（如果 manifest 没有）
+                    if not question_set_id:
+                        sample = obj.get("sample", {})
+                        if sample.get("question_set_id"):
+                            question_set_id = sample["question_set_id"]
+                            question_set_name = sample.get("question_set_name", "")
+        except (json.JSONDecodeError, IOError):
+            pass
 
     # Raw 状态
     raw_count = 0

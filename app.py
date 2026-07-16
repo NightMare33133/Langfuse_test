@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from parser import parse_langfuse_jsonl, save_results
 from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref, build_result_status
 from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS, MODE_RETRIEVAL, MODE_QA, MODE_LABELS, build_question_set_name
-from batch_query import run_batch_query, save_batch_results, push_to_raw_dir, export_csv_bytes as batch_export_csv
+from batch_query import run_batch_query, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -1482,11 +1482,42 @@ PISP和AISP的区别?
                 st.success(f"从文件加载了 {len(questions_list)} 个问题")
 
         elif q_source == "从历史记录加载":
-            # Scan data/questions/ and data/batch/ for JSONL files
+            # 只扫描 data/questions/，排除 batch 执行结果等非题集文件
+            def _is_question_set(filepath):
+                """判断文件是否为真正的 Question Set。
+
+                条件 A：存在 companion _manifest.json 文件
+                条件 B：文件前 3 行（非空）中任一行包含 question_set_id
+                """
+                # 条件 A：有 manifest
+                manifest_path = filepath.parent / f"{filepath.stem}_manifest.json"
+                if manifest_path.exists():
+                    return True
+                # 条件 B：内容中有 question_set_id
+                try:
+                    with filepath.open("r", encoding="utf-8") as f:
+                        checked = 0
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            checked += 1
+                            if checked > 3:
+                                break
+                            try:
+                                obj = json.loads(line)
+                                if obj.get("question_set_id"):
+                                    return True
+                            except json.JSONDecodeError:
+                                continue
+                except Exception:
+                    pass
+                return False
+
             history_files = []
-            for d in [QUESTIONS_DIR, BATCH_DIR]:
-                if d.exists():
-                    for f in d.glob("*.jsonl"):
+            if QUESTIONS_DIR.exists():
+                for f in QUESTIONS_DIR.glob("*.jsonl"):
+                    if _is_question_set(f):
                         history_files.append(f)
 
             if not history_files:
@@ -2047,21 +2078,18 @@ PISP和AISP的区别?
             st.session_state["batch_results"] = batch_results
             st.session_state["batch_run_id"] = run_id
 
-            # 保存结果到运行目录
+            # 保存结果到运行目录（run-local，不再写入全局 data/batch/）
             run_batch_path = run_dir / "batch_results.jsonl"
             with run_batch_path.open("w", encoding="utf-8") as f:
                 for r in batch_results:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-            # 同时保存到 data/batch/
-            batch_path, batch_filename = save_batch_results(batch_results)
 
             # 推送到 data/raw/
             raw_path, raw_filename = push_to_raw_dir(batch_results)
 
             # 更新运行 manifest
             update_experiment_run(run_id, {
-                "batch_results_file": batch_filename,
+                "batch_results_file": "batch_results.jsonl",
                 "raw_results_file": raw_filename,
                 "status": "completed",
             })
