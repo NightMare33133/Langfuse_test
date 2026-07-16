@@ -297,6 +297,81 @@ def parse_judge_response(text):
     return json.loads(match.group(0))
 
 
+# retrieval 轨道 position → (top1, top3, top5) 的唯一合法映射
+_VALID_POSITION_TOPK = {
+    1: (1, 1, 1),
+    2: (0, 1, 1),
+    3: (0, 1, 1),
+    4: (0, 0, 1),
+    5: (0, 0, 1),
+}
+
+
+def validate_retrieval_judge_output(scores, num_retrieval_results):
+    """严格校验 retrieval Judge 的 LLM 输出。
+
+    校验项：
+    - top1/top3/top5 必须是整数 0 或 1
+    - hit_evidence_position 必须是 null 或 [1, min(5, num_retrieval_results)] 的整数
+    - position 与 TopK 的一致性
+    - 丢弃 answer_correct（retrieval 轨道不应有此字段）
+
+    不符合时抛出 ValueError，由调用方捕获并记为 judge error。
+    """
+    # 基本类型校验（bool 是 int 子类，需显式拒绝）
+    for key in ("retrieval_top1_hit", "retrieval_top3_hit", "retrieval_top5_hit"):
+        val = scores.get(key)
+        if isinstance(val, bool) or val not in (0, 1):
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：{key} 必须为整数 0 或 1，实际为 {val!r}"
+            )
+
+    pos = scores.get("hit_evidence_position")
+    max_pos = min(5, num_retrieval_results) if num_retrieval_results > 0 else 0
+
+    # position 值域校验
+    if pos is not None:
+        if not isinstance(pos, int) or isinstance(pos, bool):
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：hit_evidence_position 必须为 null 或整数，实际为 {pos!r}"
+            )
+        if max_pos == 0:
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：无检索结果时 hit_evidence_position 必须为 null，实际为 {pos}"
+            )
+        if pos < 1 or pos > max_pos:
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：hit_evidence_position 越界，"
+                f"有效范围 [1, {max_pos}]，实际为 {pos}"
+            )
+
+    t1 = scores["retrieval_top1_hit"]
+    t3 = scores["retrieval_top3_hit"]
+    t5 = scores["retrieval_top5_hit"]
+
+    # position ↔ TopK 一致性校验
+    if pos is None:
+        if (t1, t3, t5) != (0, 0, 0):
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：position=null 时 TopK 应为 (0,0,0)，"
+                f"实际为 ({t1},{t3},{t5})"
+            )
+    else:
+        expected = _VALID_POSITION_TOPK.get(pos)
+        if expected is None:
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：position={pos} 无合法 TopK 映射"
+            )
+        if (t1, t3, t5) != expected:
+            raise ValueError(
+                f"retrieval Judge 输出格式错误：position={pos} 时 TopK 应为 {expected}，"
+                f"实际为 ({t1},{t3},{t5})"
+            )
+
+    # 丢弃 answer_correct：retrieval 轨道不应混入 QA 指标字段
+    scores.pop("answer_correct", None)
+
+
 def call_llm(prompt, api_key, base_url, model, timeout=30):
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
@@ -370,6 +445,10 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
         response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
         result["_raw_response"] = response_text
         scores = parse_judge_response(response_text)
+        # retrieval 轨道：严格校验 LLM 输出格式
+        if evaluation_track == TRACK_RETRIEVAL:
+            num_results = len(sample.get("retrieval_results") or [])
+            validate_retrieval_judge_output(scores, num_results)
         result.update(scores)
     except Exception as e:
         result["error"] = str(e)
@@ -481,7 +560,16 @@ def pre_screen(sample):
     # 无检索结果 → top 全 0
     no_retrieval = len(retrieval_results) == 0
 
-    # 无最终回答 → answer 错误
+    # 检索轨道：仅当检索结果为空时才预筛；final_answer 为空不影响检索命中判断
+    if evaluation_track == TRACK_RETRIEVAL:
+        if no_retrieval:
+            return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                    "retrieval_top5_hit": 0, "hit_evidence_position": None,
+                    "reason": "规则判定：无检索结果"}
+        # 有检索结果 → 交给 LLM 判断，不管 final_answer 是否为空
+        return None
+
+    # QA 轨道：保持原有逻辑
     no_answer = not final_answer
 
     if no_retrieval and no_answer:

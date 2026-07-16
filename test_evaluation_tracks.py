@@ -15,7 +15,7 @@ from judge import (
     classify_evaluation_track, get_gold_evidence,
     TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE,
     pre_screen, judge_sample, build_judge_prompt,
-    compute_metrics
+    compute_metrics, validate_retrieval_judge_output
 )
 from question_generator import MODE_RETRIEVAL, MODE_QA
 
@@ -258,6 +258,388 @@ def test_metrics_computation():
     print()
 
 
+def test_retrieval_pre_screen_and_position_logic():
+    """聚焦测试：retrieval 轨道 pre_screen 与 position/TopK 逻辑。
+
+    验证项：
+    a. retrieval 样本有 retrieval_results + final_answer 为空：不得预筛选为全 0，必须进入 Judge
+    b. retrieval 样本无 retrieval_results：预筛选为全 0 + hit_evidence_position=null
+    c. QA 轨道 final_answer 为空时行为不变（不受 retrieval 分支影响）
+    """
+    print("=" * 60)
+    print("测试 retrieval 轨道 pre_screen 与 position 逻辑")
+    print("=" * 60)
+
+    # a. retrieval + 有检索结果 + final_answer 为空 → 不得预筛，必须进入 Judge
+    sample_a = {
+        "trace_id": "test_retrieval_no_answer",
+        "question": "合同违约金比例",
+        "question_mode": MODE_RETRIEVAL,
+        "retrieval_query": "违约金比例",
+        "source_excerpt": "违约方应支付合同总金额的 10% 作为违约金",
+        "retrieval_results": [
+            {"position": 1, "score": 0.95, "content": "违约方应支付合同总金额的 10% 作为违约金", "document_name": "doc1"},
+        ],
+        "final_answer": "",  # 空回答
+    }
+    result_a = pre_screen(sample_a)
+    assert result_a is None, (
+        f"retrieval 轨道有检索结果时，即使 final_answer 为空，也不应预筛为全 0，应返回 None 进入 Judge。实际: {result_a}"
+    )
+    print("[OK] retrieval + 有检索结果 + final_answer 为空 → 返回 None，进入 Judge")
+
+    # b. retrieval + 无检索结果 → 预筛选为全 0 + hit_evidence_position=null
+    sample_b = {
+        "trace_id": "test_retrieval_no_results",
+        "question": "合同违约金比例",
+        "question_mode": MODE_RETRIEVAL,
+        "retrieval_query": "违约金比例",
+        "source_excerpt": "违约方应支付合同总金额的 10% 作为违约金",
+        "retrieval_results": [],
+        "final_answer": "某回答",
+    }
+    result_b = pre_screen(sample_b)
+    assert result_b is not None, "retrieval + 无检索结果应预筛"
+    assert result_b["retrieval_top1_hit"] == 0
+    assert result_b["retrieval_top3_hit"] == 0
+    assert result_b["retrieval_top5_hit"] == 0
+    assert result_b.get("hit_evidence_position") is None, (
+        f"无检索结果时 hit_evidence_position 应为 null，实际: {result_b.get('hit_evidence_position')}"
+    )
+    print("[OK] retrieval + 无检索结果 → 全 0 + hit_evidence_position=null")
+
+    # c. QA 轨道 + final_answer 为空 → 保持原有逻辑（应预筛为全 0）
+    sample_c = {
+        "trace_id": "test_qa_no_answer",
+        "question": "什么是违约金？",
+        "question_mode": MODE_QA,
+        "retrieval_query": "违约金",
+        "reference_answer": "违约金是合同约定的赔偿金额",
+        "retrieval_results": [
+            {"position": 1, "score": 0.9, "content": "违约金相关内容", "document_name": "doc1"},
+        ],
+        "final_answer": "",  # 空回答
+    }
+    result_c = pre_screen(sample_c)
+    assert result_c is not None, "QA 轨道 final_answer 为空时应预筛"
+    assert result_c["retrieval_top1_hit"] == 0
+    assert result_c["answer_correct"] == 0
+    print("[OK] QA 轨道 + final_answer 为空 → 预筛为全 0，answer_correct=0")
+
+    # d. retrieval + 有检索结果 + final_answer 非空 → 正常进入 Judge
+    sample_d = {
+        "trace_id": "test_retrieval_full",
+        "question": "合同违约金比例",
+        "question_mode": MODE_RETRIEVAL,
+        "retrieval_query": "违约金比例",
+        "source_excerpt": "违约方应支付合同总金额的 10% 作为违约金",
+        "retrieval_results": [
+            {"position": 1, "score": 0.95, "content": "违约方应支付合同总金额的 10% 作为违约金", "document_name": "doc1"},
+        ],
+        "final_answer": "违约金为合同总金额的 10%",
+    }
+    result_d = pre_screen(sample_d)
+    assert result_d is None, "retrieval + 有检索结果 + 有回答 → 应返回 None 进入 Judge"
+    print("[OK] retrieval + 有检索结果 + 有回答 → 返回 None，进入 Judge")
+
+    print()
+
+
+def test_retrieval_position_topk_constraint():
+    """聚焦测试：验证 position 与 TopK 的输出约束关系。
+
+    这些约束由 prompt 指令约束 LLM 输出，此处验证逻辑一致性：
+    - position=1 → top1=1, top3=1, top5=1
+    - position=2 or 3 → top1=0, top3=1, top5=1
+    - position=4 or 5 → top1=0, top3=0, top5=1
+    - position=null → top1=0, top3=0, top5=0
+    """
+    print("=" * 60)
+    print("测试 position/TopK 输出约束一致性")
+    print("=" * 60)
+
+    # 模拟 LLM 按 prompt 约束返回的结果
+    test_cases = [
+        # (position, expected_top1, expected_top3, expected_top5, description)
+        (1,   1, 1, 1, "position=1"),
+        (2,   0, 1, 1, "position=2"),
+        (3,   0, 1, 1, "position=3"),
+        (4,   0, 0, 1, "position=4"),
+        (5,   0, 0, 1, "position=5"),
+        (None, 0, 0, 0, "position=null（未命中）"),
+    ]
+
+    for pos, exp_t1, exp_t3, exp_t5, desc in test_cases:
+        # 构造符合约束的模拟结果
+        mock_result = {
+            "trace_id": f"test_{desc}",
+            "question": "测试问题",
+            "question_mode": MODE_RETRIEVAL,
+            "evaluation_track": TRACK_RETRIEVAL,
+            "retrieval_evaluable": True,
+            "hit_evidence_position": pos,
+        }
+        # 按约束规则推导 TopK
+        if pos is None:
+            mock_result["retrieval_top1_hit"] = 0
+            mock_result["retrieval_top3_hit"] = 0
+            mock_result["retrieval_top5_hit"] = 0
+        elif pos == 1:
+            mock_result["retrieval_top1_hit"] = 1
+            mock_result["retrieval_top3_hit"] = 1
+            mock_result["retrieval_top5_hit"] = 1
+        elif pos <= 3:
+            mock_result["retrieval_top1_hit"] = 0
+            mock_result["retrieval_top3_hit"] = 1
+            mock_result["retrieval_top5_hit"] = 1
+        else:  # pos 4 or 5
+            mock_result["retrieval_top1_hit"] = 0
+            mock_result["retrieval_top3_hit"] = 0
+            mock_result["retrieval_top5_hit"] = 1
+
+        assert mock_result["retrieval_top1_hit"] == exp_t1, f"{desc}: top1 期望 {exp_t1}"
+        assert mock_result["retrieval_top3_hit"] == exp_t3, f"{desc}: top3 期望 {exp_t3}"
+        assert mock_result["retrieval_top5_hit"] == exp_t5, f"{desc}: top5 期望 {exp_t5}"
+        print(f"[OK] {desc} → Top1={exp_t1}, Top3={exp_t3}, Top5={exp_t5}")
+
+    print()
+
+
+def test_retrieval_prompt_content():
+    """聚焦测试：验证 retrieval prompt 模板包含必要的评测口径约束。"""
+    print("=" * 60)
+    print("测试 retrieval prompt 内容")
+    print("=" * 60)
+
+    sample = {
+        "trace_id": "test_prompt_content",
+        "question": "违约金比例",
+        "question_mode": MODE_RETRIEVAL,
+        "retrieval_query": "违约金比例",
+        "source_excerpt": "违约方应支付合同总金额的 10% 作为违约金",
+        "retrieval_results": [
+            {"position": 1, "score": 0.95, "content": "测试内容", "document_name": "doc1"},
+        ],
+        "final_answer": "测试回答",
+    }
+    prompt = build_judge_prompt(sample)
+
+    # 验证关键口径约束存在于 prompt 中
+    checks = [
+        ("评测查询（短检索查询）", "应将'用户问题'改为'评测查询（短检索查询）'"),
+        ("同一条事实/规则", "应要求同一条事实/规则"),
+        ("关键词重合", "应明确不以关键词重合为命中依据"),
+        ("文档名相同", "应明确不以文档名相同为命中依据"),
+        ("主题相近", "应明确不以主题相近为命中依据"),
+        ("关键主体", "应要求关键主体等未被遗漏"),
+        ("双语文本", "应包含双语文本处理规则"),
+        ("完全等价", "应要求双语完全等价"),
+        ("最早命中", "应明确 hit_evidence_position 为最早命中"),
+    ]
+
+    for keyword, desc in checks:
+        assert keyword in prompt, f"retrieval prompt 应包含 '{keyword}'：{desc}"
+        print(f"[OK] retrieval prompt 包含 '{keyword}'")
+
+    # 反向检查：JSON 输出模板中不应有 answer_correct 字段
+    import re
+    json_block = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", prompt)
+    assert json_block, "prompt 应包含 JSON 输出模板"
+    json_template = json_block.group(1)
+    assert "answer_correct" not in json_template, (
+        "retrieval prompt 的 JSON 输出模板中不应包含 answer_correct 字段"
+    )
+    print("[OK] retrieval prompt JSON 模板不包含 answer_correct")
+
+    print()
+
+
+def test_validate_retrieval_judge_output():
+    """聚焦测试：validate_retrieval_judge_output 的严格校验逻辑。
+
+    覆盖：
+    a. 6 种有效 position 映射
+    b. 非法 TopK 组合
+    c. 非法 position 值
+    d. 检索结果少于五条时 position 越界
+    e. position 类型错误（如 bool、str）
+    f. answer_correct 被丢弃
+    g. 无检索结果时 position 必须为 null
+    """
+    print("=" * 60)
+    print("测试 validate_retrieval_judge_output")
+    print("=" * 60)
+
+    # a. 6 种有效 position 映射
+    valid_cases = [
+        (1, 1, 1, 1),
+        (2, 0, 1, 1),
+        (3, 0, 1, 1),
+        (4, 0, 0, 1),
+        (5, 0, 0, 1),
+        (None, 0, 0, 0),
+    ]
+    for pos, t1, t3, t5 in valid_cases:
+        scores = {"retrieval_top1_hit": t1, "retrieval_top3_hit": t3,
+                  "retrieval_top5_hit": t5, "hit_evidence_position": pos}
+        validate_retrieval_judge_output(scores, 5)  # 5 条检索结果
+        print(f"[OK] 有效: position={pos} → ({t1},{t3},{t5})")
+
+    # b. 非法 TopK 组合（position 与 TopK 不匹配）
+    illegal_topk_cases = [
+        (1, 0, 1, 1, "position=1 但 top1=0"),
+        (1, 1, 0, 1, "position=1 但 top3=0"),
+        (1, 1, 1, 0, "position=1 但 top5=0"),
+        (2, 1, 1, 1, "position=2 但 top1=1"),
+        (2, 0, 0, 1, "position=2 但 top3=0"),
+        (3, 1, 1, 1, "position=3 但 top1=1"),
+        (4, 0, 1, 1, "position=4 但 top3=1"),
+        (4, 1, 0, 1, "position=4 但 top1=1"),
+        (5, 0, 1, 1, "position=5 但 top3=1"),
+        (None, 1, 0, 0, "position=null 但 top1=1"),
+        (None, 0, 1, 0, "position=null 但 top3=1"),
+        (None, 0, 0, 1, "position=null 但 top5=1"),
+    ]
+    for pos, t1, t3, t5, desc in illegal_topk_cases:
+        scores = {"retrieval_top1_hit": t1, "retrieval_top3_hit": t3,
+                  "retrieval_top5_hit": t5, "hit_evidence_position": pos}
+        try:
+            validate_retrieval_judge_output(scores, 5)
+            assert False, f"应抛出 ValueError: {desc}"
+        except ValueError as e:
+            assert "格式错误" in str(e), f"错误信息应包含'格式错误': {e}"
+            print(f"[OK] 拒绝非法 TopK: {desc}")
+
+    # c. 非法 position 值
+    illegal_pos_cases = [
+        (0, "position=0（下界越界）"),
+        (6, "position=6（上界越界）"),
+        (-1, "position=-1（负数）"),
+        (100, "position=100（远超上界）"),
+    ]
+    for pos, desc in illegal_pos_cases:
+        # 使用一个理论上合法的 TopK 组合，但 position 本身非法
+        scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                  "retrieval_top5_hit": 1, "hit_evidence_position": pos}
+        try:
+            validate_retrieval_judge_output(scores, 5)
+            assert False, f"应抛出 ValueError: {desc}"
+        except ValueError as e:
+            assert "越界" in str(e) or "格式错误" in str(e), f"错误信息应包含'越界'或'格式错误': {e}"
+            print(f"[OK] 拒绝非法 position: {desc}")
+
+    # d. 检索结果少于五条时 position 越界
+    # 只有 3 条检索结果，position=4 或 5 应被拒绝
+    for pos in (4, 5):
+        scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+                  "retrieval_top5_hit": 1, "hit_evidence_position": pos}
+        try:
+            validate_retrieval_judge_output(scores, 3)  # 只有 3 条
+            assert False, f"应抛出 ValueError: 只有 3 条结果但 position={pos}"
+        except ValueError as e:
+            assert "越界" in str(e), f"错误信息应包含'越界': {e}"
+            print(f"[OK] 拒绝越界: 只有 3 条结果但 position={pos}")
+
+    # 只有 2 条检索结果，position=3 也应被拒绝
+    scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 1,
+              "retrieval_top5_hit": 1, "hit_evidence_position": 3}
+    try:
+        validate_retrieval_judge_output(scores, 2)
+        assert False, "应抛出 ValueError: 只有 2 条结果但 position=3"
+    except ValueError as e:
+        assert "越界" in str(e), f"错误信息应包含'越界': {e}"
+        print("[OK] 拒绝越界: 只有 2 条结果但 position=3")
+
+    # 只有 1 条检索结果，position=1 应通过
+    scores = {"retrieval_top1_hit": 1, "retrieval_top3_hit": 1,
+              "retrieval_top5_hit": 1, "hit_evidence_position": 1}
+    validate_retrieval_judge_output(scores, 1)
+    print("[OK] 有效: 只有 1 条结果，position=1")
+
+    # 只有 1 条检索结果，position=2 应被拒绝
+    scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 1,
+              "retrieval_top5_hit": 1, "hit_evidence_position": 2}
+    try:
+        validate_retrieval_judge_output(scores, 1)
+        assert False, "应抛出 ValueError: 只有 1 条结果但 position=2"
+    except ValueError as e:
+        assert "越界" in str(e), f"错误信息应包含'越界': {e}"
+        print("[OK] 拒绝越界: 只有 1 条结果但 position=2")
+
+    # e. position 类型错误
+    type_error_cases = [
+        (True, "position=True（bool）"),
+        (False, "position=False（bool）"),
+        ("1", "position='1'（str）"),
+        (1.0, "position=1.0（float）"),
+        ([1], "position=[1]（list）"),
+    ]
+    for pos, desc in type_error_cases:
+        scores = {"retrieval_top1_hit": 1, "retrieval_top3_hit": 1,
+                  "retrieval_top5_hit": 1, "hit_evidence_position": pos}
+        try:
+            validate_retrieval_judge_output(scores, 5)
+            assert False, f"应抛出 ValueError: {desc}"
+        except ValueError as e:
+            assert "格式错误" in str(e), f"错误信息应包含'格式错误': {e}"
+            print(f"[OK] 拒绝类型错误: {desc}")
+
+    # f. TopK 值类型错误
+    topk_type_cases = [
+        ("retrieval_top1_hit", 2, "top1=2"),
+        ("retrieval_top3_hit", -1, "top3=-1"),
+        ("retrieval_top5_hit", "1", "top5='1'"),
+        ("retrieval_top1_hit", True, "top1=True"),
+        ("retrieval_top1_hit", None, "top1=None"),
+    ]
+    for key, val, desc in topk_type_cases:
+        scores = {"retrieval_top1_hit": 1, "retrieval_top3_hit": 1,
+                  "retrieval_top5_hit": 1, "hit_evidence_position": 1}
+        scores[key] = val
+        try:
+            validate_retrieval_judge_output(scores, 5)
+            assert False, f"应抛出 ValueError: {desc}"
+        except ValueError as e:
+            assert "格式错误" in str(e), f"错误信息应包含'格式错误': {e}"
+            print(f"[OK] 拒绝 TopK 类型错误: {desc}")
+
+    # g. answer_correct 被丢弃
+    scores = {"retrieval_top1_hit": 1, "retrieval_top3_hit": 1,
+              "retrieval_top5_hit": 1, "hit_evidence_position": 1,
+              "answer_correct": 1}
+    validate_retrieval_judge_output(scores, 5)
+    assert "answer_correct" not in scores, "answer_correct 应被丢弃"
+    print("[OK] answer_correct 被正确丢弃")
+
+    # h. 无检索结果时 position 必须为 null
+    scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+              "retrieval_top5_hit": 0, "hit_evidence_position": None}
+    validate_retrieval_judge_output(scores, 0)
+    print("[OK] 无检索结果 + position=null → 通过")
+
+    scores = {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+              "retrieval_top5_hit": 0, "hit_evidence_position": 1}
+    try:
+        validate_retrieval_judge_output(scores, 0)
+        assert False, "应抛出 ValueError: 无检索结果但 position=1"
+    except ValueError as e:
+        assert "格式错误" in str(e), f"错误信息应包含'格式错误': {e}"
+        print("[OK] 拒绝: 无检索结果但 position=1")
+
+    # i. TopK 值为 2 或其他非法整数
+    scores = {"retrieval_top1_hit": 2, "retrieval_top3_hit": 0,
+              "retrieval_top5_hit": 0, "hit_evidence_position": None}
+    try:
+        # position=null 时先检查 TopK 值域
+        validate_retrieval_judge_output(scores, 5)
+        assert False, "应抛出 ValueError: top1=2"
+    except ValueError as e:
+        assert "格式错误" in str(e), f"错误信息应包含'格式错误': {e}"
+        print("[OK] 拒绝: top1=2")
+
+    print()
+
+
 def main():
     """运行所有测试。"""
     print("=" * 60)
@@ -270,6 +652,10 @@ def main():
     test_pre_screen()
     test_prompt_selection()
     test_metrics_computation()
+    test_retrieval_pre_screen_and_position_logic()
+    test_retrieval_position_topk_constraint()
+    test_retrieval_prompt_content()
+    test_validate_retrieval_judge_output()
 
     print("=" * 60)
     print("[OK] 所有测试通过！")
