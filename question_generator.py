@@ -500,6 +500,114 @@ def choose_strategy(content):
     return "deep"
 
 
+# ========== Retrieval Question Validation ==========
+
+# 问句特征正则：问号或常见问答/推理导向词
+_RETRIEVAL_Q_RE = re.compile(r'[？\?]')
+
+# 问答/推理导向词（出现在 query 中即判定为问句式，而非检索查询）
+_RETRIEVAL_Q_WORDS = frozenset([
+    "什么", "为何", "为什么", "如何", "是否", "哪些",
+    "请分析", "请说明", "请解释", "请描述", "请比较",
+    "分别", "哪些方面", "怎么回事",
+])
+
+# 完整证据单元最低字符数（排除过短的半句截取）
+_MIN_EVIDENCE_LEN = 15
+
+# 逐字照抄检测：去除专有名词/条款编号/定义术语后，连续匹配阈值
+_PHRASE_COPY_THRESHOLD = 6
+
+# 条款编号正则
+_CLAUSE_NUM_RE = re.compile(r'^\s*\d+[\.\-]\d+[\.\d]*\s*')
+
+# 中文书名号/引号术语正则
+_QUOTED_TERM_RE = re.compile(r'[《》「」""\u201c\u201d]')
+
+# 括号及括号内内容（含数字编号如 (i) (ii) 等）
+_BRACKET_CONTENT_RE = re.compile(r'[（(][^）)]*[）)]')
+
+
+def _strip_technical_terms(text):
+    """去除条款编号、括号内容和书名号术语，用于照抄检测。"""
+    text = _CLAUSE_NUM_RE.sub('', text)
+    text = _BRACKET_CONTENT_RE.sub('', text)
+    text = _QUOTED_TERM_RE.sub('', text)
+    return text
+
+
+def _is_valid_evidence(text):
+    """判断 reference_answer 是否为完整、连续、可独立表达的原文证据单元。
+
+    允许：完整段落（多分句）或完整单句（定义、金额、期限等）。
+    拒绝：过短的半句截取（<15字）。
+    """
+    return len(text) >= _MIN_EVIDENCE_LEN
+
+
+def _detect_phrase_copying(question, ref_answer):
+    """检测 query 是否逐字照抄 reference_answer 中的连续核心短语。
+
+    去除条款编号、括号内容和书名号术语后，
+    检查清理后的 query 整体是否作为连续子串出现在清理后的 reference_answer 中。
+    """
+    q_clean = _strip_technical_terms(question).strip()
+    r_clean = _strip_technical_terms(ref_answer).strip()
+    if not q_clean or not r_clean:
+        return False
+    return q_clean in r_clean
+
+
+def _validate_retrieval_question(q, chunk_text):
+    """校验单条检索评测查询是否合规。
+
+    返回 (is_valid, reason)：
+      - question 不得含问号或问答导向词
+      - question 不得逐字照抄 reference_answer 中的连续核心短语
+      - reference_answer 必须是 chunk_text 中的完整连续证据单元（段落或完整句子）
+      - source_excerpt 必须与 reference_answer 完全一致
+
+    注意：仅用标准化空白做比较，不会修改 q 中的原始字段值。
+    """
+    question = (q.get("question") or "").strip()
+    ref_answer = (q.get("reference_answer") or "").strip()
+    source_excerpt = (q.get("source_excerpt") or "").strip()
+
+    if not question:
+        return False, "query 为空"
+
+    # 禁止问号
+    if _RETRIEVAL_Q_RE.search(question):
+        return False, f"query 含问号: {question[:40]}"
+
+    # 禁止问答/推理导向词
+    for w in _RETRIEVAL_Q_WORDS:
+        if w in question:
+            return False, f"query 含问答导向词「{w}」: {question[:40]}"
+
+    # reference_answer 必须是完整证据单元（≥15字，允许单句定义）
+    if ref_answer and not _is_valid_evidence(ref_answer):
+        return False, f"reference_answer 过短（{len(ref_answer)}字），不足独立表达证据"
+
+    # reference_answer 必须是 chunk_text 的连续子串（仅用于比较，不修改原始值）
+    if ref_answer and chunk_text:
+        norm_ref = re.sub(r'\s+', '', ref_answer)
+        norm_chunk = re.sub(r'\s+', '', chunk_text)
+        if norm_ref not in norm_chunk:
+            return False, "reference_answer 不是当前 chunk 的连续子串"
+
+    # 检测 query 是否逐字照抄 reference_answer 中的连续核心短语
+    if question and ref_answer:
+        if _detect_phrase_copying(question, ref_answer):
+            return False, f"query 逐字照抄证据中的连续核心短语: {question[:40]}"
+
+    # source_excerpt 必须与 reference_answer 完全一致
+    if source_excerpt and ref_answer and source_excerpt != ref_answer:
+        return False, "source_excerpt 与 reference_answer 不一致"
+
+    return True, ""
+
+
 # ========== Per-Chunk Generation Helper (shared by all strategies) ==========
 
 def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
@@ -540,6 +648,39 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
         try:
             response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
             questions = parse_qgen_response(response_text)
+
+            # 检索评测模式：校验并过滤不合规查询，必要时重试一次
+            if mode == MODE_RETRIEVAL:
+                chunk_text = chunk["text"]
+                valid = []
+                for q in questions:
+                    ok, reason = _validate_retrieval_question(q, chunk_text)
+                    if ok:
+                        valid.append(q)
+                    else:
+                        print(f"  ⚠️ 检索查询校验不通过（{reason}），已过滤")
+
+                if not valid:
+                    # 全部被过滤，重试一次
+                    print(f"  🔄 章节「{chunk['section_title']}」所有查询不合规，重试一次")
+                    response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
+                    questions = parse_qgen_response(response_text)
+                    for q in questions:
+                        ok, reason = _validate_retrieval_question(q, chunk_text)
+                        if ok:
+                            valid.append(q)
+                        else:
+                            print(f"  ⚠️ 重试后查询仍不合规（{reason}），已过滤")
+
+                questions = valid
+
+            # 检索模式：强制 source_excerpt = reference_answer
+            if mode == MODE_RETRIEVAL:
+                for q in questions:
+                    ref = (q.get("reference_answer") or "").strip()
+                    if ref:
+                        q["source_excerpt"] = ref
+
             for q in questions:
                 q["source_section"] = chunk["section_title"]
                 q["chunk_index"] = chunk["chunk_index"]

@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import io
 import os
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -23,6 +24,47 @@ JUDGED_DIR = Path(__file__).parent / "data" / "judged"
 JUDGED_FILE = JUDGED_DIR / "eval_results.jsonl"
 BATCH_DIR = Path(__file__).parent / "data" / "batch"
 QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
+
+
+def _get_created_at(filepath, info):
+    """获取题集的创建时间，优先级：manifest created_at > set_id 时间戳 > 文件名时间戳。
+
+    返回 datetime 对象；若均无法解析则返回 None（排序时排在最后）。
+    """
+    # 1. 检查 manifest 文件
+    manifest_path = filepath.parent / f"{filepath.stem}_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            created_at = manifest.get("created_at")
+            if created_at:
+                return datetime.fromisoformat(created_at)
+        except Exception:
+            pass
+
+    # 2. 从 set_id 解析时间戳（格式: qs_YYYYMMDD_HHMMSSffffff_slug）
+    set_id = info.get("set_id", "")
+    if set_id:
+        parts = set_id.split("_", 3)
+        if len(parts) >= 3:
+            date_part = parts[1]  # YYYYMMDD
+            time_part = parts[2]  # HHMMSSffffff
+            try:
+                if len(date_part) == 8 and len(time_part) >= 6:
+                    ts_str = date_part + time_part[:6]
+                    return datetime.strptime(ts_str, "%Y%m%d%H%M%S")
+            except (ValueError, IndexError):
+                pass
+
+    # 3. 从文件名解析时间戳
+    match = re.search(r'(\d{8}_\d{6})', filepath.stem)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+        except ValueError:
+            pass
+
+    return None
 
 
 # ---------- 配置表单统一 helper ----------
@@ -629,7 +671,7 @@ st.sidebar.markdown(
 st.sidebar.divider()
 st.sidebar.markdown("**四步工作流**")
 st.sidebar.markdown(
-    "1. **题目生成** — 上传知识库文件，自动按章节切分后调用 LLM 出题，"
+    "1. **题目生成** — 上传知识库文件（.txt/.md/.docx/.xlsx），自动按章节切分后调用 LLM 出题，"
     "生成带参考答案的评测题集\n"
     "2. **批量提问** — 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，"
     "收集回答与检索结果\n"
@@ -692,7 +734,7 @@ with tab_qgen:
 
 | 输入 | 说明 |
 |------|------|
-| 知识库文件 | .txt 或 .md 格式的知识库文档 |
+| 知识库文件 | .txt / .md / .docx / .xlsx 格式的知识库文档 |
 | 出题模式 | 检索评测 / 全流程问答评测 |
 | 生成数量 | 期望生成的题目数量 |
 | 难度偏好 | 基础概念题 / 理解题 / 综合题（检索模式无综合题） / 混合 |
@@ -740,7 +782,7 @@ with tab_qgen:
 
     # --- Config section (collapsible) ---
     with st.expander("配置", expanded=True):
-        qgen_uploaded = st.file_uploader("上传知识库文件", type=["txt", "md"], key="qgen_upload")
+        qgen_uploaded = st.file_uploader("上传知识库文件", type=["txt", "md", "docx", "xlsx"], key="qgen_upload")
 
         # 出题模式选择（放在最显眼的位置）
         qgen_mode_selection = st.radio(
@@ -757,14 +799,15 @@ with tab_qgen:
         if mode_val == MODE_RETRIEVAL:
             st.info("""🔍 **检索评测模式（单跳检索）**
 
-生成专注于测试 RAG 系统检索能力的题目（Top1/Top3/Top5 命中率）。
+生成短检索查询，测试 RAG 系统能否从知识库召回包含正确原文证据的 chunk（Top1/Top3/Top5 命中率）。
 
-**题目特点：**
-- ✅ 单知识点、单证据片段可回答
-- ✅ 优先生成：定义题、枚举题、单点事实题、单概念解释题
-- ❌ 明确禁止：对比题、区别题、优缺点分析、原因分析、影响题
+**查询特点：**
+- ✅ 短检索查询：词、词组、短语或单一检索意图（非问句）
+- ✅ 金标准证据：从当前 chunk 逐字复制的原文片段
+- ✅ 优先生成：定义类、枚举类、单点事实类查询
+- ❌ 明确禁止：问句、对比类、分析类、多子问题查询
 
-**评测目标：** 验证检索是否命中正确的 chunk，而非测试问答质量""")
+**评测目标：** 验证检索是否命中正确的 chunk，而非测试 LLM 问答质量""")
         else:
             st.info("💬 **全流程问答评测模式**：生成的题目将用于测试完整问答能力。题目特点：可包含综合分析题、对比题、推理题，适合后续 Judge 严格评测。")
 
@@ -860,19 +903,42 @@ with tab_qgen:
 
     # --- File preview ---
     if qgen_uploaded is not None:
+        from doc_parser import parse_document, format_parse_summary, is_supported_file
+
         file_bytes = qgen_uploaded.getvalue()
+        file_name = qgen_uploaded.name
+
+        # 检查是否为 Word 临时文件
+        if file_name.startswith("~$"):
+            st.warning(f"已跳过 Word 临时文件: {file_name}")
+            st.stop()
+
+        # 统一解析
         try:
-            file_content = file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            file_content = file_bytes.decode("gbk", errors="replace")
+            parse_result = parse_document(file_bytes=file_bytes, file_name=file_name)
+            file_content = parse_result["text"]
+        except ValueError as e:
+            st.error(f"文件解析失败: {e}")
+            st.stop()
 
         file_size_kb = len(file_bytes) / 1024
         char_count = len(file_content)
 
         info_col1, info_col2, info_col3 = st.columns(3)
-        info_col1.metric("文件名", qgen_uploaded.name)
+        info_col1.metric("文件名", file_name)
         info_col2.metric("文件大小", f"{file_size_kb:.1f} KB")
         info_col3.metric("字符数", f"{char_count:,}")
+
+        # 解析摘要
+        _parse_summary = format_parse_summary(parse_result)
+        st.caption(_parse_summary)
+
+        # 解析警告
+        _warnings = parse_result.get("warnings", [])
+        if _warnings:
+            with st.expander(f"解析警告（{len(_warnings)} 条）", expanded=False):
+                for w in _warnings:
+                    st.warning(w)
 
         with st.expander("文件内容预览", expanded=False):
             preview_len = 500
@@ -1116,13 +1182,19 @@ with tab_qgen:
                         import traceback
                         st.code(traceback.format_exc())
     else:
-        st.info("请在上方「配置」区域上传知识库文件（.txt 或 .md）")
+        st.info("请在上方「配置」区域上传知识库文件（.txt / .md / .docx / .xlsx）")
 
     # --- Results display ---
     questions = st.session_state.get("generated_questions")
     if questions:
+        # 检测当前题集模式，决定字段展示标签
+        _qgen_mode = st.session_state.get("qgen_last_generated_mode", MODE_QA)
+        _is_retrieval = (_qgen_mode == MODE_RETRIEVAL)
+        _label_question = "检索查询" if _is_retrieval else "问题"
+        _label_ref_answer = "金标准原文证据" if _is_retrieval else "参考答案"
+
         st.divider()
-        st.subheader(f"生成结果（{len(questions)} 道题目）")
+        st.subheader(f"生成结果（{len(questions)} 道{'查询' if _is_retrieval else '题目'}）")
 
         # 显示保存状态
         saved_path = st.session_state.get("qgen_saved_path", "")
@@ -1140,16 +1212,17 @@ with tab_qgen:
         df_q = pd.DataFrame(questions)
         df_q.index = range(1, len(df_q) + 1)
         df_q.index.name = "#"
+        df_display = df_q[["question", "difficulty", "topic"]].rename(columns={"question": _label_question})
         st.dataframe(
-            df_q[["question", "difficulty", "topic"]],
+            df_display,
             use_container_width=True,
             height=min(400, len(df_q) * 40 + 60),
         )
 
         for i, item in enumerate(questions, 1):
             with st.expander(f"#{i} {item.get('question', '')[:60]}"):
-                st.markdown(f"**问题**: {item.get('question', '')}")
-                st.markdown(f"**参考答案**: {item.get('reference_answer', '')}")
+                st.markdown(f"**{_label_question}**: {item.get('question', '')}")
+                st.markdown(f"**{_label_ref_answer}**: {item.get('reference_answer', '')}")
                 st.markdown(f"**来源摘录**: {item.get('source_excerpt', '')}")
                 st.markdown(f"**难度**: {item.get('difficulty', '')} | **主题**: {item.get('topic', '')}")
 
@@ -1413,7 +1486,7 @@ PISP和AISP的区别?
             history_files = []
             for d in [QUESTIONS_DIR, BATCH_DIR]:
                 if d.exists():
-                    for f in sorted(d.glob("*.jsonl"), reverse=True):
+                    for f in d.glob("*.jsonl"):
                         history_files.append(f)
 
             if not history_files:
@@ -1464,7 +1537,17 @@ PISP和AISP的区别?
                 file_labels = []
                 for f in history_files:
                     info = _detect_file_info(f)
+                    info["created_at"] = _get_created_at(f, info)
                     file_info_cache[f] = info
+
+                # 按 created_at 降序排序，无时间记录排在最后
+                history_files.sort(
+                    key=lambda f: file_info_cache[f]["created_at"] or datetime.min,
+                    reverse=True,
+                )
+
+                for f in history_files:
+                    info = file_info_cache[f]
                     modes = info["modes"]
                     total_sampled = sum(modes.values())
                     q_count = info["question_count"]
@@ -1523,7 +1606,9 @@ PISP和AISP的区别?
                 selected_info = file_info_cache[selected_file]
 
                 # 显示次级信息
-                st.caption(f"文件: `{selected_file.name}` | 生成时间: {datetime.fromtimestamp(selected_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}")
+                _created = selected_info.get("created_at")
+                _created_str = _created.strftime('%Y-%m-%d %H:%M') if _created else "未知"
+                st.caption(f"文件: `{selected_file.name}` | 生成时间: {_created_str}")
 
                 try:
                     raw_lines = selected_file.read_text(encoding="utf-8").strip().split("\n")
