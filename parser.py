@@ -340,7 +340,8 @@ def load_question_index(questions_dir=None):
 
 
 _BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode",
-                    "question_set_id", "question_set_name")
+                    "question_set_id", "question_set_name",
+                    "source_format", "source_file_name", "evidence_sheet", "evidence_range")
 
 
 def parse_rag_eval_user_id(user_id: str) -> dict:

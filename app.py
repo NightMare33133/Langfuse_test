@@ -1204,6 +1204,13 @@ with tab_qgen:
                     strategy_label = STRATEGY_LABELS[strategy_val]
 
                 mode_label = MODE_LABELS[mode_val]
+
+                # XLSX 直传路径：仅检索模式 + XLSX 文件
+                _is_xlsx_direct = (
+                    parse_result.get("source_type") == "xlsx"
+                    and mode_val == MODE_RETRIEVAL
+                )
+
                 with st.status(f"正在生成题目（{mode_label} | {strategy_label}模式）...", expanded=True) as gen_status:
                     status_text = st.empty()
                     status_text.write("正在切分文档...")
@@ -1214,14 +1221,42 @@ with tab_qgen:
                         )
 
                     try:
-                        questions = generate_questions(
-                            file_content, qgen_api_key, qgen_base_url, qgen_model,
-                            num_questions=qgen_num, difficulty=difficulty_val,
-                            topic_hint=qgen_topic_hint,
-                            progress_callback=_on_progress,
-                            strategy=strategy_val,
-                            mode=mode_val,
-                        )
+                        if _is_xlsx_direct:
+                            from xlsx_question_generator import (
+                                check_xlsx_llm_support, generate_xlsx_questions,
+                            )
+                            status_text.write("检测模型是否支持 XLSX 文件输入...")
+                            _xlsx_ok = check_xlsx_llm_support(
+                                qgen_api_key, qgen_base_url, qgen_model, timeout=15,
+                            )
+                            if not _xlsx_ok:
+                                gen_status.update(label="模型不支持 XLSX 文件输入", state="error")
+                                st.error(
+                                    "当前模型/API 不支持 XLSX 文件输入。"
+                                    "请更换支持文件输入的模型，或切换到「全流程问答评测」模式使用文本解析路径。"
+                                )
+                                st.stop()
+
+                            def _on_progress_xlsx(step, total, desc):
+                                status_text.write(f"XLSX 直传出题: {desc} ({step}/{total})")
+
+                            questions, gen_stats = generate_xlsx_questions(
+                                file_bytes, file_name,
+                                qgen_api_key, qgen_base_url, qgen_model,
+                                num_questions=qgen_num, difficulty=difficulty_val,
+                                topic_hint=qgen_topic_hint,
+                                timeout=120,
+                                progress_callback=_on_progress_xlsx,
+                            )
+                        else:
+                            questions, gen_stats = generate_questions(
+                                file_content, qgen_api_key, qgen_base_url, qgen_model,
+                                num_questions=qgen_num, difficulty=difficulty_val,
+                                topic_hint=qgen_topic_hint,
+                                progress_callback=_on_progress,
+                                strategy=strategy_val,
+                                mode=mode_val,
+                            )
                         st.session_state["generated_questions"] = questions
                         st.session_state["qgen_last_generated_mode"] = mode_val  # 保存当前模式
 
@@ -1241,6 +1276,18 @@ with tab_qgen:
                         st.session_state["qgen_set_id"] = set_id
                         st.session_state["qgen_generated_set_name"] = _set_name
 
+                        # 构建统计摘要
+                        _stats_parts = [f"目标 {gen_stats.get('target', qgen_num)}"]
+                        _stats_parts.append(f"LLM 原始生成 {gen_stats.get('raw_count', '?')}")
+                        _stats_parts.append(f"校验淘汰 {gen_stats.get('validation_eliminated', 0)}")
+                        _stats_parts.append(f"去重淘汰 {gen_stats.get('dedup_eliminated', 0)}")
+                        if gen_stats.get("supplement_rounds"):
+                            _stats_parts.append(
+                                f"补题 {gen_stats['supplement_rounds']} 轮，新增 {gen_stats['supplement_new']}"
+                            )
+                        _stats_parts.append(f"最终 {gen_stats.get('final_count', len(questions))}")
+                        _stats_summary = " | ".join(_stats_parts)
+
                         # 验证文件是否保存成功
                         if output_path.exists():
                             file_size = output_path.stat().st_size
@@ -1251,6 +1298,16 @@ with tab_qgen:
                             )
                             st.success(f"✅ 题目已自动保存到：`data/questions/{fname}`（{file_size} 字节）")
                             st.caption(f"题集 ID: `{set_id}` | 题集名称: `{_set_name}`")
+                            st.caption(f"📊 {_stats_summary}")
+
+                            # 若不足目标数，显示说明
+                            if gen_stats.get("final_count", len(questions)) < qgen_num:
+                                st.warning(
+                                    f"目标 {qgen_num}，最终 {gen_stats.get('final_count', len(questions))}；"
+                                    f"已完成 {gen_stats.get('supplement_rounds', 0)} 轮补题，"
+                                    f"源文本中仅发现 {gen_stats.get('final_count', len(questions))} "
+                                    f"条唯一且合格的可检索证据。"
+                                )
                         else:
                             gen_status.update(label="生成完成但保存失败", state="error")
                             st.error(f"题目生成成功，但文件保存失败：{output_path}")
@@ -1610,6 +1667,8 @@ PISP和AISP的区别?
                         "set_id": "",
                         "question_count": 0,
                         "has_set_info": False,
+                        "source_format": "",
+                        "source_file_name": "",
                     }
                     try:
                         with filepath.open("r", encoding="utf-8") as f:
@@ -1635,6 +1694,10 @@ PISP和AISP的区别?
                                         info["set_name"] = obj["question_set_name"]
                                         info["set_id"] = obj.get("question_set_id", "")
                                         info["has_set_info"] = True
+                                    # 获取来源格式
+                                    if obj.get("source_format") and not info["source_format"]:
+                                        info["source_format"] = obj["source_format"]
+                                        info["source_file_name"] = obj.get("source_file_name", "")
                                 except json.JSONDecodeError:
                                     continue
                     except Exception:
@@ -1698,7 +1761,13 @@ PISP和AISP的区别?
                         if _sid and len(_sid) > 20:
                             _sid_short = f" · qs...{_sid[12:20]}"
                         _ts_part = f" · {_ts_display}" if _ts_display else ""
-                        label = f"{mode_tag} {info['set_name']} · {q_count} 题{_ts_part}{_sid_short}"
+                        _src_fmt = ""
+                        if info.get("source_format") == "xlsx":
+                            _src_fn = info.get("source_file_name", "")
+                            _src_fmt = f" · 来源: Excel"
+                            if _src_fn:
+                                _src_fmt += f"（{_src_fn}）"
+                        label = f"{mode_tag} {info['set_name']} · {q_count} 题{_ts_part}{_sid_short}{_src_fmt}"
                     else:
                         # 旧版文件，回退显示文件名
                         label = f"{mode_tag} {f.stem} · {q_count} 题 [旧版题集]"

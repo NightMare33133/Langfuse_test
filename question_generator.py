@@ -616,6 +616,9 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
     """对已切分的 chunks 执行 allocate → per-chunk LLM call → dedup → 多样性裁剪。
 
     所有策略共用此函数，仅 chunks 的来源和参数不同。
+
+    Returns:
+        tuple: (questions_list, stats_dict)
     """
     if not chunks:
         raise ValueError("文档内容为空，无法生成题目")
@@ -628,6 +631,9 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
         chunk_context += f"等共{len(all_titles)}个章节"
 
     all_questions = []
+    raw_count = 0
+    validation_eliminated = 0
+
     for i, (chunk, n_questions) in enumerate(zip(chunks, allocation)):
         if n_questions <= 0:
             continue
@@ -648,6 +654,7 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
         try:
             response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
             questions = parse_qgen_response(response_text)
+            raw_count += len(questions)
 
             # 检索评测模式：校验并过滤不合规查询，必要时重试一次
             if mode == MODE_RETRIEVAL:
@@ -660,17 +667,21 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
                     else:
                         print(f"  ⚠️ 检索查询校验不通过（{reason}），已过滤")
 
+                validation_eliminated += len(questions) - len(valid)
+
                 if not valid:
                     # 全部被过滤，重试一次
                     print(f"  🔄 章节「{chunk['section_title']}」所有查询不合规，重试一次")
                     response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
                     questions = parse_qgen_response(response_text)
+                    raw_count += len(questions)
                     for q in questions:
                         ok, reason = _validate_retrieval_question(q, chunk_text)
                         if ok:
                             valid.append(q)
                         else:
                             print(f"  ⚠️ 重试后查询仍不合规（{reason}），已过滤")
+                    validation_eliminated += len(questions) - len(valid)
 
                 questions = valid
 
@@ -693,12 +704,27 @@ def _generate_from_chunks(chunks, num_questions, difficulty, topic_hint,
     if not all_questions:
         raise ValueError("所有章节均出题失败，请检查 API 配置或文档内容")
 
-    return _deduplicate_and_trim(all_questions, num_questions)
+    questions, dedup_stats = _deduplicate_and_trim(all_questions, num_questions)
+    stats = {
+        "raw_count": raw_count,
+        "validation_eliminated": validation_eliminated,
+        "dedup_eliminated": dedup_stats["dedup_eliminated"],
+        "final_count": dedup_stats["final_count"],
+        "target": num_questions,
+    }
+    return questions, stats
 
 
 def _deduplicate_and_trim(all_questions, num_questions):
-    """去重 + 多样性裁剪，供所有策略共用。"""
+    """去重 + 多样性裁剪，供所有策略共用。
+
+    Returns:
+        tuple: (questions_list, stats_dict)
+        stats_dict: {"raw_count", "dedup_eliminated", "final_count"}
+    """
+    raw_count = len(all_questions)
     unique_questions = deduplicate_questions(all_questions)
+    dedup_eliminated = raw_count - len(unique_questions)
 
     if len(unique_questions) > num_questions:
         by_section = {}
@@ -718,13 +744,173 @@ def _deduplicate_and_trim(all_questions, num_questions):
             si += 1
             if si > len(section_keys) * num_questions:
                 break
+        trim_eliminated = len(unique_questions) - len(diversified)
         unique_questions = diversified
+    else:
+        trim_eliminated = 0
 
     for q in unique_questions:
         q.pop("source_section", None)
         q.pop("chunk_index", None)
 
-    return unique_questions
+    stats = {
+        "raw_count": raw_count,
+        "dedup_eliminated": dedup_eliminated + trim_eliminated,
+        "final_count": len(unique_questions),
+    }
+    return unique_questions, stats
+
+
+# ========== Supplementary Generation (Retrieval Mode) ==========
+
+_MAX_SUPPLEMENT_ROUNDS = 3
+
+
+def _build_supplement_prompt(chunk_text, num_questions, used_evidence_set,
+                              used_topics, difficulty, topic_hint,
+                              section_title, chunk_context, mode):
+    """构建补题 prompt：在原始模板基础上追加已使用证据排除指令。"""
+    base_prompt = build_qgen_prompt(
+        chunk_text, num_questions=num_questions, difficulty=difficulty,
+        topic_hint=topic_hint, section_title=section_title,
+        chunk_context=chunk_context, mode=mode,
+    )
+
+    # 构建排除指令
+    exclusion_lines = ["\n## 已使用证据（禁止重复）\n"]
+    exclusion_lines.append("以下金标准证据已被之前的题目使用，请不得再使用相同或高度相似的证据：")
+    for i, ev in enumerate(sorted(used_evidence_set), 1):
+        preview = ev[:80] + ("..." if len(ev) > 80 else "")
+        exclusion_lines.append(f"  {i}. {preview}")
+
+    if used_topics:
+        exclusion_lines.append(f"\n## 已使用主题（避免重复）\n已覆盖的主题：{'、'.join(sorted(used_topics))}")
+
+    exclusion_lines.append(f"\n## 要求\n请从当前片段中寻找**尚未被使用**的合格证据，生成 {num_questions} 条新的检索查询。")
+    exclusion_lines.append("严格遵守所有出题规范，不得重复上述已使用的证据或主题。")
+
+    return base_prompt + "\n".join(exclusion_lines)
+
+
+def _supplement_retrieval_questions(chunks, existing_questions, target_count,
+                                    difficulty, topic_hint,
+                                    api_key, base_url, model, timeout,
+                                    progress_callback=None,
+                                    max_rounds=_MAX_SUPPLEMENT_ROUNDS):
+    """补题轮次：对仍有未用合格证据的 chunk 生成新题目。
+
+    Args:
+        chunks: 原始 chunks 列表
+        existing_questions: 已通过校验的题目列表
+        target_count: 目标题数
+        difficulty, topic_hint: 出题参数
+        api_key, base_url, model, timeout: LLM 配置
+        progress_callback: 进度回调
+        max_rounds: 最大补题轮次
+
+    Returns:
+        tuple: (new_questions, stats_dict)
+        stats_dict: {"rounds": int, "new_count": int}
+    """
+    new_questions = []
+    rounds_done = 0
+
+    # 收集已使用证据和主题
+    used_evidence = set()
+    used_topics = set()
+    for q in existing_questions:
+        ref = (q.get("reference_answer") or "").strip()
+        if ref:
+            used_evidence.add(ref)
+        topic = (q.get("topic") or "").strip()
+        if topic:
+            used_topics.add(topic)
+
+    # 计算每个 chunk 的已用证据数
+    chunk_used_count = {}
+    for q in existing_questions:
+        ci = q.get("chunk_index")
+        if ci is not None:
+            chunk_used_count[ci] = chunk_used_count.get(ci, 0) + 1
+
+    all_titles = list(dict.fromkeys(c["section_title"] for c in chunks))
+    chunk_context = "、".join(all_titles[:10])
+
+    deficit = target_count - len(existing_questions)
+
+    for round_idx in range(max_rounds):
+        if deficit <= 0:
+            break
+
+        round_new = 0
+        for chunk in chunks:
+            if deficit <= 0:
+                break
+
+            ci = chunk["chunk_index"]
+            used_in_chunk = chunk_used_count.get(ci, 0)
+            # 简单估计：每个 chunk 最多还能出 (allocated * 2) 条
+            # 但更实际的做法是每次请求 deficit 条
+            request_n = min(deficit, 3)  # 每次最多请求 3 条，避免浪费
+
+            prompt = _build_supplement_prompt(
+                chunk["text"], request_n, used_evidence, used_topics,
+                difficulty, topic_hint, chunk["section_title"],
+                chunk_context, MODE_RETRIEVAL,
+            )
+
+            try:
+                if progress_callback:
+                    progress_callback(round_idx, max_rounds,
+                                      f"补题第 {round_idx + 1} 轮 — {chunk['section_title'][:30]}")
+
+                response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
+                questions = parse_qgen_response(response_text)
+
+                # 校验
+                valid = []
+                for q in questions:
+                    ok, reason = _validate_retrieval_question(q, chunk["text"])
+                    if ok:
+                        # 检查 evidence 是否重复
+                        ref = (q.get("reference_answer") or "").strip()
+                        if ref and ref in used_evidence:
+                            continue
+                        valid.append(q)
+                        if ref:
+                            used_evidence.add(ref)
+                        topic = (q.get("topic") or "").strip()
+                        if topic:
+                            used_topics.add(topic)
+
+                # 强制 source_excerpt = reference_answer
+                for q in valid:
+                    ref = (q.get("reference_answer") or "").strip()
+                    if ref:
+                        q["source_excerpt"] = ref
+                    q["source_section"] = chunk["section_title"]
+                    q["chunk_index"] = ci
+                    q["question_mode"] = MODE_RETRIEVAL
+
+                new_questions.extend(valid)
+                round_new += len(valid)
+                deficit -= len(valid)
+                chunk_used_count[ci] = used_in_chunk + len(valid)
+
+            except Exception as e:
+                print(f"  ⚠️ 补题轮次 {round_idx + 1} 章节「{chunk['section_title']}」失败: {e}")
+                continue
+
+        rounds_done += 1
+        if round_new == 0:
+            # 本轮无新增，说明证据已耗尽
+            break
+
+    stats = {
+        "rounds": rounds_done,
+        "new_count": len(new_questions),
+    }
+    return new_questions, stats
 
 
 # ========== Strategy Implementations ==========
@@ -829,7 +1015,7 @@ def generate_questions(content, api_key, base_url, model,
         mode: MODE_RETRIEVAL for retrieval testing, MODE_QA for full QA evaluation
 
     Returns:
-        List of question dicts (deduplicated).
+        tuple: (questions_list, stats_dict)
     """
     # 自动模式：根据文档特征选择策略
     if strategy == "auto":
@@ -839,10 +1025,32 @@ def generate_questions(content, api_key, base_url, model,
     if gen_fn is None:
         raise ValueError(f"未知策略: {strategy}，可选: {list(_STRATEGY_MAP.keys())}")
 
-    return gen_fn(
+    questions, stats = gen_fn(
         content, num_questions, difficulty, topic_hint,
         api_key, base_url, model, timeout, progress_callback, mode=mode,
     )
+
+    # 检索模式：若不足目标题数，执行补题轮次
+    if mode == MODE_RETRIEVAL and len(questions) < num_questions:
+        # 使用标准 chunking 获取 chunks 用于补题
+        chunks = chunk_document(content)
+        new_qs, supplement_stats = _supplement_retrieval_questions(
+            chunks, questions, num_questions,
+            difficulty, topic_hint,
+            api_key, base_url, model, timeout,
+            progress_callback=progress_callback,
+        )
+        if new_qs:
+            questions.extend(new_qs)
+            # 重新去重+裁剪
+            questions, final_dedup_stats = _deduplicate_and_trim(questions, num_questions)
+            stats["dedup_eliminated"] += final_dedup_stats["dedup_eliminated"]
+
+        stats["supplement_rounds"] = supplement_stats["rounds"]
+        stats["supplement_new"] = supplement_stats["new_count"]
+
+    stats["final_count"] = len(questions)
+    return questions, stats
 
 
 # ========== Save / Export ==========

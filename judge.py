@@ -469,7 +469,8 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout
     total = len(samples)
 
     # 元数据字段列表（需要从 sample 透传到 result）
-    META_KEYS = ("run_id", "config_id", "question_id", "question_set_id", "question_set_name")
+    META_KEYS = ("run_id", "config_id", "question_id", "question_set_id", "question_set_name",
+                 "source_file_name", "source_format")
 
     for i, sample in enumerate(samples):
         # 确保样本有 evaluation_track 字段
