@@ -24,6 +24,84 @@ JUDGED_DIR = Path(__file__).parent / "data" / "judged"
 JUDGED_FILE = JUDGED_DIR / "eval_results.jsonl"
 BATCH_DIR = Path(__file__).parent / "data" / "batch"
 QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
+REPORTS_DIR = Path(__file__).parent / "data" / "reports"
+
+
+def list_langfuse_export_files(raw_dir):
+    """列出 raw_dir 下合法的 Langfuse 导出文件，按修改时间倒序。
+
+    只保留：
+    - langfuse_api_export*.jsonl（API 拉取）
+    - Langfuse UI 导出文件（文件名含 lf-events-export 或首行含 traceId）
+    - 首行含 traceId 字段的合法 JSONL
+
+    排除：
+    - batch_qa_*.jsonl（批量执行结果）
+    - batch_results_*.jsonl
+    - questions_*.jsonl（题集）
+    - eval_results_*.jsonl（评测结果）
+    - langfuse_samples.jsonl（解析产物）
+
+    Returns:
+        list[dict]: [{"path": Path, "name": str, "label": str, "mtime": float, "size_kb": float}, ...]
+    """
+    exclude_prefixes = ("batch_qa_", "batch_results_", "questions_", "eval_results_")
+    exclude_names = {"langfuse_samples.jsonl"}
+    result = []
+
+    if not raw_dir.exists():
+        return result
+
+    for f in raw_dir.glob("*.jsonl"):
+        name = f.name
+        # 排除已知非导出文件
+        if name in exclude_names:
+            continue
+        if any(name.startswith(p) for p in exclude_prefixes):
+            continue
+
+        # 判断是否为 Langfuse 导出文件
+        is_export = False
+        # 名称匹配：API 拉取或 UI 导出
+        if name.startswith("langfuse_api_export") or "lf-events-export" in name:
+            is_export = True
+        else:
+            # 内容匹配：首行含 traceId
+            try:
+                with f.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if "traceId" in obj:
+                                is_export = True
+                        except json.JSONDecodeError:
+                            pass
+                        break  # 只检查首行
+            except Exception:
+                pass
+
+        if not is_export:
+            continue
+
+        stat = f.stat()
+        mtime = stat.st_mtime
+        size_kb = stat.st_size / 1024
+        mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+        label = f"{name}  |  {mtime_str}  |  {size_kb:.1f} KB"
+        result.append({
+            "path": f,
+            "name": name,
+            "label": label,
+            "mtime": mtime,
+            "size_kb": size_kb,
+        })
+
+    # 按修改时间倒序
+    result.sort(key=lambda x: x["mtime"], reverse=True)
+    return result
 
 
 def _get_created_at(filepath, info):
@@ -2286,7 +2364,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
         st.markdown("**第一步：获取 Langfuse 导出文件**")
         source_mode = st.radio(
             "获取方式",
-            ["上传文件", "从 API 拉取"],
+            ["从 API 拉取", "上传文件"],
             horizontal=True,
             key="lf_source_mode",
             label_visibility="collapsed",
@@ -2298,6 +2376,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 save_path = RAW_DIR / uploaded.name
                 save_path.write_bytes(uploaded.getvalue())
                 st.success(f"已保存: {uploaded.name}")
+                # 上传后自动选中新文件
+                st.session_state["raw_select"] = uploaded.name
                 st.rerun()
 
         elif source_mode == "从 API 拉取":
@@ -2314,7 +2394,6 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     st.error("请填写 Langfuse Public Key 和 Secret Key")
                 else:
                     from fetch_traces import fetch_all
-                    from datetime import datetime
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"langfuse_api_export_{ts}.jsonl"
                     output_path = RAW_DIR / filename
@@ -2326,6 +2405,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
                                     count += 1
                             st.success(f"拉取完成！共 {count} 行，已保存为 {filename}")
+                            # API 拉取成功后自动选中新文件
+                            st.session_state["raw_select"] = filename
                             st.rerun()
                         except Exception as e:
                             st.error(f"拉取失败: {e}")
@@ -2334,17 +2415,38 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
         st.divider()
         st.markdown("**第二步：选择文件并解析**")
 
-        raw_files = sorted(RAW_DIR.glob("*.jsonl"))
-        if not raw_files:
-            st.info("data/raw 目录下暂无 .jsonl 文件，请先通过上方方式获取数据")
+        export_files = list_langfuse_export_files(RAW_DIR)
+        if not export_files:
+            st.info("data/raw 目录下暂无合法的 Langfuse 导出文件，请先通过上方方式获取数据")
             selected_name = None
             selected_path = None
         else:
-            file_names = [f.name for f in raw_files]
-            selected_name = st.selectbox("待解析文件", file_names, key="raw_select")
-            selected_path = RAW_DIR / selected_name
+            file_names = [ef["name"] for ef in export_files]
+            file_labels = [ef["label"] for ef in export_files]
 
-            file_size_kb = selected_path.stat().st_size / 1024
+            # 确定默认选中索引
+            saved_select = st.session_state.get("raw_select")
+            if saved_select and saved_select in file_names:
+                default_idx = file_names.index(saved_select)
+            else:
+                default_idx = 0  # 最新文件
+
+            selected_label = st.selectbox("待解析文件", file_labels, index=default_idx, key="raw_select_label")
+            selected_idx = file_labels.index(selected_label)
+            selected_name = file_names[selected_idx]
+            selected_path = export_files[selected_idx]["path"]
+
+            # 同步 session_state
+            st.session_state["raw_select"] = selected_name
+
+            # 文件选择变化时清理解析状态
+            prev_select = st.session_state.get("_prev_raw_select")
+            if prev_select is not None and prev_select != selected_name:
+                st.session_state.pop("samples", None)
+                st.session_state.pop("summary", None)
+            st.session_state["_prev_raw_select"] = selected_name
+
+            file_size_kb = export_files[selected_idx]["size_kb"]
             with open(selected_path, "r", encoding="utf-8") as f:
                 line_count = sum(1 for _ in f)
             st.caption(f"文件大小: {file_size_kb:.1f} KB | 总行数: {line_count}")
@@ -3933,6 +4035,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         EXPERIMENTS_DIR,
     )
     from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
+    from report_export import build_evaluation_html, build_runs_csv, build_failed_samples_csv
 
     # ---------- 自动迁移：从 batch 文件回填 manifest ----------
     _all_runs = list_experiment_runs()
@@ -4120,6 +4223,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 # 后出现的 run 更新，覆盖（即使都有 error 或都无 error）
                 _seen_trace[tid] = r
         all_judge_results = list(_seen_trace.values())
+        cumulative_metrics = compute_metrics(all_judge_results)
 
         # 概览指标
         ov_col1, ov_col2, ov_col3, ov_col4 = st.columns(4)
@@ -4299,6 +4403,77 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 )])
                 fig_status_dist.update_layout(height=300, margin=dict(t=40, b=20))
                 st.plotly_chart(fig_status_dist, use_container_width=True, key="cum_status_dist")
+
+    # ---------- 一键导出评测报告 ----------
+    if config_runs:
+        st.markdown("---")
+        st.markdown("##### 一键导出评测报告")
+        _export_cols = st.columns(3)
+
+        # 构建 run_data_list（为三个导出共用）
+        _run_data_list = []
+        for _i, _run in enumerate(config_runs):
+            _rs = _all_run_statuses[_i] if _i < len(_all_run_statuses) else {}
+            _jr = _rs.get("judge_results", [])
+            _m = compute_metrics(_jr) if _jr else {}
+            _run_data_list.append({"run": _run, "run_status": _rs, "metrics": _m})
+
+        # 构建 processed sample lookup（trace_id -> sample）
+        _sample_lookup = {}
+        _processed_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+        if _processed_path.exists():
+            try:
+                with _processed_path.open("r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _obj = json.loads(_line)
+                            _tid = _obj.get("trace_id")
+                            if _tid:
+                                _sample_lookup[_tid] = _obj
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                pass
+
+        _export_scope = f"配置 {selected_config.get('config_name', '')}，{len(config_runs)} 次运行"
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with _export_cols[0]:
+            _html_bytes = build_evaluation_html(
+                selected_config, config_runs, _run_data_list,
+                cumulative_metrics, all_judge_results,
+                export_scope=_export_scope, sample_lookup=_sample_lookup,
+            ).encode("utf-8")
+            st.download_button(
+                label="下载 HTML 报告",
+                data=_html_bytes,
+                file_name=f"rag_evaluation_report_{_ts}.html",
+                mime="text/html",
+                use_container_width=True,
+                help="自包含 HTML 报告，可在浏览器直接打开并打印为 PDF",
+            )
+        with _export_cols[1]:
+            st.download_button(
+                label="下载运行汇总 CSV",
+                data=build_runs_csv(_run_data_list),
+                file_name=f"rag_evaluation_report_{_ts}_runs.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="每个运行一行，含 Top1/3/5 指标",
+            )
+        with _export_cols[2]:
+            _failed_csv = build_failed_samples_csv(all_judge_results, _sample_lookup, selected_config)
+            st.download_button(
+                label="下载未命中样本 CSV",
+                data=_failed_csv,
+                file_name=f"rag_evaluation_report_{_ts}_failed_samples.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="仅 Top5 未命中的检索样本",
+            )
 
     # ---------- 运行记录 ----------
     st.markdown("---")
