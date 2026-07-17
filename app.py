@@ -4036,6 +4036,10 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
     )
     from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
     from report_export import build_evaluation_html, build_runs_csv, build_failed_samples_csv
+    from optimization_analysis import (
+        build_analysis_context, analyze_overview, analyze_failure_groups,
+        synthesize_optimization_report, save_analysis_report, get_analysis_config,
+    )
 
     # ---------- 自动迁移：从 batch 文件回填 manifest ----------
     _all_runs = list_experiment_runs()
@@ -4474,6 +4478,105 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 use_container_width=True,
                 help="仅 Top5 未命中的检索样本",
             )
+
+    # ---------- AI 优化分析报告 ----------
+    if config_runs and all_judge_results:
+        st.markdown("---")
+        st.markdown("##### AI 优化分析报告")
+        st.caption("基于评测数据调用 LLM 生成知识库优化诊断建议，需要消耗 API 额度")
+
+        _analysis_api_key, _analysis_base_url, _analysis_model = get_analysis_config()
+
+        if not _analysis_api_key:
+            st.warning("未配置分析 API。请在 .env 中设置 ANALYSIS_API_KEY 或 JUDGE_API_KEY")
+        else:
+            _report_cache_key = f"ai_analysis_report_{selected_config_id}"
+
+            if st.button("生成 AI 优化分析", key="btn_gen_ai_analysis", type="primary"):
+                with st.status("正在生成 AI 优化分析...", expanded=True) as _ai_status:
+                    _ai_progress = st.progress(0, text="构建分析上下文...")
+                    _ai_status_text = st.empty()
+
+                    # 阶段 0：构建上下文
+                    _ai_status_text.write("正在构建分析上下文...")
+                    _ai_context = build_analysis_context(
+                        _run_data_list, _sample_lookup, all_judge_results, selected_config,
+                    )
+                    _ai_progress.progress(0.1, text="上下文构建完成")
+
+                    # 阶段 1：整体概览
+                    _ai_status_text.write("阶段 1/3：正在分析总览指标...")
+                    try:
+                        _ai_stage1 = analyze_overview(
+                            _ai_context, _analysis_api_key, _analysis_base_url, _analysis_model,
+                        )
+                    except Exception as e:
+                        _ai_status.update(label="阶段 1 失败", state="error")
+                        st.error(f"总览分析失败: {e}")
+                        st.stop()
+                    _ai_progress.progress(0.35, text="总览分析完成")
+
+                    # 阶段 2：失败诊断
+                    _ai_status_text.write("阶段 2/3：正在分析失败模式...")
+                    try:
+                        _ai_stage2 = analyze_failure_groups(
+                            _ai_context, _analysis_api_key, _analysis_base_url, _analysis_model,
+                        )
+                    except Exception as e:
+                        _ai_status.update(label="阶段 2 失败", state="error")
+                        st.error(f"失败分析失败: {e}")
+                        st.stop()
+                    _ai_progress.progress(0.65, text="失败分析完成")
+
+                    # 阶段 3：汇总报告
+                    _ai_status_text.write("阶段 3/3：正在生成最终报告...")
+                    try:
+                        _ai_report_md = synthesize_optimization_report(
+                            _ai_stage1, _ai_stage2, _ai_context,
+                            _analysis_api_key, _analysis_base_url, _analysis_model,
+                        )
+                    except Exception as e:
+                        _ai_status.update(label="阶段 3 失败", state="error")
+                        st.error(f"报告生成失败: {e}")
+                        st.stop()
+                    _ai_progress.progress(0.9, text="报告生成完成")
+
+                    # 保存到文件
+                    _ai_report_path = save_analysis_report(
+                        _ai_report_md,
+                        selected_config.get("config_name", "unnamed"),
+                        REPORTS_DIR,
+                    )
+                    _ai_progress.progress(1.0, text="完成")
+                    _ai_status.update(label="AI 优化分析完成！", state="complete")
+
+                    # 缓存到 session state
+                    st.session_state[_report_cache_key] = {
+                        "markdown": _ai_report_md,
+                        "path": str(_ai_report_path),
+                        "timestamp": datetime.now().isoformat(),
+                    }
+
+            # 显示已缓存的报告
+            _ai_cached = st.session_state.get(_report_cache_key)
+            if _ai_cached:
+                with st.expander("AI 优化分析报告（点击展开）", expanded=True):
+                    st.markdown(_ai_cached["markdown"])
+                    st.caption(f"生成时间: {_ai_cached['timestamp']}")
+
+                _ai_dl_cols = st.columns(2)
+                with _ai_dl_cols[0]:
+                    st.download_button(
+                        label="下载 AI 优化分析 Markdown",
+                        data=_ai_cached["markdown"].encode("utf-8"),
+                        file_name=f"ai_analysis_{_ts}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+                with _ai_dl_cols[1]:
+                    if st.button("重新生成", key="btn_regenerate_ai_analysis"):
+                        del st.session_state[_report_cache_key]
+                        st.rerun()
 
     # ---------- 运行记录 ----------
     st.markdown("---")
