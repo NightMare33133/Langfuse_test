@@ -3262,13 +3262,34 @@ Judge 有三层减少重复调用的机制：
                                 f"{_r['error'][:100]}{tag}"
                             )
                         else:
-                            t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
-                            t3 = "✓" if _r.get("retrieval_top3_hit") else "✗"
-                            ans = "✓" if _r.get("answer_correct") else "✗"
-                            st.write(
-                                f"✅ [{len(new_results)}] {(_r.get('question') or '')[:40]} — "
-                                f"Top1:{t1} Top3:{t3} Answer:{ans}{tag}"
-                            )
+                            _track = _r.get("evaluation_track", "")
+                            _idx = len(new_results)
+                            _q = (_r.get('question') or '')[:40]
+                            if _track == TRACK_RETRIEVAL:
+                                t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
+                                t3 = "✓" if _r.get("retrieval_top3_hit") else "✗"
+                                t5 = "✓" if _r.get("retrieval_top5_hit") else "✗"
+                                pos = _r.get("hit_evidence_position")
+                                pos_str = str(pos) if pos else "无"
+                                st.write(
+                                    f"✅ [{_idx}] {_q} — "
+                                    f"Top1:{t1} | Top3:{t3} | Top5:{t5} | "
+                                    f"最早命中位置:{pos_str}{tag}"
+                                )
+                            elif _track == TRACK_STRICT_QA:
+                                ans = "✓" if _r.get("answer_correct") else "✗"
+                                st.write(
+                                    f"✅ [{_idx}] {_q} — Answer:{ans}{tag}"
+                                )
+                            elif _track == TRACK_GROUNDED_QA:
+                                gnd = "✓" if _r.get("answer_correct") else "✗"
+                                st.write(
+                                    f"✅ [{_idx}] {_q} — 回答有据:{gnd}{tag}"
+                                )
+                            else:
+                                st.write(
+                                    f"✅ [{_idx}] {_q} — 不可评测：缺少金标准证据{tag}"
+                                )
                     if show_debug:
                         with st.expander(
                             f"调试 - 第 {len(new_results)} 条: "
