@@ -19,3 +19,5 @@ data/batch/
 *.json
 
 /7.08进度汇报.md
+
+data/reports/ai_analysis_*.md
