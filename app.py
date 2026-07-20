@@ -1774,22 +1774,21 @@ PISP和AISP的区别?
 
                     file_labels.append(label)
 
-                selected_idx = st.selectbox(
-                    "选择历史题集",
+                # 清理旧版单选 session_state
+                st.session_state.pop("batch_history_file", None)
+
+                selected_indices = st.multiselect(
+                    "选择历史题集（可多选）",
                     range(len(file_labels)),
                     format_func=lambda i: file_labels[i],
-                    key="batch_history_file",
+                    default=[],
+                    key="batch_history_files",
                 )
-                selected_file = history_files[selected_idx]
-                selected_info = file_info_cache[selected_file]
 
-                # 显示次级信息
-                _created = selected_info.get("created_at")
-                _created_str = _created.strftime('%Y-%m-%d %H:%M') if _created else "未知"
-                st.caption(f"文件: `{selected_file.name}` | 生成时间: {_created_str}")
-
-                try:
-                    raw_lines = selected_file.read_text(encoding="utf-8").strip().split("\n")
+                def _load_questions_from_file(filepath):
+                    """从题集文件加载问题列表。"""
+                    qs = []
+                    raw_lines = filepath.read_text(encoding="utf-8").strip().split("\n")
                     for line in raw_lines:
                         try:
                             obj = json.loads(line)
@@ -1806,63 +1805,75 @@ PISP和AISP的区别?
                                     item["question_set_id"] = obj["question_set_id"]
                                 if obj.get("question_set_name"):
                                     item["question_set_name"] = obj["question_set_name"]
-                                questions_list.append(item)
+                                qs.append(item)
                         except json.JSONDecodeError:
                             continue
+                    return qs
 
-                    st.success(f"从 `{selected_file.name}` 加载了 {len(questions_list)} 个问题")
+                if selected_indices:
+                    # 构建多题集数据
+                    selected_sets = []
+                    for idx in selected_indices:
+                        fp = history_files[idx]
+                        info = file_info_cache[fp]
+                        qs = _load_questions_from_file(fp)
+                        selected_sets.append({"file": fp, "info": info, "questions": qs})
 
-                    # 统计并展示 question_mode 分布
-                    mode_counts = {MODE_RETRIEVAL: 0, MODE_QA: 0, "unknown": 0}
-                    for q in questions_list:
-                        qm = q.get("question_mode", "")
-                        if qm == MODE_RETRIEVAL:
-                            mode_counts[MODE_RETRIEVAL] += 1
-                        elif qm == MODE_QA:
-                            mode_counts[MODE_QA] += 1
+                    total_questions = sum(len(s["questions"]) for s in selected_sets)
+
+                    # 汇总显示
+                    st.success(f"已选 **{len(selected_sets)}** 个题集，共 **{total_questions}** 题")
+                    for i, ss in enumerate(selected_sets, 1):
+                        info = ss["info"]
+                        modes = info["modes"]
+                        if modes[MODE_RETRIEVAL] > 0 and modes[MODE_QA] > 0:
+                            mode_tag = "混合"
+                        elif modes[MODE_RETRIEVAL] > 0:
+                            mode_tag = "检索评测"
+                        elif modes[MODE_QA] > 0:
+                            mode_tag = "全流程问答"
                         else:
-                            mode_counts["unknown"] += 1
+                            mode_tag = "旧版"
+                        _sid = info.get("set_id", "")
+                        _sid_short = f"...{_sid[-8:]}" if len(_sid) > 8 else _sid
+                        st.caption(
+                            f"  {i}. {info['set_name']} · {len(ss['questions'])} 题"
+                            f" · {mode_tag} · {_sid_short}"
+                        )
 
-                    has_ref = sum(1 for q in questions_list if q.get("reference_answer"))
-                    if has_ref:
-                        st.caption(f"其中 {has_ref} 道带有参考答案，评测时将用于严格评判")
+                    # 检查跨题集 question_id 重复
+                    all_qids = []
+                    for ss in selected_sets:
+                        for q in ss["questions"]:
+                            qid = q.get("question_id") or q.get("question", "")[:20]
+                            all_qids.append(qid)
+                    if len(all_qids) != len(set(all_qids)):
+                        st.info(
+                            "⚠️ 不同题集含相同 question_id，"
+                            "运行关联以 question_set_id + run_id 为准。"
+                        )
 
-                    # 显示模式统计
-                    mode_info_parts = []
-                    if mode_counts[MODE_RETRIEVAL] > 0:
-                        mode_info_parts.append(f"检索评测题: {mode_counts[MODE_RETRIEVAL]} 道")
-                    if mode_counts[MODE_QA] > 0:
-                        mode_info_parts.append(f"全流程问答题: {mode_counts[MODE_QA]} 道")
-                    if mode_counts["unknown"] > 0:
-                        mode_info_parts.append(f"旧版/未知模式: {mode_counts['unknown']} 道")
+                    # 合并 questions_list（用于后续执行，保留 question_set_id 来源）
+                    questions_list = []
+                    for ss in selected_sets:
+                        questions_list.extend(ss["questions"])
 
-                    if mode_info_parts:
-                        st.caption("题目模式分布：" + " | ".join(mode_info_parts))
-
-                    # 如果主要是检索评测题，给出提示
-                    if mode_counts[MODE_RETRIEVAL] > 0 and mode_counts[MODE_QA] == 0:
-                        st.info("🔍 **检索评测题**：Judge 评测时会重点关注 Top1/Top3/Top5 Hit")
-                    elif mode_counts[MODE_QA] > 0 and mode_counts[MODE_RETRIEVAL] == 0:
-                        st.info("💬 **全流程问答题**：Judge 评测时会重点关注 Answer OK")
-
-                    with st.expander("预览题目", expanded=False):
-                        for i, q in enumerate(questions_list, 1):
-                            qtext = q.get("question", "")
-                            ref = q.get("reference_answer", "")
-                            qm = q.get("question_mode", "")
-                            mode_badge = ""
-                            if qm == MODE_RETRIEVAL:
-                                mode_badge = "🔍 "
-                            elif qm == MODE_QA:
-                                mode_badge = "💬 "
-
-                            if ref:
-                                st.write(f"{mode_badge}{i}. {qtext}")
-                                st.caption(f"   参考答案: {ref[:80]}{'...' if len(ref) > 80 else ''}")
-                            else:
-                                st.write(f"{mode_badge}{i}. {qtext}")
-                except Exception as e:
-                    st.error(f"读取文件失败: {e}")
+                    # 分组预览题目
+                    with st.expander("预览题目（按题集分组）", expanded=False):
+                        for ss in selected_sets:
+                            info = ss["info"]
+                            qs = ss["questions"]
+                            with st.expander(f"{info['set_name']} · {len(qs)} 题", expanded=False):
+                                for i, q in enumerate(qs, 1):
+                                    qtext = q.get("question", "")
+                                    ref = q.get("reference_answer", "")
+                                    qm = q.get("question_mode", "")
+                                    mode_badge = "🔍 " if qm == MODE_RETRIEVAL else ("💬 " if qm == MODE_QA else "")
+                                    if ref:
+                                        st.write(f"{mode_badge}{i}. {qtext}")
+                                        st.caption(f"   参考答案: {ref[:80]}{'...' if len(ref) > 80 else ''}")
+                                    else:
+                                        st.write(f"{mode_badge}{i}. {qtext}")
 
     # --- RAG 配置方案 ---
     with st.expander("RAG 配置方案", expanded=False):
@@ -2135,6 +2146,65 @@ PISP和AISP的区别?
     # --- Run batch query ---
     st.divider()
 
+    # 预解析 config_id（用于执行前预检）
+    _pre_config_source = st.session_state.get("batch_config_source", "新建配置方案")
+    _pre_config_id = ""
+    if _pre_config_source == "使用历史配置":
+        _pre_config_id = st.session_state.get("batch_selected_config", "")
+    else:
+        # 从 session_state 构建 fingerprint 来查找已有配置
+        _pre_form_vals = {}
+        for _key, _, _, _, _, _ in CONFIG_FIELD_SCHEMA:
+            _pre_form_vals[_key] = st.session_state.get(f"batch_new_{_key}", "")
+        _pre_name = str(_pre_form_vals.get("config_name", "")).strip()
+        if _pre_name:
+            _pre_clean = collect_config_updates(_pre_form_vals)
+            _pre_existing = list_config_profiles(include_archived=False)
+            _pre_fp = config_fingerprint(_pre_clean)
+            _pre_canonical = find_canonical_config(_pre_fp, _pre_existing)
+            if _pre_canonical:
+                _pre_config_id = _pre_canonical["config_id"]
+
+    # 执行前预检：查找已有 completed run
+    _existing_runs_by_qs = {}  # question_set_id -> run manifest
+    if _pre_config_id and q_source == "从历史记录加载" and 'selected_sets' in dir() and selected_sets:
+        from experiment import list_runs_by_config
+        _config_runs = list_runs_by_config(_pre_config_id)
+        for _run in _config_runs:
+            if _run.get("status") == "completed" and _run.get("question_set_id"):
+                _qs_id = _run["question_set_id"]
+                _existing_runs_by_qs[_qs_id] = _run
+
+    # 显示已有 run 信息和策略选择
+    _qs_skip_ids = set()
+    _qs_rerun_strategy = "skip"
+
+    if _existing_runs_by_qs:
+        st.markdown("#### 已有完成记录")
+        st.caption("以下题集在当前配置下已有 completed run：")
+        for _qs_id, _run in _existing_runs_by_qs.items():
+            _qs_name = _run.get("question_set_name", _qs_id)
+            _run_id = _run.get("run_id", "")
+            _completed_at = _run.get("started_at", "")
+            _q_count = _run.get("question_count", "?")
+            _completed_str = _completed_at[:16].replace("T", " ") if _completed_at else "未知时间"
+            st.caption(
+                f"  · {_qs_name} · run: `{_run_id}`"
+                f" · 完成于 {_completed_str} · {_q_count} 题"
+            )
+
+        _qs_rerun_strategy = st.radio(
+            "执行策略",
+            ["skip", "rerun_all"],
+            format_func=lambda x: {
+                "skip": "跳过已完成题集（推荐）",
+                "rerun_all": "为所有已选题集重新执行",
+            }[x],
+            index=0,
+            key="batch_qs_strategy",
+            help="跳过：有 completed run 的题集不创建新 run；重新执行：每个题集创建全新 run，旧 run 完整保留",
+        )
+
     if st.button("开始提问", type="primary", disabled=len(questions_list) == 0, key="batch_run"):
         if not dify_api_key:
             st.error("请填写 Dify API Key（选择已保存连接配置或临时手动填写）")
@@ -2179,94 +2249,247 @@ PISP和AISP的区别?
                     config_result = create_config_profile(**_clean_vals)
                     _config_id = config_result["config_id"]
 
-            # 创建运行记录
-            # 从 questions_list 中提取题集信息
-            _q_set_id = ""
-            _q_set_name = ""
-            for q in questions_list:
-                if q.get("question_set_id"):
-                    _q_set_id = q["question_set_id"]
-                    _q_set_name = q.get("question_set_name", "")
-                    break
-
-            run_result = create_experiment_run(
-                config_id=_config_id,
-                question_set_source=st.session_state.get("batch_q_source", ""),
-                question_count=len(questions_list),
+            # 判断是否为多题集模式
+            _is_multi_qs = (
+                q_source == "从历史记录加载"
+                and 'selected_sets' in dir()
+                and len(selected_sets) > 1
             )
-            run_id = run_result["run_id"]
-            run_dir = run_result["run_dir"]
 
-            # 更新 manifest 添加题集信息和连接配置元数据（不含 API Key）
-            _manifest_updates = {}
-            if _q_set_id or _q_set_name:
-                _manifest_updates["question_set_id"] = _q_set_id
-                _manifest_updates["question_set_name"] = _q_set_name
-            if _selected_profile_id:
-                _manifest_updates["dify_connection_profile_id"] = _selected_profile_id
-                _manifest_updates["dify_connection_profile_name"] = _selected_profile_name
-                _manifest_updates["dify_base_url"] = dify_base_url
-                _manifest_updates["dify_workflow_description"] = _selected_profile_desc
-            elif dify_base_url:
-                _manifest_updates["dify_base_url"] = dify_base_url
-            if _manifest_updates:
-                from experiment import update_experiment_run
-                update_experiment_run(run_id, _manifest_updates)
+            # 构建连接配置 manifest 更新字段（不含 API Key）
+            def _build_manifest_updates(q_set_id="", q_set_name=""):
+                updates = {}
+                if q_set_id or q_set_name:
+                    updates["question_set_id"] = q_set_id
+                    updates["question_set_name"] = q_set_name
+                if _selected_profile_id:
+                    updates["dify_connection_profile_id"] = _selected_profile_id
+                    updates["dify_connection_profile_name"] = _selected_profile_name
+                    updates["dify_base_url"] = dify_base_url
+                    updates["dify_workflow_description"] = _selected_profile_desc
+                elif dify_base_url:
+                    updates["dify_base_url"] = dify_base_url
+                return updates
 
-            # 确保每个问题有 question_id
-            question_ids = []
-            for q in questions_list:
-                q = ensure_question_id(q)
-                question_ids.append(q.get("question_id", ""))
-
-            st.info(f"运行已创建: `{run_id}` | 配置方案: `{_config_id}`")
-
-            batch_results = []
-            progress_bar = st.progress(0, text="准备开始...")
-            status_container = st.container()
-
-            for idx, total, result in run_batch_query(
-                questions_list, dify_api_key, dify_base_url,
-                timeout=dify_timeout, delay=dify_delay,
-                run_id=run_id,
-                config_id=_config_id,
-                question_ids=question_ids,
-            ):
-                progress_bar.progress(
-                    (idx + 1) / total,
-                    text=f"正在提问第 {idx + 1} / {total} 条",
+            # 执行单个题集的批量提问，返回 (run_id, run_dir, batch_results)
+            def _execute_single_qs(questions, q_set_id, q_set_name, label=""):
+                run_result = create_experiment_run(
+                    config_id=_config_id,
+                    question_set_source=st.session_state.get("batch_q_source", ""),
+                    question_count=len(questions),
                 )
-                batch_results.append(result)
+                _run_id = run_result["run_id"]
+                _run_dir = run_result["run_dir"]
 
-                with status_container:
-                    if result["success"]:
-                        answer_preview = (result["sample"].get("final_answer", "") or "")[:80]
-                        st.success(f"✅ [{idx + 1}/{total}] {result['question'][:40]}... → {answer_preview}")
-                    else:
-                        st.error(f"❌ [{idx + 1}/{total}] {result['question'][:40]}... → {result['error'][:80]}")
+                manifest_up = _build_manifest_updates(q_set_id, q_set_name)
+                if manifest_up:
+                    update_experiment_run(_run_id, manifest_up)
 
-            progress_bar.progress(1.0, text="提问完成！")
-            st.session_state["batch_results"] = batch_results
-            st.session_state["batch_run_id"] = run_id
+                question_ids = []
+                for q in questions:
+                    q = ensure_question_id(q)
+                    question_ids.append(q.get("question_id", ""))
 
-            # 保存结果到运行目录（run-local，不再写入全局 data/batch/）
-            run_batch_path = run_dir / "batch_results.jsonl"
-            with run_batch_path.open("w", encoding="utf-8") as f:
-                for r in batch_results:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                st.info(f"运行已创建: `{_run_id}` | 题集: {q_set_name or q_set_id or '未知'}")
 
-            # 推送到 data/raw/
-            raw_path, raw_filename = push_to_raw_dir(batch_results)
+                _batch_results = []
+                _progress = st.progress(0, text=f"{label}准备开始...")
+                _status = st.container()
 
-            # 更新运行 manifest
-            update_experiment_run(run_id, {
-                "batch_results_file": "batch_results.jsonl",
-                "raw_results_file": raw_filename,
-                "status": "completed",
-            })
+                for idx, total, result in run_batch_query(
+                    questions, dify_api_key, dify_base_url,
+                    timeout=dify_timeout, delay=dify_delay,
+                    run_id=_run_id,
+                    config_id=_config_id,
+                    question_ids=question_ids,
+                ):
+                    _progress.progress(
+                        (idx + 1) / total,
+                        text=f"{label}正在提问第 {idx + 1} / {total} 条",
+                    )
+                    _batch_results.append(result)
 
-            st.success(f"批量提问完成！成功 {sum(1 for r in batch_results if r['success'])} / {total} 条")
-            st.caption(f"运行结果已保存到: `{run_dir}`")
+                    with _status:
+                        if result["success"]:
+                            answer_preview = (result["sample"].get("final_answer", "") or "")[:80]
+                            st.success(f"✅ [{idx + 1}/{total}] {result['question'][:40]}... → {answer_preview}")
+                        else:
+                            st.error(f"❌ [{idx + 1}/{total}] {result['question'][:40]}... → {result['error'][:80]}")
+
+                _progress.progress(1.0, text=f"{label}提问完成！")
+
+                # 保存结果到运行目录
+                run_batch_path = _run_dir / "batch_results.jsonl"
+                with run_batch_path.open("w", encoding="utf-8") as f:
+                    for r in _batch_results:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+                raw_path, raw_filename = push_to_raw_dir(_batch_results)
+
+                update_experiment_run(_run_id, {
+                    "batch_results_file": "batch_results.jsonl",
+                    "raw_results_file": raw_filename,
+                    "status": "completed",
+                })
+
+                return _run_id, _run_dir, _batch_results
+
+            if _is_multi_qs:
+                # 多题集模式：逐个执行
+                completed_runs = []
+                failed_runs = []
+                skipped_runs = []
+                global_done = 0
+                global_total = sum(len(s["questions"]) for s in selected_sets)
+                global_progress = st.progress(0, text="多题集执行开始...")
+
+                for set_idx, qs_info in enumerate(selected_sets):
+                    qs = qs_info["questions"]
+                    info = qs_info["info"]
+                    q_set_id = info.get("set_id", "")
+                    q_set_name = info.get("set_name", "")
+                    set_label = f"题集 {set_idx + 1}/{len(selected_sets)}: {q_set_name} — "
+
+                    # 跳过策略检查
+                    if _qs_rerun_strategy == "skip" and q_set_id in _existing_runs_by_qs:
+                        _existing_run = _existing_runs_by_qs[q_set_id]
+                        skipped_runs.append({
+                            "run_id": _existing_run.get("run_id", ""),
+                            "q_set_name": q_set_name,
+                            "q_set_id": q_set_id,
+                            "count": len(qs),
+                        })
+                        global_done += len(qs)
+                        global_progress.progress(
+                            global_done / global_total,
+                            text=f"全局进度: {global_done}/{global_total} 题（跳过已完成）",
+                        )
+                        st.info(
+                            f"⏭️ {set_label}{len(qs)} 题 — 已跳过"
+                            f"（已有 run: `{_existing_run.get('run_id', '')}`）"
+                        )
+                        continue
+
+                    st.markdown(f"### {set_label}{len(qs)} 题")
+
+                    if _qs_rerun_strategy == "rerun_all" and q_set_id in _existing_runs_by_qs:
+                        st.warning(
+                            f"将为 {q_set_name} 创建新的独立 run，"
+                            f"旧 run `{_existing_runs_by_qs[q_set_id].get('run_id', '')}` 完整保留。"
+                        )
+
+                    try:
+                        _run_id, _run_dir, _batch_results = _execute_single_qs(
+                            qs, q_set_id, q_set_name, label=set_label,
+                        )
+                        _success = sum(1 for r in _batch_results if r["success"])
+                        completed_runs.append({
+                            "run_id": _run_id,
+                            "q_set_name": q_set_name,
+                            "q_set_id": q_set_id,
+                            "count": len(qs),
+                            "success": _success,
+                        })
+                        global_done += len(qs)
+                        global_progress.progress(
+                            global_done / global_total,
+                            text=f"全局进度: {global_done}/{global_total} 题已完成",
+                        )
+                    except Exception as e:
+                        failed_runs.append({
+                            "q_set_name": q_set_name,
+                            "q_set_id": q_set_id,
+                            "count": len(qs),
+                            "error": str(e),
+                        })
+                        global_done += len(qs)
+                        global_progress.progress(
+                            global_done / global_total,
+                            text=f"全局进度: {global_done}/{global_total} 题（含失败）",
+                        )
+                        st.error(f"题集 {q_set_name} 执行失败: {e}")
+
+                # 最终汇总
+                global_progress.progress(1.0, text="全部执行完成")
+                st.markdown("### 执行汇总")
+
+                _actual_executed = sum(r["count"] for r in completed_runs) + sum(r["count"] for r in failed_runs)
+
+                if completed_runs:
+                    _total_success = sum(r["success"] for r in completed_runs)
+                    _total_count = sum(r["count"] for r in completed_runs)
+                    st.success(
+                        f"成功: {len(completed_runs)} 个题集 ({_total_count} 题, "
+                        f"{_total_success} 条成功回答)"
+                    )
+                    for r in completed_runs:
+                        st.caption(
+                            f"  ✓ {r['q_set_name']} · {r['count']} 题"
+                            f" · run_id: `{r['run_id']}`"
+                        )
+
+                if failed_runs:
+                    _total_failed_count = sum(r["count"] for r in failed_runs)
+                    st.error(f"失败: {len(failed_runs)} 个题集 ({_total_failed_count} 题)")
+                    for r in failed_runs:
+                        st.caption(
+                            f"  ✗ {r['q_set_name']} · {r['count']} 题"
+                            f" · 错误: {r['error'][:80]}"
+                        )
+
+                if skipped_runs:
+                    _total_skipped_count = sum(r["count"] for r in skipped_runs)
+                    st.info(f"跳过: {len(skipped_runs)} 个题集 ({_total_skipped_count} 题)")
+                    for r in skipped_runs:
+                        st.caption(
+                            f"  ⏭️ {r['q_set_name']} · {r['count']} 题"
+                            f" · 既有 run: `{r['run_id']}`"
+                        )
+
+                st.caption(
+                    f"实际执行: {_actual_executed}/{global_total} 题"
+                    + (f"（跳过 {sum(r['count'] for r in skipped_runs)} 题）" if skipped_runs else "")
+                )
+
+                # 存储最后一个成功 run 的结果到 session（兼容后续结果展示）
+                if completed_runs:
+                    last_run = completed_runs[-1]
+                    st.session_state["batch_run_id"] = last_run["run_id"]
+
+            else:
+                # 单题集模式（兼容现有行为，含跳过逻辑）
+                _q_set_id = ""
+                _q_set_name = ""
+                for q in questions_list:
+                    if q.get("question_set_id"):
+                        _q_set_id = q["question_set_id"]
+                        _q_set_name = q.get("question_set_name", "")
+                        break
+
+                if _qs_rerun_strategy == "skip" and _q_set_id and _q_set_id in _existing_runs_by_qs:
+                    _existing_run = _existing_runs_by_qs[_q_set_id]
+                    st.info(
+                        f"⏭️ 题集 {_q_set_name} 已跳过"
+                        f"（已有 run: `{_existing_run.get('run_id', '')}`）"
+                    )
+                    st.session_state["batch_run_id"] = _existing_run.get("run_id", "")
+                else:
+                    if _qs_rerun_strategy == "rerun_all" and _q_set_id and _q_set_id in _existing_runs_by_qs:
+                        st.warning(
+                            f"将为 {_q_set_name} 创建新的独立 run，"
+                            f"旧 run `{_existing_runs_by_qs[_q_set_id].get('run_id', '')}` 完整保留。"
+                        )
+
+                    run_id, run_dir, batch_results = _execute_single_qs(
+                        questions_list, _q_set_id, _q_set_name,
+                    )
+
+                    st.session_state["batch_results"] = batch_results
+                    st.session_state["batch_run_id"] = run_id
+
+                    _success = sum(1 for r in batch_results if r["success"])
+                    st.success(f"批量提问完成！成功 {_success} / {len(batch_results)} 条")
+                    st.caption(f"运行结果已保存到: `{run_dir}`")
 
     # --- Results display ---
     batch_results = st.session_state.get("batch_results")

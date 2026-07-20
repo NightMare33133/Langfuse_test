@@ -584,7 +584,7 @@ def analyze_overview(context, api_key, base_url, model, timeout=120):
 _SUB_BATCH_MAX_SIZE = 4
 _SLIM_GOLD_EVIDENCE_MAX = 160
 _SLIM_CONTENT_MAX = 120
-_SLIM_MAX_RETRIEVAL_RESULTS = 3
+_SLIM_MAX_RETRIEVAL_RESULTS = 5
 
 _STAGE2_SUB_PROMPT = """\
 你是一位 RAG 检索系统诊断专家。请分析以下失败样本子批次的共性模式。

@@ -1377,14 +1377,15 @@ def test_sub_batch_size_limit():
 
 
 def test_sub_batch_slim_payload():
-    """子批次 payload 不含敏感字段，内容已截断。"""
+    """子批次 payload 不含敏感字段，内容已截断，保留前 5 条检索结果。"""
     print("=" * 60)
     print("测试：子批次 payload 精简")
     print("=" * 60)
 
     sample = _make_failure("t1", gold="A" * 500)
     sample["retrieval_results"] = [
-        {"position": 1, "document_name": "doc1", "content": "B" * 500},
+        {"position": i + 1, "document_name": f"doc{i}", "content": "B" * 500}
+        for i in range(7)
     ]
 
     slim = _slim_sample(sample)
@@ -1392,6 +1393,10 @@ def test_sub_batch_slim_payload():
     # gold_evidence 截断
     assert len(slim["gold_evidence"]) <= 160, \
         f"gold_evidence 应 ≤160，实际 {len(slim['gold_evidence'])}"
+
+    # 保留前 5 条检索结果（不是 3）
+    assert len(slim["retrieval_results"]) == 5, \
+        f"应保留 5 条检索结果，实际 {len(slim['retrieval_results'])}"
 
     # content 截断
     for rr in slim["retrieval_results"]:
@@ -1406,6 +1411,54 @@ def test_sub_batch_slim_payload():
     assert slim["trace_id"] == "t1"
     assert slim["run_id"] == "run_1"
     assert slim["query"] == "测试查询"
+
+    print("[OK] payload 精简正确（5 条检索结果）")
+
+
+def test_sub_batch_retry_further_truncation():
+    """子批次超时重试时，内容被进一步截断。"""
+    print("=" * 60)
+    print("测试：子批次重试进一步截断")
+    print("=" * 60)
+
+    from unittest.mock import patch, MagicMock
+    from optimization_analysis import _analyze_sub_batch
+
+    group_ctx = {"failure_type": "top5_miss", "source_key": "doc.xlsx", "group_total": 2}
+    payload = [
+        {
+            "run_id": "run_1", "trace_id": "t1", "query": "查询",
+            "gold_evidence": "A" * 160, "hit_position": None,
+            "retrieval_results": [
+                {"position": 1, "document_name": "doc1", "content": "B" * 120},
+            ],
+        },
+    ]
+
+    call_count = [0]
+    captured_prompts = []
+
+    def mock_llm(prompt, *args, **kwargs):
+        call_count[0] += 1
+        captured_prompts.append(prompt)
+        if call_count[0] == 1:
+            raise RuntimeError("timeout")
+        return "重试成功"
+
+    with patch('optimization_analysis.call_llm', mock_llm):
+        result = _analyze_sub_batch(
+            "test_batch", payload, group_ctx, {},
+            "key", "http://fake", "model", timeout=5,
+        )
+
+    assert result["status"] == "ok"
+    assert call_count[0] == 2, f"应重试 1 次，共调用 {call_count[0]} 次"
+
+    # 第二次调用的 prompt 应更短（内容被进一步截断）
+    assert len(captured_prompts[1]) < len(captured_prompts[0]), \
+        "重试 prompt 应更短"
+
+    print(f"[OK] 重试成功，prompt 从 {len(captured_prompts[0])} 缩至 {len(captured_prompts[1])}")
 
     print("[OK] payload 精简正确")
 
