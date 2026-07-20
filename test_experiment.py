@@ -299,6 +299,180 @@ def test_dify_user_field():
     print()
 
 
+def test_per_run_judge_stats_not_overwrite():
+    """连续运行两个不同 run 后，两个 run 的统计互不覆盖。"""
+    print("=" * 60)
+    print("测试：per-run Judge 统计互不覆盖")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config_profiles"
+        exp_dir = Path(tmpdir) / "experiments"
+
+        with patch('experiment.CONFIG_PROFILES_DIR', config_dir), \
+             patch('experiment.EXPERIMENTS_DIR', exp_dir):
+
+            # 创建配置方案
+            config = create_config_profile(
+                config_name="测试配置",
+                knowledge_base_version="v1",
+                retrieval_mode="hybrid",
+                top_k=5,
+            )
+            config_id = config["config_id"]
+
+            # 创建两个运行
+            run1 = create_experiment_run(config_id, question_count=10)
+            run2 = create_experiment_run(config_id, question_count=10)
+            run1_id = run1["run_id"]
+            run2_id = run2["run_id"]
+
+            assert run1_id != run2_id, "两个 run_id 应不同"
+
+            # 模拟第一次 Judge 完成（单 run 批次），写入 run1 的 manifest
+            update_experiment_run(run1_id, {
+                "judge_duration_seconds": 12.5,
+                "judge_duration_scope": "run",
+                "judge_llm_call_count": 8,
+                "judge_prescreened_count": 2,
+                "judge_content_cached_count": 0,
+                "judge_concurrency": 3,
+                "judge_completed_at": "2026-07-20T10:00:00",
+                "judge_mode": "incremental",
+                "judge_batch_id": "judge_20260720_100000",
+            })
+
+            # 模拟第二次 Judge 完成（单 run 批次），写入 run2 的 manifest
+            update_experiment_run(run2_id, {
+                "judge_duration_seconds": 25.3,
+                "judge_duration_scope": "run",
+                "judge_llm_call_count": 15,
+                "judge_prescreened_count": 3,
+                "judge_content_cached_count": 1,
+                "judge_concurrency": 4,
+                "judge_completed_at": "2026-07-20T11:00:00",
+                "judge_mode": "retry_failed",
+                "judge_batch_id": "judge_20260720_110000",
+            })
+
+            # 验证 run1 的统计未被覆盖
+            r1 = load_experiment_run(run1_id)
+            assert r1["judge_duration_seconds"] == 12.5, \
+                f"run1 耗时应为 12.5，实际 {r1['judge_duration_seconds']}"
+            assert r1["judge_llm_call_count"] == 8, \
+                f"run1 LLM 调用应为 8，实际 {r1['judge_llm_call_count']}"
+            assert r1["judge_concurrency"] == 3
+            assert r1["judge_completed_at"] == "2026-07-20T10:00:00"
+            assert r1["judge_mode"] == "incremental"
+            assert r1["judge_duration_scope"] == "run"
+            print(f"[OK] run1 统计正确: LLM={r1['judge_llm_call_count']}, "
+                  f"耗时={r1['judge_duration_seconds']}s, scope=run")
+
+            # 验证 run2 的统计正确
+            r2 = load_experiment_run(run2_id)
+            assert r2["judge_duration_seconds"] == 25.3
+            assert r2["judge_llm_call_count"] == 15
+            assert r2["judge_concurrency"] == 4
+            assert r2["judge_completed_at"] == "2026-07-20T11:00:00"
+            assert r2["judge_mode"] == "retry_failed"
+            assert r2["judge_duration_scope"] == "run"
+            print(f"[OK] run2 统计正确: LLM={r2['judge_llm_call_count']}, "
+                  f"耗时={r2['judge_duration_seconds']}s, scope=run")
+
+            # 验证看板读取：每个 run 读到自己的数据
+            r1_again = load_experiment_run(run1_id)
+            r2_again = load_experiment_run(run2_id)
+            assert r1_again["judge_llm_call_count"] == 8
+            assert r2_again["judge_llm_call_count"] == 15
+            assert r1_again["judge_batch_id"] != r2_again["judge_batch_id"]
+            print("[OK] 看板分别读到各自 run 的统计，互不干扰")
+
+    print()
+
+
+def test_cross_run_batch_stats():
+    """跨 run 批次统计：每个 run 写入自己的 manifest，批次信息一致。"""
+    print("=" * 60)
+    print("测试：跨 run 批次统计")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config_profiles"
+        exp_dir = Path(tmpdir) / "experiments"
+
+        with patch('experiment.CONFIG_PROFILES_DIR', config_dir), \
+             patch('experiment.EXPERIMENTS_DIR', exp_dir):
+
+            config = create_config_profile(
+                config_name="跨 run 测试",
+                knowledge_base_version="v1",
+                retrieval_mode="hybrid",
+                top_k=5,
+            )
+            config_id = config["config_id"]
+
+            run1 = create_experiment_run(config_id, question_count=5)
+            run2 = create_experiment_run(config_id, question_count=5)
+
+            batch_id = "judge_20260720_120000"
+            batch_elapsed = 30.0
+
+            # 同一批次评测两个 run：跨 run 批次语义
+            update_experiment_run(run1["run_id"], {
+                "judge_batch_duration_seconds": batch_elapsed,
+                "judge_duration_scope": "batch",
+                "judge_llm_call_count": 4,
+                "judge_prescreened_count": 1,
+                "judge_content_cached_count": 0,
+                "judge_concurrency": 3,
+                "judge_completed_at": "2026-07-20T12:01:00",
+                "judge_batch_id": batch_id,
+                "judge_mode": "incremental",
+            })
+            update_experiment_run(run2["run_id"], {
+                "judge_batch_duration_seconds": batch_elapsed,
+                "judge_duration_scope": "batch",
+                "judge_llm_call_count": 3,
+                "judge_prescreened_count": 1,
+                "judge_content_cached_count": 1,
+                "judge_concurrency": 3,
+                "judge_completed_at": "2026-07-20T12:01:00",
+                "judge_batch_id": batch_id,
+                "judge_mode": "incremental",
+            })
+
+            r1 = load_experiment_run(run1["run_id"])
+            r2 = load_experiment_run(run2["run_id"])
+
+            # 同一批次 ID
+            assert r1["judge_batch_id"] == batch_id
+            assert r2["judge_batch_id"] == batch_id
+
+            # 各自的 LLM 调用数独立
+            assert r1["judge_llm_call_count"] == 4
+            assert r2["judge_llm_call_count"] == 3
+
+            # 跨 run 批次：不应有 judge_duration_seconds（那是单 run 语义）
+            assert "judge_duration_seconds" not in r1, \
+                "跨 run 批次不应写入 judge_duration_seconds"
+            assert "judge_duration_seconds" not in r2, \
+                "跨 run 批次不应写入 judge_duration_seconds"
+
+            # batch 总耗时通过 judge_batch_duration_seconds 保存
+            assert r1["judge_batch_duration_seconds"] == batch_elapsed
+            assert r2["judge_batch_duration_seconds"] == batch_elapsed
+
+            # scope 标记为 batch
+            assert r1["judge_duration_scope"] == "batch"
+            assert r2["judge_duration_scope"] == "batch"
+
+            print(f"[OK] run1: LLM={r1['judge_llm_call_count']}, "
+                  f"run2: LLM={r2['judge_llm_call_count']}, "
+                  f"batch耗时={batch_elapsed}s, scope=batch")
+
+    print()
+
+
 def main():
     """运行所有测试。"""
     print("=" * 60)
@@ -312,6 +486,8 @@ def main():
     test_raw_results_with_run_fields()
     test_query_to_sample_with_run_fields()
     test_dify_user_field()
+    test_per_run_judge_stats_not_overwrite()
+    test_cross_run_batch_stats()
 
     print("=" * 60)
     print("[OK] 所有测试通过！")

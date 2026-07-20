@@ -236,8 +236,12 @@ def update_config_profile_safe(config_id: str, updates: dict, edit_note: str = "
     return config
 
 
-def list_config_profiles() -> list:
-    """列出所有配置方案。"""
+def list_config_profiles(include_archived: bool = False) -> list:
+    """列出配置方案。
+
+    Args:
+        include_archived: 是否包含已归档的重复配置。默认 False。
+    """
     if not CONFIG_PROFILES_DIR.exists():
         return []
 
@@ -245,11 +249,313 @@ def list_config_profiles() -> list:
     for config_path in sorted(CONFIG_PROFILES_DIR.glob("*.json"), reverse=True):
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
+            if not include_archived and config.get("archived_duplicate"):
+                continue
             configs.append(config)
         except (json.JSONDecodeError, IOError):
             continue
 
     return configs
+
+
+# ========== 配置去重与指纹 ==========
+
+# 指纹计算中排除的字段（非业务字段或敏感字段）
+_FP_EXCLUDE_KEYS = frozenset({
+    "config_id", "created_at", "updated_at", "edit_note", "archived_duplicate",
+    "config_snapshot", "run_id", "question_set_id", "question_set_name",
+    # 敏感字段
+    "api_key", "secret_key", "lf_public_key", "lf_secret_key",
+    "openai_api_key", "api_keys", "cookie", "session_token", "password", "token",
+})
+
+
+def config_fingerprint(config: dict) -> str:
+    """计算配置的业务内容指纹。
+
+    排除 config_id、created_at 等非业务字段和所有敏感字段。
+    空值字段不参与指纹计算。
+    字典 key 顺序无关。
+    """
+    import hashlib
+    biz = {}
+    for k, v in sorted(config.items()):
+        if k in _FP_EXCLUDE_KEYS:
+            continue
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        # 数值统一为字符串
+        if isinstance(v, (int, float)):
+            biz[k] = str(v)
+        else:
+            biz[k] = str(v).strip()
+    raw = json.dumps(biz, ensure_ascii=True, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def find_duplicate_config_groups(configs: list = None) -> dict:
+    """按 fingerprint 分组找出重复配置。
+
+    Returns:
+        dict: {fingerprint: [config_dict, ...]} 只包含有重复的组（>=2 个）。
+    """
+    if configs is None:
+        configs = list_config_profiles()
+
+    groups = {}
+    for cfg in configs:
+        if cfg.get("archived_duplicate"):
+            continue  # 已归档的不参与分组
+        fp = config_fingerprint(cfg)
+        groups.setdefault(fp, []).append(cfg)
+
+    return {fp: cfgs for fp, cfgs in groups.items() if len(cfgs) >= 2}
+
+
+def find_canonical_config(fingerprint: str, configs: list = None) -> dict:
+    """找到 fingerprint 对应的 canonical（最早创建）配置。"""
+    if configs is None:
+        configs = list_config_profiles()
+
+    candidates = [
+        cfg for cfg in configs
+        if not cfg.get("archived_duplicate") and config_fingerprint(cfg) == fingerprint
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: c.get("created_at", ""))
+
+
+def cleanup_duplicate_configs(dry_run: bool = True) -> dict:
+    """清理重复配置：将非 canonical 的标记为 archived_duplicate。
+
+    Args:
+        dry_run: True 时只分析不实际修改。
+
+    Returns:
+        dict: {
+            "groups": int,           # 重复组数
+            "canonical": int,        # 保留的 canonical 数
+            "archived": int,         # 已归档数（之前已标记）
+            "newly_archived": int,   # 本次新归档数
+            "deleted": int,          # 安全删除数（无 run 引用的非 canonical）
+            "details": [{fingerprint, canonical_id, archived_ids, deleted_ids}],
+        }
+    """
+    configs = list_config_profiles()
+    groups = find_duplicate_config_groups(configs)
+
+    # 收集所有被 run 引用的 config_id
+    referenced_ids = set()
+    if EXPERIMENTS_DIR.exists():
+        for run_dir in EXPERIMENTS_DIR.iterdir():
+            manifest_path = run_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    cid = manifest.get("config_id")
+                    if cid:
+                        referenced_ids.add(cid)
+                    # config_snapshot 中也可能有 config_id
+                    snap = manifest.get("config_snapshot") or {}
+                    cid2 = snap.get("config_id")
+                    if cid2:
+                        referenced_ids.add(cid2)
+                except (json.JSONDecodeError, IOError):
+                    continue
+
+    result = {
+        "groups": len(groups),
+        "canonical": 0,
+        "archived": 0,
+        "newly_archived": 0,
+        "deleted": 0,
+        "details": [],
+    }
+
+    for fp, cfgs in groups.items():
+        # 按创建时间排序，最早的为 canonical
+        sorted_cfgs = sorted(cfgs, key=lambda c: c.get("created_at", ""))
+        canonical = sorted_cfgs[0]
+        duplicates = sorted_cfgs[1:]
+        result["canonical"] += 1
+
+        detail = {
+            "fingerprint": fp,
+            "canonical_id": canonical["config_id"],
+            "canonical_name": canonical.get("config_name", ""),
+            "archived_ids": [],
+            "already_archived_ids": [],
+            "deleted_ids": [],
+        }
+
+        for dup in duplicates:
+            dup_id = dup["config_id"]
+            if dup.get("archived_duplicate"):
+                result["archived"] += 1
+                detail["already_archived_ids"].append(dup_id)
+                continue
+
+            if dup_id in referenced_ids:
+                # 被 run 引用，只能归档
+                if not dry_run:
+                    _mark_config_archived(dup_id)
+                result["newly_archived"] += 1
+                detail["archived_ids"].append(dup_id)
+            else:
+                # 无 run 引用，可以安全删除
+                if not dry_run:
+                    _delete_config(dup_id)
+                result["deleted"] += 1
+                detail["deleted_ids"].append(dup_id)
+
+        result["details"].append(detail)
+
+    return result
+
+
+def merge_duplicate_configs(dry_run: bool = True) -> dict:
+    """合并重复配置：将非 canonical 配置关联的 run 重新绑定到 canonical，然后删除重复配置。
+
+    流程：
+    1. 按 fingerprint 分组，最早创建者为 canonical。
+    2. 找出所有 manifest 中 config_id 属于非 canonical 的 run。
+    3. 将这些 run 的 manifest config_id 更新为 canonical config_id。
+    4. 校验每个迁移后的 run 仍可正常读取。
+    5. 全部成功后删除非 canonical 配置文件。
+
+    Args:
+        dry_run: True 时只分析不实际修改。
+
+    Returns:
+        dict: {
+            "groups": int,
+            "runs_migrated": int,
+            "configs_deleted": int,
+            "validation_failures": list[str],
+            "details": [{canonical_id, canonical_name, dup_ids, migrated_run_ids, deleted_config_ids, errors}],
+        }
+    """
+    all_configs = list_config_profiles(include_archived=True)
+    groups = find_duplicate_config_groups(all_configs)
+
+    # 建立 config_id -> config 映射
+    config_map = {c["config_id"]: c for c in all_configs}
+
+    # 扫描所有 run，建立 config_id -> [run_id, ...] 映射
+    config_to_runs = {}
+    if EXPERIMENTS_DIR.exists():
+        for run_dir in EXPERIMENTS_DIR.iterdir():
+            manifest_path = run_dir / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    cid = manifest.get("config_id")
+                    if cid:
+                        config_to_runs.setdefault(cid, []).append(manifest.get("run_id", run_dir.name))
+                except (json.JSONDecodeError, IOError):
+                    continue
+
+    result = {
+        "groups": len(groups),
+        "runs_migrated": 0,
+        "configs_deleted": 0,
+        "validation_failures": [],
+        "details": [],
+    }
+
+    for fp, cfgs in groups.items():
+        sorted_cfgs = sorted(cfgs, key=lambda c: c.get("created_at", ""))
+        canonical = sorted_cfgs[0]
+        canonical_id = canonical["config_id"]
+        duplicates = sorted_cfgs[1:]
+
+        detail = {
+            "canonical_id": canonical_id,
+            "canonical_name": canonical.get("config_name", ""),
+            "dup_ids": [],
+            "migrated_run_ids": [],
+            "deleted_config_ids": [],
+            "errors": [],
+        }
+
+        for dup in duplicates:
+            dup_id = dup["config_id"]
+            detail["dup_ids"].append(dup_id)
+
+            # 找出引用此重复配置的 run
+            run_ids = config_to_runs.get(dup_id, [])
+
+            if not dry_run:
+                # 迁移每个 run
+                for run_id in run_ids:
+                    try:
+                        update_experiment_run(run_id, {"config_id": canonical_id})
+                        result["runs_migrated"] += 1
+                        detail["migrated_run_ids"].append(run_id)
+                    except Exception as e:
+                        detail["errors"].append(f"run {run_id}: {e}")
+
+            else:
+                result["runs_migrated"] += len(run_ids)
+                detail["migrated_run_ids"].extend(run_ids)
+
+        # 校验：确认所有迁移后的 run 仍可读取
+        if not dry_run and not detail["errors"]:
+            all_ok = True
+            for run_id in detail["migrated_run_ids"]:
+                m = load_experiment_run(run_id)
+                if m is None:
+                    detail["errors"].append(f"校验失败: run {run_id} 无法加载")
+                    result["validation_failures"].append(run_id)
+                    all_ok = False
+                elif m.get("config_id") != canonical_id:
+                    detail["errors"].append(
+                        f"校验失败: run {run_id} config_id={m.get('config_id')} != {canonical_id}"
+                    )
+                    result["validation_failures"].append(run_id)
+                    all_ok = False
+
+            # 全部校验通过后才删除重复配置
+            if all_ok:
+                for dup in duplicates:
+                    dup_id = dup["config_id"]
+                    # 再次确认无 run 引用此 config
+                    remaining = config_to_runs.get(dup_id, [])
+                    # 迁移后应该没有 run 引用它了，但再检查一次
+                    still_referenced = False
+                    for rid in remaining:
+                        m = load_experiment_run(rid)
+                        if m and m.get("config_id") == dup_id:
+                            still_referenced = True
+                            break
+                    if not still_referenced:
+                        _delete_config(dup_id)
+                        result["configs_deleted"] += 1
+                        detail["deleted_config_ids"].append(dup_id)
+                    else:
+                        detail["errors"].append(f"跳过删除: {dup_id} 仍有 run 引用")
+
+        result["details"].append(detail)
+
+    return result
+    """将配置标记为 archived_duplicate。"""
+    config_path = CONFIG_PROFILES_DIR / f"{config_id}.json"
+    if not config_path.exists():
+        return
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["archived_duplicate"] = True
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    except (json.JSONDecodeError, IOError):
+        pass
+
+
+def _delete_config(config_id: str):
+    """安全删除配置文件（仅在确认无 run 引用后调用）。"""
+    config_path = CONFIG_PROFILES_DIR / f"{config_id}.json"
+    if config_path.exists():
+        config_path.unlink()
 
 
 # ========== Experiment Run 管理 ==========

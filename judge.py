@@ -15,6 +15,8 @@ Judge 评测模块 — 使用 LLM 对结构化样本进行自动评分。
 import hashlib
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -392,9 +394,12 @@ def call_llm(prompt, api_key, base_url, model, timeout=30):
         raise RuntimeError(f"连接失败: {url}\n{e}")
 
     if resp.status_code != 200:
-        raise RuntimeError(
+        err = RuntimeError(
             f"HTTP {resp.status_code} | URL: {url}\nResponse: {resp.text[:1000]}"
         )
+        err.status_code = resp.status_code
+        err.retry_after = resp.headers.get("Retry-After")
+        raise err
 
     try:
         data = resp.json()
@@ -405,6 +410,32 @@ def call_llm(prompt, api_key, base_url, model, timeout=30):
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError):
         raise RuntimeError(f"响应结构异常 | Response: {json.dumps(data, ensure_ascii=False)[:1000]}")
+
+
+def _retry_call_llm(prompt, api_key, base_url, model, timeout=30,
+                    max_retries=3, base_delay=1.0):
+    """带指数退避的 call_llm 包装。429/5xx/超时/连接失败可重试。"""
+
+    def _is_retryable(exc):
+        if not hasattr(exc, 'status_code'):
+            msg = str(exc)
+            return "请求超时" in msg or "连接失败" in msg
+        code = exc.status_code
+        return code == 429 or (500 <= code < 600)
+
+    for attempt in range(max_retries + 1):
+        try:
+            return call_llm(prompt, api_key, base_url, model, timeout=timeout)
+        except RuntimeError as exc:
+            if not _is_retryable(exc) or attempt == max_retries:
+                raise
+            retry_after = getattr(exc, 'retry_after', None)
+            try:
+                ra_delay = float(retry_after) if retry_after else 0
+            except (ValueError, TypeError):
+                ra_delay = 0
+            delay = max(base_delay * (2 ** attempt), ra_delay)
+            time.sleep(delay)
 
 
 def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout=60):
@@ -442,7 +473,7 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
     try:
         prompt = build_judge_prompt(sample, prompt_template, evaluation_track=evaluation_track)
         result["_prompt"] = prompt
-        response_text = call_llm(prompt, api_key, base_url, model, timeout=timeout)
+        response_text = _retry_call_llm(prompt, api_key, base_url, model, timeout=timeout)
         result["_raw_response"] = response_text
         scores = parse_judge_response(response_text)
         # retrieval 轨道：严格校验 LLM 输出格式
@@ -456,81 +487,227 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
     return result
 
 
-def judge_all(samples, api_key, base_url, model, progress_callback=None, timeout=60):
-    """Judge all samples sequentially. Yields results one by one.
+def judge_all(samples, api_key, base_url, model, progress_callback=None,
+              timeout=60, max_workers=1):
+    """Judge all samples. Yields results one by one in original order.
 
     内置规则预筛选和内容级去重：
     - 预筛选：无检索结果/无回答的样本直接出结果，不调 LLM
     - 去重：相同 question+retrieval_query+final_answer 的样本只评一次
 
+    max_workers > 1 时，仅对需要 LLM 调用的样本使用 ThreadPoolExecutor 并行。
+    max_workers == 1 时行为与旧串行逻辑完全一致。
+
     模板选择：根据 evaluation_track 自动选择对应模板。
+
+    progress_callback(done, total, result, info) 在每个样本完成时立即调用：
+    - done: 已完成样本数（含预筛、去重、LLM）
+    - total: 总样本数
+    - result: 本次完成的结果 dict
+    - info: {"llm_done", "llm_total", "elapsed", "eta_text", "throughput",
+             "prescreened_count", "cached_count", "concurrency"}
     """
     content_cache = {}  # content_hash -> result dict (without trace_id/question)
     total = len(samples)
+    start_time = time.monotonic()
 
     # 元数据字段列表（需要从 sample 透传到 result）
     META_KEYS = ("run_id", "config_id", "question_id", "question_set_id", "question_set_name",
                  "source_file_name", "source_format")
 
+    _CACHE_EXCLUDE = {
+        "trace_id", "question", "question_mode",
+        "evaluation_track", "retrieval_evaluable",
+        "has_reference", "_prompt", "_raw_response",
+        *META_KEYS,
+    }
+
+    def _build_immediate(sample, extra_flags, sample_meta):
+        return {
+            "trace_id": sample.get("trace_id", "unknown"),
+            "question": sample.get("question") or "",
+            "question_mode": (sample.get("question_mode") or "").strip(),
+            "evaluation_track": sample["evaluation_track"],
+            **extra_flags,
+            **sample_meta,
+        }
+
+    # --- Phase 1: classify, pre-screen, content dedup (sequential) ---
+    immediate_results = {}  # idx -> result
+    llm_queue = []          # (idx, sample)
+    prescreened_count = 0
+    cached_count = 0
+    done = 0
+
     for i, sample in enumerate(samples):
-        # 确保样本有 evaluation_track 字段
         if "evaluation_track" not in sample:
             sample["evaluation_track"] = classify_evaluation_track(sample)
-
-        # 提取当前样本的元数据
         sample_meta = {k: sample.get(k) for k in META_KEYS if sample.get(k)}
 
-        # 规则预筛选
         prescreened = pre_screen(sample)
         if prescreened is not None:
-            result = {
-                "trace_id": sample.get("trace_id", "unknown"),
-                "question": sample.get("question") or "",
-                "question_mode": (sample.get("question_mode") or "").strip(),
-                "evaluation_track": sample["evaluation_track"],
-                "_prescreened": True,
-                **prescreened,
-                **sample_meta,  # 透传元数据
-            }
+            result = _build_immediate(
+                sample, {"_prescreened": True, **prescreened}, sample_meta)
+            immediate_results[i] = result
+            prescreened_count += 1
+            done += 1
             if progress_callback:
-                progress_callback(i + 1, total, result)
-            yield result
+                elapsed = time.monotonic() - start_time
+                info = {
+                    "llm_done": 0, "llm_total": 0,
+                    "elapsed": elapsed, "eta_text": "计算中",
+                    "throughput": 0.0,
+                    "prescreened_count": prescreened_count,
+                    "cached_count": cached_count,
+                    "concurrency": max_workers,
+                }
+                progress_callback(done, total, result, info)
             continue
 
-        # 内容级去重
         ch = compute_content_hash(sample)
         if ch in content_cache:
             cached = content_cache[ch]
-            result = {
-                "trace_id": sample.get("trace_id", "unknown"),
-                "question": sample.get("question") or "",
-                "question_mode": (sample.get("question_mode") or "").strip(),
-                "evaluation_track": sample["evaluation_track"],
-                "_content_cached": True,
-                **cached,
-                **sample_meta,  # 透传元数据（覆盖缓存中的值）
-            }
+            result = _build_immediate(
+                sample, {"_content_cached": True, **cached}, sample_meta)
+            immediate_results[i] = result
+            cached_count += 1
+            done += 1
             if progress_callback:
-                progress_callback(i + 1, total, result)
-            yield result
+                elapsed = time.monotonic() - start_time
+                info = {
+                    "llm_done": 0, "llm_total": 0,
+                    "elapsed": elapsed, "eta_text": "计算中",
+                    "throughput": 0.0,
+                    "prescreened_count": prescreened_count,
+                    "cached_count": cached_count,
+                    "concurrency": max_workers,
+                }
+                progress_callback(done, total, result, info)
             continue
 
-        # 实际调用 LLM（不传 template，由 build_judge_prompt 根据 sample 自动选择）
-        result = judge_sample(sample, api_key, base_url, model, timeout=timeout)
-        # 缓存成功结果（排除样本身份与轨道字段，这些是样本特定的）
+        llm_queue.append((i, sample))
+
+    llm_total = len(llm_queue)
+
+    # --- Phase 2: LLM calls ---
+    llm_results = {}  # idx -> result
+    llm_done = 0
+    llm_start_time = None
+    llm_elapsed_sum = 0.0
+
+    def _make_llm_info():
+        """构建当前 LLM 进度 info dict。"""
+        elapsed = time.monotonic() - start_time
+        if llm_done >= 2 and llm_elapsed_sum > 0:
+            avg_time = llm_elapsed_sum / llm_done
+            remaining = llm_total - llm_done
+            eta_secs = avg_time * remaining
+            if eta_secs < 60:
+                eta_text = f"约 {int(eta_secs)} 秒"
+            else:
+                eta_text = f"约 {int(eta_secs // 60)} 分 {int(eta_secs % 60)} 秒"
+            throughput = llm_done / llm_elapsed_sum
+        elif llm_done > 0:
+            eta_text = "计算中"
+            throughput = 0.0
+        else:
+            eta_text = "计算中"
+            throughput = 0.0
+        return {
+            "llm_done": llm_done, "llm_total": llm_total,
+            "elapsed": elapsed, "eta_text": eta_text,
+            "throughput": throughput,
+            "prescreened_count": prescreened_count,
+            "cached_count": cached_count,
+            "concurrency": max_workers,
+        }
+
+    def _on_llm_result(idx, result):
+        """LLM 结果完成后的统一处理：缓存、计数、回调。"""
+        nonlocal llm_done, llm_start_time, llm_elapsed_sum, done
+        ch = compute_content_hash(llm_queue_map[idx])
         if "error" not in result:
             content_cache[ch] = {
-                k: v for k, v in result.items()
-                if k not in (
-                    "trace_id", "question", "question_mode",
-                    "evaluation_track", "retrieval_evaluable",
-                    "has_reference", "_prompt", "_raw_response",
-                    *META_KEYS  # 排除元数据字段
-                )
+                k: v for k, v in result.items() if k not in _CACHE_EXCLUDE
             }
+        llm_results[idx] = result
+        llm_done += 1
+        done += 1
+        if llm_start_time is not None:
+            llm_elapsed_sum = time.monotonic() - llm_start_time
         if progress_callback:
-            progress_callback(i + 1, total, result)
-        yield result
+            progress_callback(done, total, result, _make_llm_info())
+
+    if llm_queue:
+        def _worker(idx, sample):
+            sample_meta = {k: sample.get(k) for k in META_KEYS if sample.get(k)}
+            try:
+                result = judge_sample(sample, api_key, base_url, model, timeout=timeout)
+            except Exception as e:
+                result = {
+                    "trace_id": sample.get("trace_id", "unknown"),
+                    "question": sample.get("question") or "",
+                    "evaluation_track": sample.get("evaluation_track", ""),
+                    "error": str(e),
+                }
+            for k, v in sample_meta.items():
+                result.setdefault(k, v)
+            return idx, result
+
+        llm_queue_map = {idx: sample for idx, sample in llm_queue}
+
+        if max_workers <= 1:
+            for idx, sample in llm_queue:
+                ch = compute_content_hash(sample)
+                if ch in content_cache:
+                    sample_meta = {k: sample.get(k) for k in META_KEYS if sample.get(k)}
+                    cached = content_cache[ch]
+                    result = {
+                        "trace_id": sample.get("trace_id", "unknown"),
+                        "question": sample.get("question") or "",
+                        "question_mode": (sample.get("question_mode") or "").strip(),
+                        "evaluation_track": sample.get("evaluation_track", ""),
+                        "_content_cached": True,
+                        **cached,
+                        **sample_meta,
+                    }
+                    llm_results[idx] = result
+                    llm_done += 1
+                    done += 1
+                    if progress_callback:
+                        progress_callback(done, total, result, _make_llm_info())
+                    continue
+                if llm_start_time is None:
+                    llm_start_time = time.monotonic()
+                t0 = time.monotonic()
+                _, result = _worker(idx, sample)
+                llm_elapsed_sum += time.monotonic() - t0
+                if "error" not in result:
+                    content_cache[ch] = {
+                        k: v for k, v in result.items() if k not in _CACHE_EXCLUDE
+                    }
+                llm_results[idx] = result
+                llm_done += 1
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total, result, _make_llm_info())
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_worker, idx, sample): idx
+                    for idx, sample in llm_queue
+                }
+                llm_start_time = time.monotonic()
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    _on_llm_result(idx, result)
+
+    # --- Phase 3: yield in original order (no progress callback) ---
+    for i in range(total):
+        if i in immediate_results:
+            yield immediate_results[i]
+        elif i in llm_results:
+            yield llm_results[i]
 
 
 def pre_screen(sample):

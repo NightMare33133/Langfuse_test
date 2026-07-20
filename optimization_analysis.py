@@ -783,6 +783,45 @@ def synthesize_optimization_report(stage1_output, stage2_output, context,
 
 # ─── 报告保存 ─────────────────────────────────────────────────────────────────
 
+def sanitize_filename_component(name, max_len=50):
+    """将配置名清洗为安全的文件名组成部分。
+
+    规则：
+    - 保留中文、英文、数字、空格、-、_、圆括号
+    - 替换 Windows 非法字符 < > : " / \\ | ? * 和控制字符为 _
+    - 去除末尾空格和句点
+    - 限制长度 max_len
+    - 空或清洗后为空时回退为 "未命名配置"
+    - 不含路径分隔符，无目录穿越风险
+    """
+    if not name or not isinstance(name, str):
+        return "未命名配置"
+    # 替换非法字符
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name.strip())
+    # 仅保留允许的字符
+    safe = re.sub(r'[^\w\u4e00-\u9fff\s\-\(\)]', '_', safe)
+    # 合并连续下划线
+    safe = re.sub(r'_+', '_', safe)
+    # 去除首尾下划线、空格和句点
+    safe = safe.strip('_ ')
+    safe = safe.rstrip('.')
+    # 截断
+    if len(safe) > max_len:
+        safe = safe[:max_len].rstrip(' .')
+    # 去除纯下划线的情况
+    if not safe or safe.strip('_') == '':
+        return "未命名配置"
+    return safe
+
+
+def build_report_filename(config_name, timestamp=None):
+    """生成统一的报告文件名：{config_name}_ai_analysis_{timestamp}.md"""
+    safe_name = sanitize_filename_component(config_name)
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe_name}_ai_analysis_{timestamp}.md"
+
+
 def save_analysis_report(markdown_content, config_name, reports_dir):
     """保存 Markdown 报告到 data/reports/ 目录。
 
@@ -797,10 +836,7 @@ def save_analysis_report(markdown_content, config_name, reports_dir):
     reports_dir = Path(reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = re.sub(r'[^\w\u4e00-\u9fff-]', '_', config_name.strip())[:30]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"ai_analysis_{safe_name}_{timestamp}.md"
-
+    filename = build_report_filename(config_name)
     filepath = reports_dir / filename
     filepath.write_text(markdown_content, encoding="utf-8")
     return filepath

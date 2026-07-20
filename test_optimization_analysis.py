@@ -36,6 +36,8 @@ from optimization_analysis import (
     build_scope_note,
     get_analysis_config,
     save_analysis_report,
+    sanitize_filename_component,
+    build_report_filename,
     analyze_overview,
     analyze_failure_groups,
     synthesize_optimization_report,
@@ -608,9 +610,9 @@ def test_report_save_path():
 
         assert path.exists(), f"文件不存在: {path}"
         assert path.parent == reports_dir, f"路径不在 reports 目录: {path}"
-        assert path.name.startswith("ai_analysis_"), f"文件名格式错误: {path.name}"
         assert path.name.endswith(".md"), f"应为 .md 文件: {path.name}"
-        assert "测试配置" in path.name or "测试" in path.name, f"文件名应含配置名: {path.name}"
+        assert "_ai_analysis_" in path.name, f"文件名应含 _ai_analysis_: {path.name}"
+        assert path.name.startswith("测试配置"), f"文件名应以配置名开头: {path.name}"
 
         content = path.read_text(encoding="utf-8")
         assert content == "# 测试报告"
@@ -1143,6 +1145,137 @@ def test_appendix_b_trace_ownership():
     print("PASS: 附录 trace 归属校验正确")
 
 
+def test_sanitize_chinese_config_name():
+    """中文配置名生成预期文件名。"""
+    print("=" * 60)
+    print("测试：中文配置名清洗")
+    print("=" * 60)
+
+    result = sanitize_filename_component("合同知识库入库_v3")
+    assert result == "合同知识库入库_v3", f"期望 '合同知识库入库_v3'，实际 '{result}'"
+
+    filename = build_report_filename("合同知识库入库_v3", "20260720_112133")
+    assert filename == "合同知识库入库_v3_ai_analysis_20260720_112133.md", \
+        f"文件名错误: {filename}"
+
+    print(f"PASS: {filename}")
+
+
+def test_sanitize_illegal_chars():
+    """含 / : * ? 等字符的配置名被安全清洗。"""
+    print("=" * 60)
+    print("测试：非法字符清洗")
+    print("=" * 60)
+
+    result = sanitize_filename_component('测试/配置:v1*name?')
+    # / : * ? 都应被替换为 _，尾部 _ 被去除
+    assert '/' not in result
+    assert ':' not in result
+    assert '*' not in result
+    assert '?' not in result
+    assert result == "测试_配置_v1_name", f"实际: '{result}'"
+
+    # 含引号和尖括号
+    result2 = sanitize_filename_component('a<b>c"d|e')
+    assert '<' not in result2
+    assert '>' not in result2
+    assert '"' not in result2
+    assert '|' not in result2
+    print(f"PASS: 清洗后 '{result2}'")
+
+
+def test_sanitize_empty_fallback():
+    """空配置名回退为 '未命名配置'。"""
+    print("=" * 60)
+    print("测试：空配置名回退")
+    print("=" * 60)
+
+    assert sanitize_filename_component("") == "未命名配置"
+    assert sanitize_filename_component(None) == "未命名配置"
+    assert sanitize_filename_component("   ") == "未命名配置"
+    # 清洗后为空的情况（全是非法字符）
+    assert sanitize_filename_component("/:*>?") == "未命名配置"
+
+    filename = build_report_filename("", "20260720_112133")
+    assert filename == "未命名配置_ai_analysis_20260720_112133.md", \
+        f"文件名错误: {filename}"
+
+    print("PASS: 空名回退正确")
+
+
+def test_sanitize_trailing_dots_spaces():
+    """末尾空格和句点被去除。"""
+    print("=" * 60)
+    print("测试：末尾空格和句点")
+    print("=" * 60)
+
+    result = sanitize_filename_component("test name...  ")
+    assert not result.endswith('.'), f"不应以句点结尾: '{result}'"
+    assert not result.endswith(' '), f"不应以空格结尾: '{result}'"
+    print(f"PASS: '{result}'")
+
+
+def test_sanitize_max_len():
+    """超长配置名被截断。"""
+    print("=" * 60)
+    print("测试：长度限制")
+    print("=" * 60)
+
+    long_name = "这是一个非常非常非常非常非常非常非常非常非常非常长的配置名称"
+    result = sanitize_filename_component(long_name, max_len=20)
+    assert len(result) <= 20, f"长度应 <=20，实际 {len(result)}: '{result}'"
+    print(f"PASS: 截断后 '{result}'（{len(result)} 字符）")
+
+
+def test_save_and_download_filename_consistent():
+    """保存文件名与下载文件名一致。"""
+    print("=" * 60)
+    print("测试：保存/下载文件名一致")
+    print("=" * 60)
+
+    config_name = "合同知识库入库_v3"
+    timestamp = "20260720_112133"
+
+    # 模拟 save_analysis_report 的文件名生成
+    saved_filename = build_report_filename(config_name, timestamp)
+
+    # 模拟缓存后下载按钮使用的文件名
+    cached_filename = saved_filename  # 两者应相同
+
+    assert saved_filename == cached_filename, \
+        f"不一致: 保存 '{saved_filename}' vs 下载 '{cached_filename}'"
+    assert saved_filename == "合同知识库入库_v3_ai_analysis_20260720_112133.md"
+
+    print(f"PASS: {saved_filename}")
+
+
+def test_no_overwrite_different_times():
+    """两次不同时间生成不会覆盖。"""
+    import time
+    print("=" * 60)
+    print("测试：不同时间不覆盖")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        reports_dir = Path(tmpdir) / "reports"
+
+        path1 = save_analysis_report("# 报告1", "测试配置", reports_dir)
+        time.sleep(1.1)  # 确保时间戳不同（秒级精度）
+        path2 = save_analysis_report("# 报告2", "测试配置", reports_dir)
+
+        assert path1.exists(), f"第一个文件不存在: {path1}"
+        assert path2.exists(), f"第二个文件不存在: {path2}"
+        assert path1 != path2, f"两次生成不应覆盖: {path1}"
+        assert path1.name != path2.name, f"文件名应不同: {path1.name} vs {path2.name}"
+
+        content1 = path1.read_text(encoding="utf-8")
+        content2 = path2.read_text(encoding="utf-8")
+        assert content1 == "# 报告1"
+        assert content2 == "# 报告2"
+
+    print(f"PASS: {path1.name} != {path2.name}")
+
+
 # ====== 主函数 ======
 
 def main():
@@ -1167,6 +1300,13 @@ def main():
         test_config_value_no_unknown,
         test_no_arbitrary_percentage_without_chunk_size,
         test_appendix_b_trace_ownership,
+        test_sanitize_chinese_config_name,
+        test_sanitize_illegal_chars,
+        test_sanitize_empty_fallback,
+        test_sanitize_trailing_dots_spaces,
+        test_sanitize_max_len,
+        test_save_and_download_filename_consistent,
+        test_no_overwrite_different_times,
     ]
 
     passed = 0
