@@ -579,65 +579,364 @@ def analyze_overview(context, api_key, base_url, model, timeout=120):
     return call_llm(prompt, api_key, base_url, model, timeout=timeout)
 
 
-# ─── 阶段 2：失败诊断 ────────────────────────────────────────────────────────
+# ─── 阶段 2：失败诊断（map-reduce） ──────────────────────────────────────────
 
-_STAGE2_PROMPT = """\
-你是一位 RAG 检索系统诊断专家。请分析以下失败样本的共性模式。
+_SUB_BATCH_MAX_SIZE = 4
+_SLIM_GOLD_EVIDENCE_MAX = 160
+_SLIM_CONTENT_MAX = 120
+_SLIM_MAX_RETRIEVAL_RESULTS = 3
 
-## 输入数据
+_STAGE2_SUB_PROMPT = """\
+你是一位 RAG 检索系统诊断专家。请分析以下失败样本子批次的共性模式。
+
+## 分组上下文
+- 失败类型: {failure_type}（top5_miss=Top5 完全未命中, sorting_issue=排序问题）
+- 来源标识: {source_key}
+- 本组总样本数: {group_total}
+- 本批次样本数: {batch_count}
+
+## 本批次样本
 ```json
-{failures_json}
+{batch_json}
 ```
 
-## 统计摘要（由 Python 精确计算，不可修改）
+## 分析要求
+1. 识别本批次样本的共性特征；若无稳定共性，明确写"无稳定共性"
+2. 提出可能的根因假设（明确标注为"假设"）
+3. 每个判断必须附带审计引用: [run_id=... | trace_id=...]
+4. 不得自行统计全局数字，只分析本批次
+5. 不得输出统计摘要或数据事实部分
+
+## 输出格式
+#### 子批次诊断: {batch_id}
+- **共性特征**: ... 或"无稳定共性"
+- **根因假设**: ...
+- **审计引用**:
+  - [run_id=xxx | trace_id=xxx]: 简要说明"""
+
+_STAGE2_REDUCE_PROMPT = """\
+你是一位 RAG 系统优化顾问。请基于以下多个子批次的失败诊断结果，生成统一的失败模式分析。
+
+## 全局统计（由 Python 精确计算，不可修改）
 - retrieval_evaluable_n: {retrieval_evaluable_n}
 - top5_miss_n: {top5_miss_n}
 - ranking_issue_n: {ranking_issue_n}
 
+## 各分组样本数
+{group_stats_text}
+
+## 子批次诊断结果
+{sub_batch_summaries}
+
+## 未完成的子批次（AI 诊断不可用）
+{failed_batches_text}
+
 ## 分析要求
-1. 按 source_file 或 failure_pattern 对失败样本分组。source_file 缺失时，使用 question_set_name 作为"评测源题集/文档"标识，不得显示为"未记录"
-2. 识别每组的共性特征（同一文件、相似问题类型、相似检索结果模式）
-3. 对每组提出可能的根因假设（明确标注为"假设"）
-4. 每个判断必须附带审计引用: [run_id=... | trace_id=... | query=...]
-5. **引用归属校验**: 引用的 trace_id 必须属于其标注的 run_id。不得使用 run_A 的 trace 作为 run_B 文档的证据
-6. **样本数阈值**: 样本数 >= 3 的组才可称为"失败模式"或"弱项"；样本数 < 3 的组只能标注为"待观察个例"，不得生成强结论
-7. 优先分析 Top5 完全未命中（主要召回问题），其次分析排序问题（次要排序问题）
-8. 不得自行计算或复述统计数字，所有数字以"统计摘要"为准
+1. 合并各子批次的诊断，按失败模式优先级排序
+2. 样本数 >= 3 的组称为"失败模式"；样本数 < 3 的组标注为"待观察个例"
+3. 优先分析 Top5 完全未命中（主要召回问题），其次分析排序问题
+4. 识别跨文件/跨题集的共性模式
+5. 提出下一轮单变量实验建议
+6. 对未完成的子批次，明确标注"AI 诊断不可用"，不得伪装为已分析
+7. 每条诊断附审计引用: [run_id=... | trace_id=...]
 
 ## 输出格式
-使用 Markdown，每组一个子节：
+使用 Markdown：
 
-### 失败组 N: [组名]（[召回/排序]）
+### 失败模式优先级排序
+（按样本数和严重性排序）
+
+### 跨文件共性
+（如有）
+
+### 各失败模式详情
+#### 模式 N: [名称]（[召回/排序]）
 - **样本数**: X（是否达到阈值 3）
 - **共性特征**: ...
-- **根因假设**（诊断假设）: ...
-- **审计样本**:
-  - [run_id=xxx | trace_id=xxx | query=xxx]: 简要说明
+- **根因假设**: ...
+- **审计引用**: ...
 
-注意：分析了 X/Y 条失败样本（如果存在截断）。"""
+### 待观察个例
+（样本数 < 3 的组）
+
+### AI 诊断不可用的样本
+（如有未完成批次）
+
+### 下一轮实验建议
+（按预期收益排序）"""
 
 
-def analyze_failure_groups(context, api_key, base_url, model, timeout=120):
-    """阶段 2：失败样本分组诊断。
+def group_failures_for_analysis(failures):
+    """将全部失败样本按 (failure_type, source_key) 分组。
+
+    不截断，保留全部失败样本。
+
+    Args:
+        failures: dict with "top5_miss" and "sorting_issues" lists
+
+    Returns:
+        list of group dicts: {failure_type, source_key, samples, count, trace_ids}
+    """
+    groups = {}  # (failure_type, source_key) -> group
+
+    for failure_type in ("top5_miss", "sorting_issues"):
+        for sample in failures.get(failure_type, []):
+            source_key = (sample.get("source_file_name") or "").strip()
+            if not source_key:
+                source_key = (sample.get("question_set_name") or "").strip()
+            if not source_key:
+                source_key = "未归类"
+
+            key = (failure_type, source_key)
+            if key not in groups:
+                groups[key] = {
+                    "failure_type": failure_type,
+                    "source_key": source_key,
+                    "samples": [],
+                    "trace_ids": [],
+                }
+            groups[key]["samples"].append(sample)
+            groups[key]["trace_ids"].append(sample.get("trace_id", ""))
+
+    result = []
+    for (ft, sk), group in sorted(groups.items()):
+        group["count"] = len(group["samples"])
+        result.append(group)
+    return result
+
+
+def _slim_sample(sample):
+    """将单个失败样本精简为子批次 payload。"""
+    slim = {
+        "run_id": sample.get("run_id", ""),
+        "trace_id": sample.get("trace_id", ""),
+        "query": sample.get("retrieval_query", ""),
+        "gold_evidence": (sample.get("gold_evidence") or "")[:_SLIM_GOLD_EVIDENCE_MAX],
+        "hit_position": sample.get("hit_evidence_position"),
+    }
+    raw_results = sample.get("retrieval_results") or []
+    slim_results = []
+    for rr in raw_results[:_SLIM_MAX_RETRIEVAL_RESULTS]:
+        slim_results.append({
+            "position": rr.get("position"),
+            "document_name": rr.get("document_name", ""),
+            "content": (rr.get("content") or "")[:_SLIM_CONTENT_MAX],
+        })
+    slim["retrieval_results"] = slim_results
+    return slim
+
+
+def _split_into_sub_batches(group, max_batch_size=_SUB_BATCH_MAX_SIZE):
+    """将一个分组切分为多个子批次，每个子批次 payload 已精简。"""
+    samples = group["samples"]
+    batches = []
+    for i in range(0, len(samples), max_batch_size):
+        chunk = samples[i:i + max_batch_size]
+        batch_id = f"{group['failure_type']}_{group['source_key']}_{i // max_batch_size}"
+        batches.append({
+            "batch_id": batch_id,
+            "payload": [_slim_sample(s) for s in chunk],
+            "trace_ids": [s.get("trace_id", "") for s in chunk],
+        })
+    return batches
+
+
+def _analyze_sub_batch(batch_id, batch_payload, group_context, stats,
+                       api_key, base_url, model, timeout=120):
+    """分析单个子批次，带重试逻辑。"""
+    batch_json = json.dumps(batch_payload, ensure_ascii=False, indent=2)
+    prompt = _STAGE2_SUB_PROMPT.format(
+        failure_type=group_context["failure_type"],
+        source_key=group_context["source_key"],
+        group_total=group_context["group_total"],
+        batch_count=len(batch_payload),
+        batch_json=batch_json,
+        batch_id=batch_id,
+    )
+    payload_chars = len(prompt)
+    trace_ids = [s.get("trace_id", "") for s in batch_payload]
+
+    try:
+        output = call_llm(prompt, api_key, base_url, model, timeout=timeout)
+        return {
+            "batch_id": batch_id, "status": "ok",
+            "output": output, "trace_ids": trace_ids,
+            "payload_chars": payload_chars,
+        }
+    except Exception as e:
+        # 重试：进一步截断内容
+        try:
+            for s in batch_payload:
+                for rr in s.get("retrieval_results", []):
+                    if len(rr.get("content", "")) > 60:
+                        rr["content"] = rr["content"][:60] + "..."
+                if len(s.get("gold_evidence", "")) > 80:
+                    s["gold_evidence"] = s["gold_evidence"][:80] + "..."
+            batch_json_retry = json.dumps(batch_payload, ensure_ascii=False, indent=2)
+            prompt_retry = _STAGE2_SUB_PROMPT.format(
+                failure_type=group_context["failure_type"],
+                source_key=group_context["source_key"],
+                group_total=group_context["group_total"],
+                batch_count=len(batch_payload),
+                batch_json=batch_json_retry,
+                batch_id=batch_id,
+            )
+            output = call_llm(prompt_retry, api_key, base_url, model, timeout=timeout)
+            return {
+                "batch_id": batch_id, "status": "ok",
+                "output": output, "trace_ids": trace_ids,
+                "payload_chars": len(prompt_retry),
+            }
+        except Exception as e2:
+            return {
+                "batch_id": batch_id, "status": "failed",
+                "error": str(e2), "trace_ids": trace_ids,
+                "payload_chars": payload_chars,
+            }
+
+
+def _build_python_failure_manifest(failures):
+    """Python 生成的完整失败清单（确定性，无 LLM）。"""
+    lines = ["## Python 生成的完整失败清单\n"]
+    for section, label in [("top5_miss", "Top5 完全未命中"), ("sorting_issues", "排序问题")]:
+        items = failures.get(section, [])
+        if not items:
+            continue
+        lines.append(f"### {label}（{len(items)} 条）\n")
+        for s in items:
+            tid = s.get("trace_id", "")
+            rid = s.get("run_id", "")
+            q = (s.get("retrieval_query") or s.get("question") or "")[:60]
+            gold = (s.get("gold_evidence") or "")[:80]
+            hit = s.get("hit_evidence_position")
+            lines.append(f"- [{rid} | {tid}] query: {q}")
+            lines.append(f"  金标准: {gold} | hit_position: {hit}")
+    return "\n".join(lines)
+
+
+def analyze_failure_groups(context, api_key, base_url, model, timeout=120,
+                           progress_callback=None):
+    """阶段 2：map-reduce 失败诊断。
+
+    1. Python 确定性分组（不截断）
+    2. 每组切分子批次，逐批调用 LLM
+    3. 汇总所有子批次结果
 
     Args:
         context: build_analysis_context 返回的上下文
         api_key, base_url, model: LLM 配置
         timeout: 请求超时秒数
+        progress_callback: callable(phase, detail) 进度回调
 
     Returns:
-        str: LLM 返回的 Markdown 分析文本
+        str: 完整的 Stage 2 Markdown（含 Python 清单 + AI 诊断）
     """
     stats = compute_precise_stats(context)
     failures = context.get("failures", {})
-    failures_json = json.dumps(failures, ensure_ascii=False, indent=2)
-    prompt = _STAGE2_PROMPT.format(
-        failures_json=failures_json,
+
+    # Phase 1: Python 分组
+    groups = group_failures_for_analysis(failures)
+    total_failures = sum(g["count"] for g in groups)
+
+    # 构建子批次
+    all_batches = []
+    for group in groups:
+        batches = _split_into_sub_batches(group)
+        for b in batches:
+            b["group_context"] = {
+                "failure_type": group["failure_type"],
+                "source_key": group["source_key"],
+                "group_total": group["count"],
+            }
+        all_batches.extend(batches)
+
+    if progress_callback:
+        progress_callback("grouping", {
+            "total_failures": total_failures,
+            "group_count": len(groups),
+            "batch_count": len(all_batches),
+        })
+
+    # Phase 2: 逐批 LLM 分析
+    batch_results = []
+    for i, batch in enumerate(all_batches):
+        result = _analyze_sub_batch(
+            batch["batch_id"], batch["payload"],
+            batch["group_context"], stats,
+            api_key, base_url, model, timeout=timeout,
+        )
+        batch_results.append(result)
+        if progress_callback:
+            progress_callback("sub_batch", {
+                "batch_index": i + 1,
+                "total_batches": len(all_batches),
+                "batch_id": batch["batch_id"],
+                "status": result["status"],
+                "payload_chars": result.get("payload_chars", 0),
+            })
+
+    # Phase 3: 汇总
+    if progress_callback:
+        progress_callback("synthesis", {"status": "started"})
+
+    ok_results = [r for r in batch_results if r["status"] == "ok"]
+    failed_results = [r for r in batch_results if r["status"] == "failed"]
+
+    # 构建汇总输入
+    sub_batch_summaries = []
+    for r in ok_results:
+        sub_batch_summaries.append(f"#### {r['batch_id']}\n{r['output']}")
+    sub_batch_text = "\n\n".join(sub_batch_summaries) if sub_batch_summaries else "（无成功子批次）"
+
+    group_stats_lines = []
+    for g in groups:
+        ft_label = "Top5 未命中" if g["failure_type"] == "top5_miss" else "排序问题"
+        group_stats_lines.append(f"- {ft_label} / {g['source_key']}: {g['count']} 条")
+    group_stats_text = "\n".join(group_stats_lines)
+
+    failed_lines = []
+    for r in failed_results:
+        failed_lines.append(f"- {r['batch_id']}: {r['error']}（涉及 trace_id: {', '.join(r['trace_ids'][:3])}...）")
+    failed_text = "\n".join(failed_lines) if failed_lines else "无"
+
+    # 若全部失败，直接返回 Python 清单 + 错误说明
+    if not ok_results:
+        manifest = _build_python_failure_manifest(failures)
+        ai_section = (
+            f"\n\n## AI 诊断\n\n所有 {len(all_batches)} 个子批次均失败，"
+            f"AI 诊断不可用。失败原因：\n{failed_text}"
+        )
+        if progress_callback:
+            progress_callback("done", {"status": "all_failed"})
+        return manifest + ai_section
+
+    reduce_prompt = _STAGE2_REDUCE_PROMPT.format(
         retrieval_evaluable_n=stats["retrieval_evaluable_n"],
         top5_miss_n=stats["top5_miss_n"],
         ranking_issue_n=stats["ranking_issue_n"],
+        group_stats_text=group_stats_text,
+        sub_batch_summaries=sub_batch_text,
+        failed_batches_text=failed_text,
     )
-    return call_llm(prompt, api_key, base_url, model, timeout=timeout)
+    ai_diagnosis = call_llm(reduce_prompt, api_key, base_url, model, timeout=timeout)
+
+    if progress_callback:
+        progress_callback("synthesis", {"status": "completed"})
+
+    # 组装最终输出
+    manifest = _build_python_failure_manifest(failures)
+    ai_section = f"\n\n## AI 诊断（基于 {len(ok_results)}/{len(all_batches)} 个子批次分析）\n\n{ai_diagnosis}"
+
+    if progress_callback:
+        progress_callback("done", {
+            "status": "completed",
+            "total_failures": total_failures,
+            "batch_count": len(all_batches),
+            "ok_count": len(ok_results),
+            "failed_count": len(failed_results),
+        })
+
+    return manifest + ai_section
 
 
 # ─── 阶段 3：汇总报告 ────────────────────────────────────────────────────────

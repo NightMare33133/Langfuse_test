@@ -4837,11 +4837,54 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         st.stop()
                     _ai_progress.progress(0.35, text="总览分析完成")
 
-                    # 阶段 2：失败诊断
-                    _ai_status_text.write("阶段 2/3：正在分析失败模式...")
+                    # 阶段 2：失败诊断（map-reduce）
+                    _ai_status_text.write("阶段 2/3：正在分组失败样本...")
+                    _stage2_detail = st.empty()
+
+                    def _stage2_progress(phase, detail):
+                        if phase == "grouping":
+                            _tf = detail["total_failures"]
+                            _gc = detail["group_count"]
+                            _bc = detail["batch_count"]
+                            _ai_status_text.write(
+                                f"阶段 2/3：共 {_tf} 条失败，{_gc} 组，{_bc} 个子批次"
+                            )
+                            _ai_progress.progress(0.38)
+                        elif phase == "sub_batch":
+                            _bi = detail["batch_index"]
+                            _bt = detail["total_batches"]
+                            _bs = detail["status"]
+                            _pc = detail.get("payload_chars", 0)
+                            _status_icon = "✓" if _bs == "ok" else "✗"
+                            _ai_status_text.write(
+                                f"阶段 2/3：子批次分析 {_bi}/{_bt} {_status_icon}"
+                            )
+                            _stage2_detail.caption(
+                                f"批次 {detail['batch_id']} | "
+                                f"payload {_pc} 字符 | "
+                                f"状态: {_bs}"
+                            )
+                            _ai_progress.progress(0.35 + 0.25 * (_bi / _bt))
+                        elif phase == "synthesis":
+                            if detail["status"] == "started":
+                                _ai_status_text.write("阶段 2/3：正在汇总诊断...")
+                                _ai_progress.progress(0.62)
+                            else:
+                                _ai_progress.progress(0.65)
+                        elif phase == "done":
+                            if detail["status"] == "completed":
+                                _tc = detail["total_failures"]
+                                _ok = detail["ok_count"]
+                                _fc = detail["failed_count"]
+                                _stage2_detail.caption(
+                                    f"完成: {_tc} 条失败样本, "
+                                    f"{_ok} 批成功, {_fc} 批失败"
+                                )
+
                     try:
                         _ai_stage2 = analyze_failure_groups(
                             _ai_context, _analysis_api_key, _analysis_base_url, _analysis_model,
+                            progress_callback=_stage2_progress,
                         )
                     except Exception as e:
                         _ai_status.update(label="阶段 2 失败", state="error")

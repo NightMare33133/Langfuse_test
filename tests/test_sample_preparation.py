@@ -21,8 +21,6 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-# 从 app.py 导入辅助函数
-sys.path.insert(0, str(Path(__file__).parent))
 from app import list_langfuse_export_files
 
 

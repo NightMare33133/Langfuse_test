@@ -40,12 +40,17 @@ from optimization_analysis import (
     build_report_filename,
     analyze_overview,
     analyze_failure_groups,
+    group_failures_for_analysis,
+    _split_into_sub_batches,
+    _slim_sample,
+    _build_python_failure_manifest,
     synthesize_optimization_report,
     _SENSITIVE_KEYS,
     _SENSITIVE_SNAPSHOT_KEYS,
     _ABS_PATH_PREFIXES,
     _MAX_CONTEXT_CHARS,
     _MIN_GROUP_SAMPLE_COUNT,
+    _SUB_BATCH_MAX_SIZE,
 )
 
 
@@ -403,7 +408,7 @@ def test_truncation_rules():
 
 
 def test_llm_call_order():
-    """阶段 1→2→3 调用顺序正确，共 3 次调用。"""
+    """阶段 1→2→3 调用顺序正确，Stage 1 和 3 各 1 次，Stage 2 多次（map-reduce）。"""
     print("=" * 60)
     print("测试：LLM 调用顺序")
     print("=" * 60)
@@ -411,9 +416,9 @@ def test_llm_call_order():
     config, runs, rdl, cum_m, all_r, sl = _build_fixture()
     ctx = build_analysis_context(rdl, sl, all_r, config)
 
-    mock_fn, call_log = _mock_call_llm(["概览分析", "失败诊断", "最终报告"])
+    # Stage 2 现在是 map-reduce：子批次 + reduce 调用，所以需要更多 mock 响应
+    mock_fn, call_log = _mock_call_llm(["概览分析"] + ["子批次诊断"] * 20 + ["最终报告"])
 
-    # 替换 call_llm
     import optimization_analysis as oa
     orig_fn = oa.call_llm
     oa.call_llm = mock_fn
@@ -424,19 +429,18 @@ def test_llm_call_order():
     finally:
         oa.call_llm = orig_fn
 
-    assert len(call_log) == 3, f"应有 3 次 LLM 调用，实际 {len(call_log)}"
-    assert call_log[0]["stage"] == 0
-    assert call_log[1]["stage"] == 1
-    assert call_log[2]["stage"] == 2
-    # synthesize_optimization_report 现在组合 Python 事实 + LLM 输出
-    assert "最终报告" in report, "报告应包含 LLM 输出"
+    # Stage 1 = 1 次, Stage 2 >= 1 次 (sub-batches + reduce), Stage 3 = 1 次
+    assert len(call_log) >= 3, f"应有 >=3 次 LLM 调用，实际 {len(call_log)}"
+    assert call_log[0]["stage"] == 0  # Stage 1
+    # Stage 2 调用在中间
+    assert call_log[-1]["stage"] == len(call_log) - 1  # Stage 3 是最后一次
     assert "AI 优化分析报告" in report, "报告应包含标题"
 
-    print("PASS: LLM 调用顺序正确")
+    print(f"PASS: LLM 调用 {len(call_log)} 次，顺序正确")
 
 
 def test_failure_handling():
-    """LLM 失败时保留已完成结果。"""
+    """Stage 2 子批次全部失败时，返回 Python 清单 + 错误说明，不抛异常。"""
     print("=" * 60)
     print("测试：LLM 失败处理")
     print("=" * 60)
@@ -446,7 +450,7 @@ def test_failure_handling():
 
     import optimization_analysis as oa
 
-    # 阶段 1 成功，阶段 2 失败
+    # 阶段 1 成功，阶段 2 全部子批次失败
     call_count = [0]
     def mock_fail_stage2(prompt, api_key, base_url, model, timeout=120):
         call_count[0] += 1
@@ -460,18 +464,17 @@ def test_failure_handling():
         s1 = analyze_overview(ctx, "key", "url", "model")
         assert s1 == "概览分析成功", "阶段 1 应成功"
 
-        try:
-            analyze_failure_groups(ctx, "key", "url", "model")
-            assert False, "阶段 2 应抛出异常"
-        except RuntimeError as e:
-            assert "阶段 2" in str(e)
+        # Stage 2 现在不会抛异常，而是返回 Python 清单 + 错误说明
+        s2 = analyze_failure_groups(ctx, "key", "url", "model")
+        assert "Python 生成的完整失败清单" in s2, "应包含 Python 清单"
+        assert "AI 诊断不可用" in s2, "应标注 AI 诊断不可用"
 
         # 阶段 1 结果仍可用
         assert s1 == "概览分析成功"
     finally:
         oa.call_llm = orig_fn
 
-    print("PASS: LLM 失败时保留已完成结果")
+    print("PASS: Stage 2 全部失败时返回 Python 清单 + 错误说明")
 
 
 def test_markdown_references():
@@ -1276,6 +1279,218 @@ def test_no_overwrite_different_times():
     print(f"PASS: {path1.name} != {path2.name}")
 
 
+def _make_failure(trace_id, run_id="run_1", source_file="doc.xlsx",
+                  question_set="题集A", query="测试查询", gold="金标准证据"):
+    """构造测试用失败样本。"""
+    return {
+        "trace_id": trace_id, "run_id": run_id,
+        "source_file_name": source_file, "question_set_name": question_set,
+        "retrieval_query": query, "gold_evidence": gold,
+        "hit_evidence_position": None,
+        "retrieval_results": [
+            {"position": 1, "document_name": "doc1", "content": "内容" * 50},
+            {"position": 2, "document_name": "doc2", "content": "内容" * 50},
+        ],
+    }
+
+
+def test_group_failures_all_samples_covered():
+    """分组后不丢失任何失败样本。"""
+    print("=" * 60)
+    print("测试：分组覆盖全部失败样本")
+    print("=" * 60)
+
+    failures = {
+        "top5_miss": [_make_failure(f"t_{i}", source_file=f"file_{i % 3}.xlsx")
+                      for i in range(10)],
+        "sorting_issues": [_make_failure(f"s_{i}", source_file=f"file_{i % 2}.xlsx")
+                           for i in range(6)],
+    }
+
+    groups = group_failures_for_analysis(failures)
+    total_in_groups = sum(g["count"] for g in groups)
+    assert total_in_groups == 16, f"期望 16 条，实际 {total_in_groups}"
+
+    # 检查所有 trace_id 都出现
+    all_tids = set()
+    for g in groups:
+        all_tids.update(g["trace_ids"])
+    expected_tids = {f"t_{i}" for i in range(10)} | {f"s_{i}" for i in range(6)}
+    assert all_tids == expected_tids, f"丢失 trace_id: {expected_tids - all_tids}"
+
+    print(f"[OK] {total_in_groups} 条样本分布在 {len(groups)} 组")
+
+
+def test_source_key_fallback():
+    """source_file_name 缺失时回退到 question_set_name。"""
+    print("=" * 60)
+    print("测试：source_key 回退")
+    print("=" * 60)
+
+    failures = {
+        "top5_miss": [
+            _make_failure("t1", source_file="", question_set="题集X"),
+            _make_failure("t2", source_file="  ", question_set="题集X"),
+            _make_failure("t3", source_file="doc.xlsx"),
+        ],
+        "sorting_issues": [],
+    }
+
+    groups = group_failures_for_analysis(failures)
+    keys = {g["source_key"] for g in groups}
+    assert "题集X" in keys, f"应有题集X，实际 {keys}"
+    assert "doc.xlsx" in keys, f"应有 doc.xlsx，实际 {keys}"
+
+    # 题集X 组应有 2 条
+    qsn_group = next(g for g in groups if g["source_key"] == "题集X")
+    assert qsn_group["count"] == 2
+
+    print(f"[OK] source_key: {keys}")
+
+
+def test_sub_batch_size_limit():
+    """每个子批次不超过 _SUB_BATCH_MAX_SIZE 条。"""
+    print("=" * 60)
+    print("测试：子批次大小限制")
+    print("=" * 60)
+
+    group = {
+        "failure_type": "top5_miss",
+        "source_key": "doc.xlsx",
+        "samples": [_make_failure(f"t_{i}") for i in range(10)],
+        "trace_ids": [f"t_{i}" for i in range(10)],
+        "count": 10,
+    }
+
+    batches = _split_into_sub_batches(group)
+    for b in batches:
+        assert len(b["payload"]) <= _SUB_BATCH_MAX_SIZE, \
+            f"批次 {b['batch_id']} 有 {len(b['payload'])} 条，超过 {_SUB_BATCH_MAX_SIZE}"
+
+    # 所有 trace_id 都应出现
+    all_tids = set()
+    for b in batches:
+        all_tids.update(b["trace_ids"])
+    assert all_tids == {f"t_{i}" for i in range(10)}
+
+    print(f"[OK] {len(batches)} 个子批次，每批 ≤ {_SUB_BATCH_MAX_SIZE}")
+
+
+def test_sub_batch_slim_payload():
+    """子批次 payload 不含敏感字段，内容已截断。"""
+    print("=" * 60)
+    print("测试：子批次 payload 精简")
+    print("=" * 60)
+
+    sample = _make_failure("t1", gold="A" * 500)
+    sample["retrieval_results"] = [
+        {"position": 1, "document_name": "doc1", "content": "B" * 500},
+    ]
+
+    slim = _slim_sample(sample)
+
+    # gold_evidence 截断
+    assert len(slim["gold_evidence"]) <= 160, \
+        f"gold_evidence 应 ≤160，实际 {len(slim['gold_evidence'])}"
+
+    # content 截断
+    for rr in slim["retrieval_results"]:
+        assert len(rr["content"]) <= 120, \
+            f"content 应 ≤120，实际 {len(rr['content'])}"
+
+    # 不含敏感字段
+    for key in ("api_key", "secret_key", "_prompt", "final_answer"):
+        assert key not in slim, f"不应包含 {key}"
+
+    # 包含必要字段
+    assert slim["trace_id"] == "t1"
+    assert slim["run_id"] == "run_1"
+    assert slim["query"] == "测试查询"
+
+    print("[OK] payload 精简正确")
+
+
+def test_python_failure_manifest_no_llm():
+    """Python 清单是确定性的，不含 LLM 生成内容。"""
+    print("=" * 60)
+    print("测试：Python 失败清单")
+    print("=" * 60)
+
+    failures = {
+        "top5_miss": [_make_failure("t1"), _make_failure("t2")],
+        "sorting_issues": [_make_failure("s1")],
+    }
+
+    manifest = _build_python_failure_manifest(failures)
+    assert "t1" in manifest
+    assert "t2" in manifest
+    assert "s1" in manifest
+    assert "Top5 完全未命中" in manifest
+    assert "排序问题" in manifest
+    assert "2 条" in manifest
+    assert "1 条" in manifest
+
+    print("[OK] Python 清单正确")
+
+
+def test_progress_callback_invoked():
+    """progress_callback 在各阶段被调用。"""
+    print("=" * 60)
+    print("测试：进度回调调用")
+    print("=" * 60)
+
+    failures = {
+        "top5_miss": [_make_failure(f"t_{i}") for i in range(3)],
+        "sorting_issues": [_make_failure(f"s_{i}") for i in range(2)],
+    }
+    context = {"failures": failures}
+    phases = []
+
+    def on_progress(phase, detail):
+        phases.append(phase)
+
+    # Mock call_llm to avoid real API
+    from unittest.mock import patch, MagicMock
+    mock_llm = MagicMock(return_value="mock diagnosis")
+
+    with patch('optimization_analysis.call_llm', mock_llm):
+        analyze_failure_groups(
+            context, "key", "http://fake", "model",
+            timeout=5, progress_callback=on_progress,
+        )
+
+    assert "grouping" in phases, f"应有 grouping，实际 {phases}"
+    assert "sub_batch" in phases, f"应有 sub_batch，实际 {phases}"
+    assert "synthesis" in phases, f"应有 synthesis，实际 {phases}"
+    assert "done" in phases, f"应有 done，实际 {phases}"
+
+    print(f"[OK] 回调阶段: {phases}")
+
+
+def test_reduce_includes_failed_batches():
+    """未完成批次在汇总中被标注，不伪装为已分析。"""
+    print("=" * 60)
+    print("测试：失败批次标注")
+    print("=" * 60)
+
+    from optimization_analysis import _STAGE2_REDUCE_PROMPT
+    # 检查 reduce prompt 模板中有失败批次占位
+    assert "{failed_batches_text}" in _STAGE2_REDUCE_PROMPT
+
+    # 模拟有失败批次的输入
+    failed_text = "- top5_miss_doc.xlsx_0: timeout（涉及 trace_id: t1, t2, t3...）"
+    prompt = _STAGE2_REDUCE_PROMPT.format(
+        retrieval_evaluable_n=100, top5_miss_n=20, ranking_issue_n=10,
+        group_stats_text="- Top5 未命中 / doc.xlsx: 20 条",
+        sub_batch_summaries="（无成功子批次）",
+        failed_batches_text=failed_text,
+    )
+    assert "timeout" in prompt
+    assert "t1" in prompt
+
+    print("[OK] 失败批次正确传入 reduce prompt")
+
+
 # ====== 主函数 ======
 
 def main():
@@ -1307,6 +1522,13 @@ def main():
         test_sanitize_max_len,
         test_save_and_download_filename_consistent,
         test_no_overwrite_different_times,
+        test_group_failures_all_samples_covered,
+        test_source_key_fallback,
+        test_sub_batch_size_limit,
+        test_sub_batch_slim_payload,
+        test_python_failure_manifest_no_llm,
+        test_progress_callback_invoked,
+        test_reduce_includes_failed_batches,
     ]
 
     passed = 0

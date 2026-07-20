@@ -10,10 +10,6 @@
 """
 
 import sys
-import os
-
-# 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from judge import (
     TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE,

@@ -225,25 +225,17 @@ python main.py <input.jsonl> [--output PATH] [--summary PATH]
 
 ## 测试
 
+测试文件位于 `tests/` 目录，通过 `pytest.ini` 配置自动发现。
+
 ```bash
-python test_experiment.py            # 配置方案和运行记录基础测试
-python test_experiment_dashboard.py  # 运行看板测试
-python test_experiment_e2e.py        # 端到端测试（batch → raw → processed → judged）
-python test_experiment_e2e_v2.py     # 端到端测试 v2（batch trace_id 与 Langfuse trace_id 不同）
-python test_experiment_viz.py        # 可视化增强测试（图表、筛选、跨 run 隔离）
-python test_evaluation_tracks.py     # 评测轨道分类和指标计算测试
-python test_charts_and_details.py    # 图表 layout 和详情展示测试
-python test_question_mode.py         # 出题模式测试
-python test_question_set.py          # 题集管理测试
-python test_result_status.py         # 结果状态显示测试
-python test_config_overview.py       # 配置方案总览测试（加权汇总、去重、隔离）
-python test_history_selector.py      # 历史题集选择器测试（标签唯一性、选择绑定）
-python test_safe_edit.py             # 安全编辑测试（核心字段保护、快照审计）
-python test_chart_layout.py          # 图表 layout 单元测试（margin、title、height）
-python test_unified_config.py        # 统一配置 schema 测试（跨 Tab 一致性）
-python test_dify_connection.py       # Dify 连接配置测试（安全存储、CRUD、无泄露）
-python test_run_detail.py            # 运行看板评测详情测试（跨 run 隔离、trace_id 关联）
-python test_doc_parser.py            # 统一文档解析测试（.txt/.md/.docx/.xlsx、元数据、错误处理）
+# 运行全部测试
+python -m pytest
+
+# 运行单个测试文件
+python -m pytest tests/test_experiment.py
+
+# 运行并显示详细输出
+python -m pytest -v
 ```
 
 ## 输出格式
