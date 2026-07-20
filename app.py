@@ -104,6 +104,171 @@ def list_langfuse_export_files(raw_dir):
     return result
 
 
+# ─── 缓存函数（避免每次 rerun 重新扫描磁盘） ────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_question_set_index(cache_key=""):
+    """扫描 data/questions/ 目录，返回题集元数据列表（轻量级，不含题目内容）。
+
+    cache_key: 传入目录 mtime 或手动递增的值，用于控制缓存失效。
+    返回 list of dict，每个 dict 包含 Path-serializable 的元数据。
+    """
+    if not QUESTIONS_DIR.exists():
+        return []
+
+    results = []
+    for f in QUESTIONS_DIR.glob("*.jsonl"):
+        # 条件 A：有 manifest
+        manifest_path = f.parent / f"{f.stem}_manifest.json"
+        is_qs = manifest_path.exists()
+        # 条件 B：前3行含 question_set_id
+        if not is_qs:
+            try:
+                with f.open("r", encoding="utf-8") as fh:
+                    checked = 0
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        checked += 1
+                        if checked > 3:
+                            break
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("question_set_id"):
+                                is_qs = True
+                                break
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                pass
+        if not is_qs:
+            continue
+
+        # 检测文件信息（前20行）
+        info = {
+            "modes": {"retrieval": 0, "qa": 0, "unknown": 0},
+            "set_name": "", "set_id": "", "question_count": 0,
+            "has_set_info": False, "source_format": "", "source_file_name": "",
+        }
+        try:
+            with f.open("r", encoding="utf-8") as fh:
+                for i, line in enumerate(fh):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    info["question_count"] += 1
+                    if i >= 20:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        mode = obj.get("question_mode", "")
+                        if mode == "retrieval":
+                            info["modes"]["retrieval"] += 1
+                        elif mode == "qa":
+                            info["modes"]["qa"] += 1
+                        else:
+                            info["modes"]["unknown"] += 1
+                        if obj.get("question_set_name") and not info["set_name"]:
+                            info["set_name"] = obj["question_set_name"]
+                            info["set_id"] = obj.get("question_set_id", "")
+                            info["has_set_info"] = True
+                        if obj.get("source_format") and not info["source_format"]:
+                            info["source_format"] = obj["source_format"]
+                            info["source_file_name"] = obj.get("source_file_name", "")
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+
+        # created_at
+        created_at = None
+        if manifest_path.exists():
+            try:
+                m = json.loads(manifest_path.read_text(encoding="utf-8"))
+                ca = m.get("created_at")
+                if ca:
+                    created_at = ca  # ISO string
+            except Exception:
+                pass
+        if not created_at:
+            sid = info.get("set_id", "")
+            parts = sid.split("_", 3)
+            if len(parts) >= 3 and len(parts[1]) == 8:
+                created_at = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:8]}"
+
+        results.append({
+            "path": str(f),
+            "name": f.name,
+            "modes": info["modes"],
+            "set_name": info["set_name"],
+            "set_id": info["set_id"],
+            "question_count": info["question_count"],
+            "has_set_info": info["has_set_info"],
+            "source_format": info["source_format"],
+            "source_file_name": info["source_file_name"],
+            "created_at": created_at,
+        })
+
+    results.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return results
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _build_run_summary_index(cache_key=""):
+    """扫描 experiments 目录，返回所有 run 的轻量摘要（不含 config_snapshot）。
+
+    返回 list of dict: run_id, config_id, question_set_id, question_set_name,
+    status, question_count, started_at。
+    """
+    from experiment import EXPERIMENTS_DIR
+    if not EXPERIMENTS_DIR.exists():
+        return []
+
+    summaries = []
+    for run_dir in EXPERIMENTS_DIR.iterdir():
+        if not run_dir.is_dir():
+            continue
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            summaries.append({
+                "run_id": m.get("run_id", ""),
+                "config_id": m.get("config_id", ""),
+                "question_set_id": m.get("question_set_id", ""),
+                "question_set_name": m.get("question_set_name", ""),
+                "status": m.get("status", ""),
+                "question_count": m.get("question_count", 0),
+                "started_at": m.get("started_at", ""),
+            })
+        except (json.JSONDecodeError, IOError):
+            continue
+    return summaries
+
+
+def _get_questions_dir_mtime():
+    """获取 questions 目录的 mtime，用作缓存 key。"""
+    if not QUESTIONS_DIR.exists():
+        return ""
+    try:
+        return str(QUESTIONS_DIR.stat().st_mtime)
+    except Exception:
+        return ""
+
+
+def _get_experiments_dir_mtime():
+    """获取 experiments 目录的 mtime，用作缓存 key。"""
+    from experiment import EXPERIMENTS_DIR
+    if not EXPERIMENTS_DIR.exists():
+        return ""
+    try:
+        return str(EXPERIMENTS_DIR.stat().st_mtime)
+    except Exception:
+        return ""
+
+
 def _get_created_at(filepath, info):
     """获取题集的创建时间，优先级：manifest created_at > set_id 时间戳 > 文件名时间戳。
 
@@ -1617,162 +1782,73 @@ PISP和AISP的区别?
                 st.success(f"从文件加载了 {len(questions_list)} 个问题")
 
         elif q_source == "从历史记录加载":
-            # 只扫描 data/questions/，排除 batch 执行结果等非题集文件
-            def _is_question_set(filepath):
-                """判断文件是否为真正的 Question Set。
+            # 使用缓存的题集索引（避免每次 rerun 扫描磁盘）
+            _qs_index = _build_question_set_index(_get_questions_dir_mtime())
 
-                条件 A：存在 companion _manifest.json 文件
-                条件 B：文件前 3 行（非空）中任一行包含 question_set_id
-                """
-                # 条件 A：有 manifest
-                manifest_path = filepath.parent / f"{filepath.stem}_manifest.json"
-                if manifest_path.exists():
-                    return True
-                # 条件 B：内容中有 question_set_id
-                try:
-                    with filepath.open("r", encoding="utf-8") as f:
-                        checked = 0
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            checked += 1
-                            if checked > 3:
-                                break
-                            try:
-                                obj = json.loads(line)
-                                if obj.get("question_set_id"):
-                                    return True
-                            except json.JSONDecodeError:
-                                continue
-                except Exception:
-                    pass
-                return False
-
-            history_files = []
-            if QUESTIONS_DIR.exists():
-                for f in QUESTIONS_DIR.glob("*.jsonl"):
-                    if _is_question_set(f):
-                        history_files.append(f)
-
-            if not history_files:
+            if not _qs_index:
                 st.warning("暂无历史记录，请先在「题目生成」或「批量提问」中生成/保存过结果")
             else:
-                # 预读每个文件，检测 question_mode、question_set_name、题目数
-                def _detect_file_info(filepath):
-                    """读取文件前20行，检测模式、题集名称、题目数。"""
-                    info = {
-                        "modes": {MODE_RETRIEVAL: 0, MODE_QA: 0, "unknown": 0},
-                        "set_name": "",
-                        "set_id": "",
-                        "question_count": 0,
-                        "has_set_info": False,
-                        "source_format": "",
-                        "source_file_name": "",
-                    }
-                    try:
-                        with filepath.open("r", encoding="utf-8") as f:
-                            for i, line in enumerate(f):
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                info["question_count"] += 1
-                                if i >= 20:
-                                    continue
-                                try:
-                                    obj = json.loads(line)
-                                    mode = obj.get("question_mode", "")
-                                    if mode == MODE_RETRIEVAL:
-                                        info["modes"][MODE_RETRIEVAL] += 1
-                                    elif mode == MODE_QA:
-                                        info["modes"][MODE_QA] += 1
-                                    else:
-                                        info["modes"]["unknown"] += 1
-
-                                    # 获取题集信息
-                                    if obj.get("question_set_name") and not info["set_name"]:
-                                        info["set_name"] = obj["question_set_name"]
-                                        info["set_id"] = obj.get("question_set_id", "")
-                                        info["has_set_info"] = True
-                                    # 获取来源格式
-                                    if obj.get("source_format") and not info["source_format"]:
-                                        info["source_format"] = obj["source_format"]
-                                        info["source_file_name"] = obj.get("source_file_name", "")
-                                except json.JSONDecodeError:
-                                    continue
-                    except Exception:
-                        pass
-                    return info
-
-                # 为每个文件生成带模式标签和题集名称的显示名
+                # 构建显示标签
+                history_files = [Path(item["path"]) for item in _qs_index]
                 file_info_cache = {}
                 file_labels = []
-                for f in history_files:
-                    info = _detect_file_info(f)
-                    info["created_at"] = _get_created_at(f, info)
-                    file_info_cache[f] = info
-
-                # 按 created_at 降序排序，无时间记录排在最后
-                history_files.sort(
-                    key=lambda f: file_info_cache[f]["created_at"] or datetime.min,
-                    reverse=True,
-                )
-
-                for f in history_files:
-                    info = file_info_cache[f]
-                    modes = info["modes"]
+                for item in _qs_index:
+                    fp = Path(item["path"])
+                    modes = item["modes"]
                     total_sampled = sum(modes.values())
-                    q_count = info["question_count"]
+                    q_count = item["question_count"]
 
-                    # 生成模式标签
+                    # 模式标签
                     if total_sampled == 0:
                         mode_tag = "[空文件]"
-                    elif modes[MODE_RETRIEVAL] > 0 and modes[MODE_QA] > 0:
+                    elif modes["retrieval"] > 0 and modes["qa"] > 0:
                         mode_tag = "[混合]"
-                    elif modes[MODE_RETRIEVAL] > 0 and modes["unknown"] == 0:
+                    elif modes["retrieval"] > 0 and modes["unknown"] == 0:
                         mode_tag = "[检索评测]"
-                    elif modes[MODE_QA] > 0 and modes["unknown"] == 0:
+                    elif modes["qa"] > 0 and modes["unknown"] == 0:
                         mode_tag = "[全流程问答]"
-                    elif modes["unknown"] > 0 and modes[MODE_RETRIEVAL] == 0 and modes[MODE_QA] == 0:
+                    elif modes["unknown"] > 0 and modes["retrieval"] == 0 and modes["qa"] == 0:
                         mode_tag = "[旧版]"
-                    elif modes[MODE_RETRIEVAL] > 0:
+                    elif modes["retrieval"] > 0:
                         mode_tag = "[检索评测+旧版]"
-                    elif modes[MODE_QA] > 0:
+                    elif modes["qa"] > 0:
                         mode_tag = "[全流程问答+旧版]"
                     else:
                         mode_tag = "[旧版]"
 
-                    # 生成显示标签：优先题集名称，附带时间戳和 set_id 后缀确保唯一
-                    if info["has_set_info"] and info["set_name"]:
-                        # 从 set_id 提取时间戳用于区分同名题集
-                        # set_id 格式: qs_YYYYMMDD_HHMMSSffffff_slug
-                        _sid = info.get("set_id", "")
+                    if item["has_set_info"] and item["set_name"]:
+                        _sid = item.get("set_id", "")
                         _ts_display = ""
                         if _sid:
                             _parts = _sid.split("_", 3)
                             if len(_parts) >= 3:
-                                _date_part = _parts[1]  # YYYYMMDD
-                                _time_part = _parts[2]  # HHMMSSffffff
+                                _date_part = _parts[1]
+                                _time_part = _parts[2]
                                 if len(_date_part) == 8 and len(_time_part) >= 6:
                                     _ts_display = f"{_date_part[:4]}-{_date_part[4:6]}-{_date_part[6:8]} {_time_part[:2]}:{_time_part[2:4]}"
-                        # 用 set_id 时间戳微秒部分做短后缀，确保同名题集可区分
-                        # 取 HHMMSSffffff 中的后 8 位（含微秒）
-                        _sid_short = ""
-                        if _sid and len(_sid) > 20:
-                            _sid_short = f" · qs...{_sid[12:20]}"
+                        _sid_short = f" · qs...{_sid[12:20]}" if _sid and len(_sid) > 20 else ""
                         _ts_part = f" · {_ts_display}" if _ts_display else ""
                         _src_fmt = ""
-                        if info.get("source_format") == "xlsx":
-                            _src_fn = info.get("source_file_name", "")
-                            _src_fmt = f" · 来源: Excel"
-                            if _src_fn:
-                                _src_fmt += f"（{_src_fn}）"
-                        label = f"{mode_tag} {info['set_name']} · {q_count} 题{_ts_part}{_sid_short}{_src_fmt}"
+                        if item.get("source_format") == "xlsx":
+                            _src_fmt = " · 来源: Excel"
+                            if item.get("source_file_name"):
+                                _src_fmt += f"（{item['source_file_name']}）"
+                        label = f"{mode_tag} {item['set_name']} · {q_count} 题{_ts_part}{_sid_short}{_src_fmt}"
                     else:
-                        # 旧版文件，回退显示文件名
-                        label = f"{mode_tag} {f.stem} · {q_count} 题 [旧版题集]"
+                        label = f"{mode_tag} {fp.stem} · {q_count} 题 [旧版题集]"
 
                     file_labels.append(label)
+                    # 构建兼容旧代码的 file_info_cache（Path key）
+                    file_info_cache[fp] = {
+                        "modes": modes,
+                        "set_name": item["set_name"],
+                        "set_id": item["set_id"],
+                        "question_count": q_count,
+                        "has_set_info": item["has_set_info"],
+                        "source_format": item.get("source_format", ""),
+                        "source_file_name": item.get("source_file_name", ""),
+                        "created_at": item.get("created_at"),
+                    }
 
                 # 清理旧版单选 session_state
                 st.session_state.pop("batch_history_file", None)
@@ -1786,7 +1862,7 @@ PISP和AISP的区别?
                 )
 
                 def _load_questions_from_file(filepath):
-                    """从题集文件加载问题列表。"""
+                    """从题集文件加载问题列表（仅在选择后调用）。"""
                     qs = []
                     raw_lines = filepath.read_text(encoding="utf-8").strip().split("\n")
                     for line in raw_lines:
@@ -1826,11 +1902,11 @@ PISP和AISP的区别?
                     for i, ss in enumerate(selected_sets, 1):
                         info = ss["info"]
                         modes = info["modes"]
-                        if modes[MODE_RETRIEVAL] > 0 and modes[MODE_QA] > 0:
+                        if modes["retrieval"] > 0 and modes["qa"] > 0:
                             mode_tag = "混合"
-                        elif modes[MODE_RETRIEVAL] > 0:
+                        elif modes["retrieval"] > 0:
                             mode_tag = "检索评测"
-                        elif modes[MODE_QA] > 0:
+                        elif modes["qa"] > 0:
                             mode_tag = "全流程问答"
                         else:
                             mode_tag = "旧版"
@@ -2146,39 +2222,61 @@ PISP和AISP的区别?
     # --- Run batch query ---
     st.divider()
 
-    # 预解析 config_id（用于执行前预检）
-    _pre_config_source = st.session_state.get("batch_config_source", "新建配置方案")
-    _pre_config_id = ""
-    if _pre_config_source == "使用历史配置":
-        _pre_config_id = st.session_state.get("batch_selected_config", "")
-    else:
-        # 从 session_state 构建 fingerprint 来查找已有配置
-        _pre_form_vals = {}
-        for _key, _, _, _, _, _ in CONFIG_FIELD_SCHEMA:
-            _pre_form_vals[_key] = st.session_state.get(f"batch_new_{_key}", "")
-        _pre_name = str(_pre_form_vals.get("config_name", "")).strip()
-        if _pre_name:
-            _pre_clean = collect_config_updates(_pre_form_vals)
-            _pre_existing = list_config_profiles(include_archived=False)
-            _pre_fp = config_fingerprint(_pre_clean)
-            _pre_canonical = find_canonical_config(_pre_fp, _pre_existing)
-            if _pre_canonical:
-                _pre_config_id = _pre_canonical["config_id"]
-
-    # 执行前预检：查找已有 completed run
-    _existing_runs_by_qs = {}  # question_set_id -> run manifest
-    if _pre_config_id and q_source == "从历史记录加载" and 'selected_sets' in dir() and selected_sets:
-        from experiment import list_runs_by_config
-        _config_runs = list_runs_by_config(_pre_config_id)
-        for _run in _config_runs:
-            if _run.get("status") == "completed" and _run.get("question_set_id"):
-                _qs_id = _run["question_set_id"]
-                _existing_runs_by_qs[_qs_id] = _run
-
-    # 显示已有 run 信息和策略选择
-    _qs_skip_ids = set()
+    # 执行前预检（使用缓存的 run 摘要，通过显式按钮触发）
+    # 注意：config_id 解析延迟到按钮点击时，避免 multiselect/radio rerun 时
+    # 调用 list_config_profiles() 扫描磁盘
+    _existing_runs_by_qs = {}  # question_set_id -> run summary
     _qs_rerun_strategy = "skip"
 
+    # 仅在历史题集模式且有选中题集时显示预检按钮
+    _show_precheck = (
+        q_source == "从历史记录加载"
+        and 'selected_sets' in dir()
+        and len(selected_sets) > 0
+    )
+
+    if _show_precheck:
+        # 显式检查按钮（点击时才解析 config_id + 扫描 run 摘要）
+        if st.button("检查已完成运行", key="btn_check_existing_runs"):
+            # 解析 config_id（仅在按钮点击时执行）
+            _pre_config_source = st.session_state.get("batch_config_source", "新建配置方案")
+            _pre_config_id = ""
+            if _pre_config_source == "使用历史配置":
+                _pre_config_id = st.session_state.get("batch_selected_config", "")
+            else:
+                _pre_form_vals = {}
+                for _key, _, _, _, _, _ in CONFIG_FIELD_SCHEMA:
+                    _pre_form_vals[_key] = st.session_state.get(f"batch_new_{_key}", "")
+                _pre_name = str(_pre_form_vals.get("config_name", "")).strip()
+                if _pre_name:
+                    _pre_clean = collect_config_updates(_pre_form_vals)
+                    _pre_existing = list_config_profiles(include_archived=False)
+                    _pre_fp = config_fingerprint(_pre_clean)
+                    _pre_canonical = find_canonical_config(_pre_fp, _pre_existing)
+                    if _pre_canonical:
+                        _pre_config_id = _pre_canonical["config_id"]
+
+            if _pre_config_id:
+                # 强制刷新缓存后读取 run 摘要
+                _build_run_summary_index.clear()
+                _run_summaries = _build_run_summary_index(_get_experiments_dir_mtime())
+                _selected_qs_ids = {ss["info"].get("set_id", "") for ss in selected_sets}
+                for _rs in _run_summaries:
+                    if (_rs.get("config_id") == _pre_config_id
+                        and _rs.get("status") == "completed"
+                        and _rs.get("question_set_id")
+                        and _rs["question_set_id"] in _selected_qs_ids):
+                        _existing_runs_by_qs[_rs["question_set_id"]] = _rs
+
+                # 缓存到 session_state，避免下次 rerun 丢失
+                st.session_state["batch_existing_runs_by_qs"] = _existing_runs_by_qs
+            else:
+                st.session_state.pop("batch_existing_runs_by_qs", None)
+
+        # 从 session_state 恢复已检查的结果（不触发磁盘扫描）
+        _existing_runs_by_qs = st.session_state.get("batch_existing_runs_by_qs", {})
+
+    # 显示已有 run 信息和策略选择
     if _existing_runs_by_qs:
         st.markdown("#### 已有完成记录")
         st.caption("以下题集在当前配置下已有 completed run：")
@@ -2411,6 +2509,8 @@ PISP和AISP的区别?
 
                 # 最终汇总
                 global_progress.progress(1.0, text="全部执行完成")
+                _build_run_summary_index.clear()  # 执行完成后刷新缓存
+                st.session_state.pop("batch_existing_runs_by_qs", None)  # 清除旧预检结果
                 st.markdown("### 执行汇总")
 
                 _actual_executed = sum(r["count"] for r in completed_runs) + sum(r["count"] for r in failed_runs)
@@ -2486,6 +2586,8 @@ PISP和AISP的区别?
 
                     st.session_state["batch_results"] = batch_results
                     st.session_state["batch_run_id"] = run_id
+                    _build_run_summary_index.clear()  # 执行完成后刷新缓存
+                    st.session_state.pop("batch_existing_runs_by_qs", None)  # 清除旧预检结果
 
                     _success = sum(1 for r in batch_results if r["success"])
                     st.success(f"批量提问完成！成功 {_success} / {len(batch_results)} 条")

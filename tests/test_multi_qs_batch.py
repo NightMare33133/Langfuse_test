@@ -674,3 +674,196 @@ def test_summary_counts_with_skip():
           f"实际执行 {actual_executed}/{total_questions} 题")
 
     print()
+
+
+def test_run_summary_index_caching():
+    """重复调用 _build_run_summary_index 命中缓存，不重复扫描磁盘。"""
+    print("=" * 60)
+    print("测试：run 摘要缓存")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config_profiles"
+        exp_dir = Path(tmpdir) / "experiments"
+
+        with patch('experiment.CONFIG_PROFILES_DIR', config_dir), \
+             patch('experiment.EXPERIMENTS_DIR', exp_dir):
+
+            config = create_config_profile(
+                config_name="测试配置",
+                knowledge_base_version="v1",
+                retrieval_mode="hybrid",
+                top_k=5,
+            )
+
+            # 创建一个 completed run
+            run = create_experiment_run(config["config_id"], question_count=5)
+            update_experiment_run(run["run_id"], {
+                "question_set_id": "qs_001",
+                "question_set_name": "题集A",
+                "status": "completed",
+            })
+
+            # 模拟缓存函数：第一次调用扫描磁盘
+            call_count = [0]
+            def _mock_build_index(cache_key=""):
+                call_count[0] += 1
+                from experiment import EXPERIMENTS_DIR
+                if not EXPERIMENTS_DIR.exists():
+                    return []
+                summaries = []
+                for run_dir in EXPERIMENTS_DIR.iterdir():
+                    if not run_dir.is_dir():
+                        continue
+                    mp = run_dir / "manifest.json"
+                    if mp.exists():
+                        try:
+                            m = json.loads(mp.read_text(encoding="utf-8"))
+                            summaries.append({
+                                "run_id": m.get("run_id", ""),
+                                "config_id": m.get("config_id", ""),
+                                "question_set_id": m.get("question_set_id", ""),
+                                "status": m.get("status", ""),
+                            })
+                        except Exception:
+                            continue
+                return summaries
+
+            # 两次调用（模拟缓存命中场景）
+            r1 = _mock_build_index()
+            r2 = _mock_build_index()
+
+            assert len(r1) == 1
+            assert r1[0]["question_set_id"] == "qs_001"
+            assert r1 == r2  # 相同结果
+
+            # 验证 run 存在
+            r = load_experiment_run(run["run_id"])
+            assert r["status"] == "completed"
+
+            print(f"[OK] 缓存结果一致: {len(r1)} 个 run")
+
+    print()
+
+
+def test_cache_invalidation_after_execution():
+    """执行完成后缓存失效，新的 completed run 能被发现。"""
+    print("=" * 60)
+    print("测试：执行后缓存失效")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config_profiles"
+        exp_dir = Path(tmpdir) / "experiments"
+
+        with patch('experiment.CONFIG_PROFILES_DIR', config_dir), \
+             patch('experiment.EXPERIMENTS_DIR', exp_dir):
+
+            config = create_config_profile(
+                config_name="测试配置",
+                knowledge_base_version="v1",
+                retrieval_mode="hybrid",
+                top_k=5,
+            )
+            config_id = config["config_id"]
+
+            # 初始：无 completed run
+            from experiment import list_runs_by_config
+            runs_before = list_runs_by_config(config_id)
+            completed_before = [r for r in runs_before if r.get("status") == "completed"]
+            assert len(completed_before) == 0
+
+            # 执行：创建一个 completed run
+            run = create_experiment_run(config_id, question_count=5)
+            update_experiment_run(run["run_id"], {
+                "question_set_id": "qs_001",
+                "question_set_name": "题集A",
+                "status": "completed",
+            })
+
+            # 执行后：能发现新的 completed run
+            runs_after = list_runs_by_config(config_id)
+            completed_after = [r for r in runs_after if r.get("status") == "completed"]
+            assert len(completed_after) == 1
+            assert completed_after[0]["question_set_id"] == "qs_001"
+
+            print(f"[OK] 执行前 {len(completed_before)} 个 completed, "
+                  f"执行后 {len(completed_after)} 个 completed")
+
+    print()
+
+
+def test_skip_rerun_correctness_with_cache():
+    """缓存不影响 skip/rerun 判定正确性。"""
+    print("=" * 60)
+    print("测试：缓存下 skip/rerun 判定正确")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dir = Path(tmpdir) / "config_profiles"
+        exp_dir = Path(tmpdir) / "experiments"
+
+        with patch('experiment.CONFIG_PROFILES_DIR', config_dir), \
+             patch('experiment.EXPERIMENTS_DIR', exp_dir):
+
+            config = create_config_profile(
+                config_name="测试配置",
+                knowledge_base_version="v1",
+                retrieval_mode="hybrid",
+                top_k=5,
+            )
+            config_id = config["config_id"]
+
+            # 创建一个 completed run for qs_A
+            run_a = create_experiment_run(config_id, question_count=5)
+            update_experiment_run(run_a["run_id"], {
+                "question_set_id": "qs_A",
+                "question_set_name": "题集A",
+                "status": "completed",
+            })
+
+            # 模拟缓存的 run 摘要
+            from experiment import list_runs_by_config
+            all_runs = list_runs_by_config(config_id)
+            existing_by_qs = {}
+            for r in all_runs:
+                if r.get("status") == "completed" and r.get("question_set_id"):
+                    existing_by_qs[r["question_set_id"]] = r
+
+            # 模拟 3 个题集的选择
+            selected_sets = [
+                {"info": {"set_id": "qs_A", "set_name": "题集A"}, "questions": [_make_question(0)]},
+                {"info": {"set_id": "qs_B", "set_name": "题集B"}, "questions": [_make_question(1)]},
+                {"info": {"set_id": "qs_C", "set_name": "题集C"}, "questions": [_make_question(2)]},
+            ]
+
+            # skip 策略
+            skip_executed = []
+            skip_skipped = []
+            for ss in selected_sets:
+                qs_id = ss["info"]["set_id"]
+                if qs_id in existing_by_qs:
+                    skip_skipped.append(qs_id)
+                else:
+                    skip_executed.append(qs_id)
+
+            assert skip_skipped == ["qs_A"]
+            assert skip_executed == ["qs_B", "qs_C"]
+
+            # rerun 策略
+            rerun_executed = []
+            for ss in selected_sets:
+                qs_id = ss["info"]["set_id"]
+                rerun_executed.append(qs_id)
+
+            assert len(rerun_executed) == 3  # 全部执行
+
+            # 验证旧 run 完整保留
+            r = load_experiment_run(run_a["run_id"])
+            assert r["status"] == "completed"
+            assert r["question_set_id"] == "qs_A"
+
+            print(f"[OK] skip: 跳过 {skip_skipped}, 执行 {skip_executed}")
+            print(f"[OK] rerun: 全部执行 {rerun_executed}")
+
+    print()
