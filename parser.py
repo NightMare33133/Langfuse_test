@@ -268,11 +268,34 @@ def build_trace_sample(trace_id, observations):
 
 
 
-def load_jsonl(path):
+def load_jsonl(path, progress_callback=None):
+    """Load a Langfuse JSONL export file, grouping observations by traceId.
+
+    Args:
+        path: Path to the JSONL file.
+        progress_callback: Optional callable(phase, lines_read, total_lines,
+            traces_found, retrieval_count). Called every 100 lines during
+            reading. Phases: "counting", "reading".
+
+    Returns:
+        (traces, bad_lines) where traces is a dict of traceId -> list of
+        normalized observation rows.
+    """
+    path = Path(path)
     traces = defaultdict(list)
     bad_lines = []
+    retrieval_count = 0
 
-    with Path(path).open("r", encoding="utf-8") as f:
+    # Phase 1: lightweight line count for progress bar denominator
+    total_lines = 0
+    if progress_callback:
+        with path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                total_lines += 1
+        progress_callback("counting", 0, total_lines, 0, 0)
+
+    # Phase 2: parse line by line
+    with path.open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -287,6 +310,19 @@ def load_jsonl(path):
                 bad_lines.append({"line": idx, "error": "missing traceId"})
                 continue
             traces[trace_id].append(normalize_observation_row(row))
+            # rough retrieval count for progress display
+            normalized = traces[trace_id][-1]
+            output = normalized.get("output") or {}
+            if isinstance(output, dict) and output.get("result"):
+                if isinstance(output["result"], list):
+                    retrieval_count += len(output["result"])
+            # callback every 100 lines
+            if progress_callback and idx % 100 == 0:
+                progress_callback("reading", idx, total_lines, len(traces), retrieval_count)
+
+    # final callback
+    if progress_callback:
+        progress_callback("reading", total_lines, total_lines, len(traces), retrieval_count)
 
     return traces, bad_lines
 
@@ -453,24 +489,53 @@ def backfill_reference_answers(samples, questions_dir=None):
     return samples, stats
 
 
-def parse_langfuse_jsonl(input_path):
-    """Parse a Langfuse JSONL export file and return samples + summary."""
+def parse_langfuse_jsonl(input_path, progress_callback=None):
+    """Parse a Langfuse JSONL export file and return samples + summary.
+
+    Args:
+        input_path: Path to the JSONL file.
+        progress_callback: Optional callable(phase, current, total,
+            traces_found, retrieval_count). Phases: "counting", "reading",
+            "building", "backfilling", "saving".
+
+    Returns:
+        (samples, summary) — same structure as before; callback is purely
+        optional and does not affect return values.
+    """
     input_path = Path(input_path)
-    traces, bad_lines = load_jsonl(input_path)
-    samples = [build_trace_sample(trace_id, obs) for trace_id, obs in traces.items()]
+    traces, bad_lines = load_jsonl(input_path, progress_callback)
+
+    # Phase 3: build structured samples from grouped observations
+    # Convert to list of items then release traces dict to halve peak memory
+    trace_items = list(traces.items())
+    num_traces = len(trace_items)
+    del traces
+
+    samples = []
+    for i, (trace_id, obs) in enumerate(trace_items):
+        samples.append(build_trace_sample(trace_id, obs))
+        if progress_callback and (i + 1) % 50 == 0:
+            progress_callback("building", i + 1, num_traces, num_traces, 0)
+    del trace_items
+    if progress_callback:
+        progress_callback("building", num_traces, num_traces, num_traces, 0)
+
     samples.sort(key=lambda x: (x.get("question") or "", x["trace_id"]))
 
-    # 回填 reference_answer
+    # Phase 4: backfill reference answers
+    if progress_callback:
+        progress_callback("backfilling", 0, 0, num_traces, 0)
     samples, backfill_stats = backfill_reference_answers(samples)
+    if progress_callback:
+        progress_callback("backfilling", 1, 1, num_traces, 0)
 
+    retrieval_total = sum(len(s.get("retrieval_results", [])) for s in samples)
     summary = {
         "input_file": str(input_path),
         "trace_count": len(samples),
         "bad_line_count": len(bad_lines),
         "bad_lines": bad_lines[:20],
-        "total_retrieval_results": sum(
-            len(s.get("retrieval_results", [])) for s in samples
-        ),
+        "total_retrieval_results": retrieval_total,
         "backfill_stats": backfill_stats,
     }
 

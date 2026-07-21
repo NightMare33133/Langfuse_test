@@ -5,6 +5,9 @@ import json
 import io
 import os
 import re
+import time
+
+import psutil
 
 import pandas as pd
 import plotly.express as px
@@ -267,6 +270,55 @@ def _get_experiments_dir_mtime():
         return str(EXPERIMENTS_DIR.stat().st_mtime)
     except Exception:
         return ""
+
+
+# ─── RSS 内存采样 ────────────────────────────────────────────────────────────
+
+def _get_rss_mb():
+    """返回当前进程 RSS（MB）。"""
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+
+def _record_rss(stage):
+    """记录当前 RSS 到 session_state，用于内存用量分析。"""
+    if "_rss_log" not in st.session_state:
+        st.session_state["_rss_log"] = []
+    st.session_state["_rss_log"].append({
+        "stage": stage,
+        "rss_mb": round(_get_rss_mb(), 1),
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
+
+
+# ─── 缓存加载 ──────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=120, max_entries=2, show_spinner=False)
+def _load_sample_lookup(cache_key=""):
+    """加载 processed samples 为 {trace_id: sample} 查找表（不含 observations）。
+
+    缓存 120 秒、最多 2 个条目，避免实验看板切换 run 时累积占用。
+    cache_key 应包含 proc_mtime 以在文件更新后自动失效。
+    """
+    lookup = {}
+    proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+    if not proc_path.exists():
+        return lookup
+    try:
+        with proc_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    obj.pop("observations", None)
+                    tid = obj.get("trace_id")
+                    if tid:
+                        lookup[tid] = obj
+                except json.JSONDecodeError:
+                    continue
+    except IOError:
+        pass
+    return lookup
 
 
 def _get_created_at(filepath, info):
@@ -839,7 +891,7 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
 
     from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
 
-    # 筛选控件
+    # ── 筛选控件 ──
     filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
         track_options = ["全部"]
@@ -853,14 +905,14 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         filter_track = st.selectbox("按评测轨道筛选", track_options, key=f"{key_prefix}_track")
     with filter_col2:
         filter_status = st.selectbox(
-            "按结果状态筛选", ["全部", "命中/正确", "未命中/错误", "错误"],
+            "按结果状态筛选",
+            ["全部", "命中/正确", "未命中/错误", "Top1 未命中", "Top3 未命中", "Top5 未命中", "错误"],
             key=f"{key_prefix}_status",
         )
     with filter_col3:
-        st.markdown("")
-        st.markdown("")
+        filter_keyword = st.text_input("搜索题目关键字", "", key=f"{key_prefix}_kw")
 
-    # 应用筛选
+    # ── 应用筛选 ──
     filtered = list(results)
     if filter_track != "全部":
         filtered = [r for r in filtered if r.get("evaluation_track") == filter_track]
@@ -870,8 +922,23 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
     elif filter_status == "未命中/错误":
         filtered = [r for r in filtered if "error" not in r and (
             not r.get("retrieval_top1_hit") and not r.get("answer_correct"))]
+    elif filter_status == "Top1 未命中":
+        filtered = [r for r in filtered if "error" not in r
+                    and r.get("evaluation_track") == TRACK_RETRIEVAL
+                    and not r.get("retrieval_top1_hit")]
+    elif filter_status == "Top3 未命中":
+        filtered = [r for r in filtered if "error" not in r
+                    and r.get("evaluation_track") == TRACK_RETRIEVAL
+                    and not r.get("retrieval_top3_hit")]
+    elif filter_status == "Top5 未命中":
+        filtered = [r for r in filtered if "error" not in r
+                    and r.get("evaluation_track") == TRACK_RETRIEVAL
+                    and not r.get("retrieval_top5_hit")]
     elif filter_status == "错误":
         filtered = [r for r in filtered if "error" in r]
+    if filter_keyword:
+        _kw = filter_keyword.lower()
+        filtered = [r for r in filtered if _kw in (r.get("question") or "").lower()]
 
     st.caption(f"筛选后 {len(filtered)} 条结果（共 {len(results)} 条）")
 
@@ -879,7 +946,7 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         st.info("无匹配的评测结果")
         return
 
-    # 分页
+    # ── 分页 ──
     total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
     if total_pages > 1:
         page_col1, page_col2, _ = st.columns([1, 1, 4])
@@ -895,7 +962,7 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
     else:
         page_results = filtered
 
-    # 渲染每条详情
+    # ── 渲染当前页 ──
     for r in page_results:
         tid = r.get("trace_id", "")
         sample = sample_map.get(tid, {})
@@ -926,18 +993,35 @@ st.sidebar.divider()
 st.sidebar.markdown("**运行看板** — 按配置方案查看累计结果、运行历史和单次运行详情")
 st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有独立配置面板和详细说明。")
 
+# --- 内存用量显示 ---
+_rss_log = st.session_state.get("_rss_log", [])
+if _rss_log:
+    with st.sidebar.expander("内存用量 (RSS)", expanded=False):
+        for entry in _rss_log:
+            st.caption(f"{entry['ts']} | {entry['stage']} | {entry['rss_mb']:.0f} MB")
+        _delta = _rss_log[-1]["rss_mb"] - _rss_log[0]["rss_mb"]
+        st.caption(f"累计变化: {_delta:+.0f} MB")
+
 # Load existing samples if available
 if "samples" not in st.session_state:
     samples_file = PROCESSED_DIR / "langfuse_samples.jsonl"
     summary_file = PROCESSED_DIR / "langfuse_summary.json"
     if samples_file.exists():
         with open(samples_file, "r", encoding="utf-8") as f:
-            st.session_state["samples"] = [json.loads(line) for line in f if line.strip()]
+            _loaded = [json.loads(line) for line in f if line.strip()]
+        for _s in _loaded:
+            _s.pop("observations", None)
+        st.session_state["samples"] = _loaded
     if summary_file.exists():
         st.session_state["summary"] = json.loads(summary_file.read_text(encoding="utf-8"))
 
 samples = st.session_state.get("samples")
 summary = st.session_state.get("summary") or {}
+
+# 记录初始 RSS
+if "_rss_init" not in st.session_state:
+    _record_rss("初始加载")
+    st.session_state["_rss_init"] = True
 
 # --- Tabs ---
 tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板"])
@@ -2706,6 +2790,7 @@ PISP和AISP的区别?
 
 # ========== Tab: 样本准备 ==========
 with tab_samples:
+    _record_rss("样本准备页")
     st.subheader("样本准备")
     st.caption("导入 Langfuse 导出数据，解析并准备评测样本")
 
@@ -2869,28 +2954,90 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 line_count = sum(1 for _ in f)
             st.caption(f"文件大小: {file_size_kb:.1f} KB | 总行数: {line_count}")
 
-            if st.button("开始解析", type="primary", key="parse_btn"):
-                with st.spinner("正在解析..."):
-                    samples, summary = parse_langfuse_jsonl(selected_path)
+            if st.button(
+                "开始解析", type="primary", key="parse_btn",
+                disabled=st.session_state.get("_parsing", False),
+            ):
+                st.session_state["_parsing"] = True
+                parse_status = st.status("正在解析 Langfuse 导出文件...", expanded=True)
+                progress_bar = st.progress(0, text="准备中...")
+                detail_text = st.empty()
+                t0 = time.time()
+
+                try:
+                    def _on_progress(phase, current, total, traces, retrieval):
+                        if phase == "counting":
+                            progress_bar.progress(0, text="正在统计行数...")
+                            detail_text.caption("正在预扫描文件...")
+                        elif phase == "reading" and total > 0:
+                            pct = min(current / total, 1.0)
+                            progress_bar.progress(pct, text=f"正在读取 JSONL: {current}/{total}")
+                            detail_text.caption(f"已识别 trace: {traces} | retrieval: {retrieval}")
+                        elif phase == "building":
+                            if total > 0:
+                                pct = min(current / total, 1.0)
+                                progress_bar.progress(pct, text=f"正在构建样本: {current}/{total}")
+                            detail_text.caption(f"已识别 trace: {traces}")
+                        elif phase == "backfilling":
+                            progress_bar.progress(0.95, text="正在回填参考答案...")
+                        elif phase == "saving":
+                            progress_bar.progress(0.99, text="正在写入文件...")
+
+                    samples, summary = parse_langfuse_jsonl(
+                        selected_path, progress_callback=_on_progress,
+                    )
+
+                    _on_progress("saving", 0, 0, 0, 0)
                     output_path = PROCESSED_DIR / "langfuse_samples.jsonl"
                     summary_path = PROCESSED_DIR / "langfuse_summary.json"
+                    if output_path.exists():
+                        st.info(f"将覆盖已有解析结果：`{output_path.name}`")
                     full_summary = save_results(samples, summary, output_path, summary_path)
+                    # Strip observations from memory (61% of data) — already saved to disk
+                    for _s in samples:
+                        _s.pop("observations", None)
                     st.session_state["samples"] = samples
                     st.session_state["summary"] = full_summary
-                st.success(f"解析完成，共 {len(samples)} 条 trace")
-                # 回填结果提示
-                bs = summary.get("backfill_stats") or {}
-                if bs:
+
+                    elapsed = time.time() - t0
+                    progress_bar.progress(1.0, text="解析完成")
+                    parse_status.update(label="解析完成", state="complete", expanded=False)
+                    _record_rss("JSONL 解析完成")
+
+                    # success feedback
+                    bs = summary.get("backfill_stats") or {}
                     bf = bs.get("backfilled", 0)
                     already = bs.get("already_has", 0)
-                    no_ref = bs["total"] - bf - already
+                    bad = summary.get("bad_line_count", 0)
+                    st.success(
+                        f"解析完成：**{len(samples)}** 条 Trace | "
+                        f"**{summary.get('total_retrieval_results', 0)}** 条 retrieval 结果 | "
+                        f"耗时 {elapsed:.1f}s"
+                    )
                     if bf > 0:
-                        st.success(f"参考答案回填：**{bf}** 条样本匹配到题目库，已回填 reference_answer")
+                        st.success(f"参考答案回填：**{bf}** 条匹配到题目库")
                     if already > 0:
                         st.info(f"**{already}** 条样本本身已带参考答案")
+                    no_ref = bs.get("total", 0) - bf - already
                     if no_ref > 0:
-                        st.warning(f"**{no_ref}** 条样本未匹配到题目库，将走无参考答案评测")
-                st.rerun()
+                        st.warning(f"**{no_ref}** 条样本未匹配到题目库")
+                    if bad > 0:
+                        bad_reasons = summary.get("bad_lines", [])
+                        reason_summary = "; ".join(
+                            f"行 {b['line']}: {b['error'][:40]}" for b in bad_reasons[:5]
+                        )
+                        suffix = "..." if len(bad_reasons) > 5 else ""
+                        st.warning(f"跳过 {bad} 行（原因：{reason_summary}{suffix}）")
+
+                    st.rerun()
+
+                except Exception as e:
+                    parse_status.update(label="解析失败", state="error")
+                    st.error(f"解析失败: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                finally:
+                    st.session_state["_parsing"] = False
 
     # --- Sample display section ---
     if not samples:
@@ -2921,7 +3068,23 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
         if search:
             filtered = [s for s in samples if search.lower() in (s.get("question") or "").lower()]
 
-        for i, sample in enumerate(filtered):
+        # Pagination
+        _SAMPLE_PAGE_SIZE = 20
+        _total_pages = max(1, (len(filtered) + _SAMPLE_PAGE_SIZE - 1) // _SAMPLE_PAGE_SIZE)
+        if _total_pages > 1:
+            _pg_col1, _pg_col2, _ = st.columns([1, 1, 4])
+            with _pg_col1:
+                _page_num = st.number_input(
+                    "页码", min_value=1, max_value=_total_pages, value=1, key="sample_page",
+                )
+            with _pg_col2:
+                st.caption(f"共 {_total_pages} 页（{len(filtered)} 条样本）")
+            _start = (_page_num - 1) * _SAMPLE_PAGE_SIZE
+            page_items = filtered[_start:_start + _SAMPLE_PAGE_SIZE]
+        else:
+            page_items = filtered
+
+        for i, sample in enumerate(page_items):
             question = sample.get("question") or "(无问题)"
             retrieval_count = len(sample.get("retrieval_results", []))
 
@@ -2949,14 +3112,22 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 st.markdown("**LLM Input**")
                 llm_input = sample.get("llm_input")
                 if llm_input:
-                    st.json(llm_input)
+                    _input_str = json.dumps(llm_input, ensure_ascii=False)
+                    if len(_input_str) > 2000:
+                        st.code(_input_str[:2000] + "\n... (已截断，共 " + str(len(_input_str)) + " 字符)", language="json")
+                    else:
+                        st.json(llm_input)
                 else:
                     st.caption("(无)")
 
                 st.markdown("**LLM Output**")
                 llm_output = sample.get("llm_output")
                 if llm_output:
-                    st.json(llm_output)
+                    _output_str = json.dumps(llm_output, ensure_ascii=False)
+                    if len(_output_str) > 2000:
+                        st.code(_output_str[:2000] + "\n... (已截断，共 " + str(len(_output_str)) + " 字符)", language="json")
+                    else:
+                        st.json(llm_output)
                 else:
                     st.caption("(无)")
 
@@ -2994,7 +3165,6 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     "session_id": sample.get("session_id"),
                     "user_id": sample.get("user_id"),
                     "workflow_run_id": sample.get("workflow_run_id"),
-                    "observation_count": len(sample.get("observations", [])),
                 })
 
 
@@ -4281,12 +4451,26 @@ Judge 有三层减少重复调用的机制：
                     else:
                         st.info("无有效评测数据")
 
-                st.markdown("**每题检索命中情况**")
-                pq_fig = build_per_question_chart(view_valid) if view_valid else None
-                if pq_fig:
-                    st.plotly_chart(pq_fig, use_container_width=True)
-                else:
-                    st.info("无有效评测数据")
+                # 命中分布摘要表（替代逐题柱状图，避免巨大图表）
+                if view_valid:
+                    st.markdown("**命中分布摘要**")
+                    _retrieval_v = [r for r in view_valid if r.get("evaluation_track") == TRACK_RETRIEVAL]
+                    if _retrieval_v:
+                        _t1h = sum(1 for r in _retrieval_v if r.get("retrieval_top1_hit"))
+                        _t3h = sum(1 for r in _retrieval_v if r.get("retrieval_top3_hit"))
+                        _t5h = sum(1 for r in _retrieval_v if r.get("retrieval_top5_hit"))
+                        _n = len(_retrieval_v)
+                        _dist = pd.DataFrame([
+                            {"指标": "Top1 命中", "数量": _t1h, "占比": f"{_t1h/_n:.0%}"},
+                            {"指标": "Top3 命中", "数量": _t3h, "占比": f"{_t3h/_n:.0%}"},
+                            {"指标": "Top5 命中", "数量": _t5h, "占比": f"{_t5h/_n:.0%}"},
+                        ])
+                        st.dataframe(_dist, use_container_width=True, hide_index=True)
+                    _qa_v = [r for r in view_valid if r.get("evaluation_track") in (TRACK_STRICT_QA, TRACK_GROUNDED_QA)]
+                    if _qa_v:
+                        _qa_ok = sum(1 for r in _qa_v if r.get("answer_correct"))
+                        _qa_n = len(_qa_v)
+                        st.caption(f"QA 回答正确: {_qa_ok}/{_qa_n} ({_qa_ok/_qa_n:.0%})")
 
                 # Top1 未命中案例
                 top1_miss = [r for r in view_valid if not r.get("retrieval_top1_hit")]
@@ -4345,48 +4529,12 @@ Judge 有三层减少重复调用的机制：
                             st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
                             st.caption(f"trace_id: `{_tid}`")
 
-                # 评测详情卡
+                # 评测详情卡（复用分页渲染函数）
                 st.subheader("评测详情")
                 if not view_all:
                     st.info("当前视图下无评测样本")
-                for _idx, r in enumerate(view_all):
-                    _tid = r.get("trace_id", "")
-                    _sample = _sample_map.get(_tid, {})
-                    _q = r.get("question", "(无问题)")
-                    _has_ref = r.get("has_reference", False)
-                    _mtag = "严格" if _has_ref else "合理性"
-                    _ans_ok = r.get("answer_correct")
-                    _t1 = r.get("retrieval_top1_hit")
-                    _t3 = r.get("retrieval_top3_hit")
-                    _t5 = r.get("retrieval_top5_hit")
-                    _status = "✅" if _ans_ok else "❌"
-                    _rs = f"T1:{'✓' if _t1 else '✗'} T3:{'✓' if _t3 else '✗'} T5:{'✓' if _t5 else '✗'}"
-
-                    with st.expander(f"{_status} {_q[:55]}{'...' if len(_q) > 55 else ''}  [{_mtag}] {_rs}"):
-                        st.markdown(f"**检索命中**: Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
-                        if _t1:
-                            st.caption("Top1 检索结果包含回答问题所需的关键信息")
-                        elif _t3:
-                            st.caption("Top1 未命中，但 Top3 内命中 — 正确结果排在第 2~3 位，排序可能有优化空间")
-                        elif _t5:
-                            st.caption("Top3 未命中，但 Top5 内命中 — 正确结果排在第 4~5 位，召回但排序较差")
-                        else:
-                            st.caption("Top5 全未命中 — 检索未召回正确内容，需检查检索策略")
-                        st.markdown("---")
-                        _final = _sample.get("final_answer") or "(无)"
-                        st.markdown("**最终回答**")
-                        st.code(_final[:1500], language=None)
-                        if _has_ref:
-                            _ref = (_sample.get("reference_answer") or "").strip()
-                            if _ref:
-                                st.markdown("**参考答案**")
-                                st.code(_ref[:1500], language=None)
-                            _excerpt = (_sample.get("source_excerpt") or "").strip()
-                            if _excerpt:
-                                with st.expander("来源摘录"):
-                                    st.text(_excerpt[:1000])
-                        st.markdown(f"**Judge 原因**: {r.get('reason', '(无)')}")
-                        st.caption(f"trace_id: `{_tid}` | 评测模式: {_mtag}评测 | answer_correct: {_ans_ok}")
+                else:
+                    render_judge_results_list(view_all, _sample_map, key_prefix="jd_detail")
 
             # ---------- 根据视图过滤数据 ----------
             def _filter_by_view(results, mode):
@@ -4427,7 +4575,7 @@ Judge 有三层减少重复调用的机制：
                         _sv = _filter_by_track(valid_results, TRACK_RETRIEVAL)
                         _sa = _filter_by_track(judge_results, TRACK_RETRIEVAL)
 
-                        # 可视化图表：只显示 Top1/Top3/Top5，不显示 Answer Correct
+                        # 可视化图表：Top1/Top3/Top5 命中率 + 命中/未命中分布
                         chart_col1, chart_col2 = st.columns(2)
                         with chart_col1:
                             st.markdown("**检索命中率（核心指标）**")
@@ -4438,19 +4586,29 @@ Judge 有三层减少重复调用的机制：
                             }
                             st.plotly_chart(build_retrieval_bar_chart(_ret_metrics), use_container_width=True)
                         with chart_col2:
-                            st.markdown("**每题检索命中情况**")
-                            pq_fig = build_retrieval_per_question_chart(_sv) if _sv else None
-                            if pq_fig:
-                                st.plotly_chart(pq_fig, use_container_width=True)
+                            st.markdown("**命中分布**")
+                            if _sv:
+                                _t1_hit = sum(1 for r in _sv if r.get("retrieval_top1_hit"))
+                                _t1_miss = len(_sv) - _t1_hit
+                                _t3_hit = sum(1 for r in _sv if r.get("retrieval_top3_hit"))
+                                _t3_miss = len(_sv) - _t3_hit
+                                _t5_hit = sum(1 for r in _sv if r.get("retrieval_top5_hit"))
+                                _t5_miss = len(_sv) - _t5_hit
+                                _dist_df = pd.DataFrame([
+                                    {"指标": "Top1", "命中": _t1_hit, "未命中": _t1_miss},
+                                    {"指标": "Top3", "命中": _t3_hit, "未命中": _t3_miss},
+                                    {"指标": "Top5", "命中": _t5_hit, "未命中": _t5_miss},
+                                ])
+                                st.dataframe(_dist_df, use_container_width=True, hide_index=True)
                             else:
                                 st.info("无有效评测数据")
 
-                        # 检索评测详情
+                        # 检索评测详情（复用共享分页渲染器）
+                        st.markdown("---")
                         st.markdown("##### 检索评测详情")
-                        for r in _sa:
-                            _tid = r.get("trace_id", "")
-                            _sample = _sample_map.get(_tid, {})
-                            render_retrieval_result_detail(r, _sample, f"judge_ret_{_tid[:8]}")
+                        render_judge_results_list(
+                            _sa, _sample_map, key_prefix="judge_ret", page_size=20,
+                        )
                     tab_idx += 1
 
                 # 严格问答详情
@@ -4579,6 +4737,7 @@ Judge 有三层减少重复调用的机制：
 
 # ========== Tab: 运行看板 ==========
 with tab_experiment:
+    _record_rss("实验看板页")
     st.subheader("配置与运行看板")
     st.caption("按评测配置查看累计结果、运行历史和单次运行详情。")
 
@@ -4833,6 +4992,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 raw_dir=str(RAW_DIR),
                 processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
                 judged_file=str(JUDGED_FILE),
+                include_judge_results=True,
             )
             _all_run_statuses.append(rs)
             _total_questions += run.get("question_count", 0)
@@ -5068,25 +5228,10 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             _m = compute_metrics(_jr) if _jr else {}
             _run_data_list.append({"run": _run, "run_status": _rs, "metrics": _m})
 
-        # 构建 processed sample lookup（trace_id -> sample）
-        _sample_lookup = {}
-        _processed_path = PROCESSED_DIR / "langfuse_samples.jsonl"
-        if _processed_path.exists():
-            try:
-                with _processed_path.open("r", encoding="utf-8") as _f:
-                    for _line in _f:
-                        _line = _line.strip()
-                        if not _line:
-                            continue
-                        try:
-                            _obj = json.loads(_line)
-                            _tid = _obj.get("trace_id")
-                            if _tid:
-                                _sample_lookup[_tid] = _obj
-                        except json.JSONDecodeError:
-                            continue
-            except Exception:
-                pass
+        # 构建 processed sample lookup（trace_id -> sample，缓存）
+        _proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+        _proc_mtime = str(_proc_path.stat().st_mtime) if _proc_path.exists() else ""
+        _sample_lookup = _load_sample_lookup(_proc_mtime)
 
         _export_scope = f"配置 {selected_config.get('config_name', '')}，{len(config_runs)} 次运行"
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -5287,6 +5432,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 raw_dir=str(RAW_DIR),
                 processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
                 judged_file=str(JUDGED_FILE),
+                include_judge_results=False,
             )
             run_table.append({
                 "运行 ID": run.get("run_id", ""),
@@ -5301,17 +5447,55 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
 
         st.dataframe(run_table, use_container_width=True)
 
-        # 运行详情和状态看板
-        for run in config_runs:
-            run_id = run.get("run_id", "")
+        # ---------- 运行详情（按需加载单个 run） ----------
+        _run_options = {run.get("run_id", ""): run for run in config_runs}
+        _run_ids = list(_run_options.keys())
 
-            # 获取真实状态
+        # 构建 selectbox 选项：run_id | 题集 | Judge 数
+        _run_labels = []
+        for _rid in _run_ids:
+            _r = _run_options[_rid]
+            _rs = get_run_status(
+                _rid,
+                batch_dir=str(BATCH_DIR),
+                raw_dir=str(RAW_DIR),
+                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                judged_file=str(JUDGED_FILE),
+                include_judge_results=False,
+            )
+            _qs = _rs.get("question_set_name") or _r.get("question_set_name", "") or "旧版题集"
+            _jc = _rs.get("judge_count", 0)
+            _run_labels.append(f"{_rid} | {_qs} | Judge:{_jc}")
+
+        # 使用 session_state 保持选择
+        _detail_key = f"_selected_detail_run_{selected_config.get('config_id', '')}"
+        _prev_sel = st.session_state.get(_detail_key, "")
+
+        _sel_idx = 0
+        if _prev_sel and _prev_sel in _run_ids:
+            _sel_idx = _run_ids.index(_prev_sel)
+
+        _sel_label = st.selectbox(
+            "选择运行查看题目明细",
+            _run_labels,
+            index=_sel_idx,
+            key=f"_run_detail_select_{selected_config.get('config_id', '')}",
+        )
+        _sel_run_id = _run_ids[_run_labels.index(_sel_label)] if _sel_label else ""
+        st.session_state[_detail_key] = _sel_run_id
+
+        if _sel_run_id:
+            run = _run_options[_sel_run_id]
+            run_id = _sel_run_id
+
+            # 按需加载该 run 的完整状态（含 judge_results）
             run_status = get_run_status(
                 run_id,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
                 processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
                 judged_file=str(JUDGED_FILE),
+                include_judge_results=True,
             )
 
             q_set_name = run_status.get("question_set_name") or run.get("question_set_name", "") or "旧版题集"
@@ -5330,7 +5514,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             else:
                 status_icon = "❌"
 
-            with st.expander(f"{status_icon} {run_id} | 题集: {q_set_name}", expanded=False):
+            with st.expander(f"{status_icon} {run_id} | 题集: {q_set_name}", expanded=True):
                 # 基本信息
                 info_col1, info_col2 = st.columns(2)
                 with info_col1:
@@ -5485,29 +5669,21 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         valid_viz = [r for r in judge_results_viz if "error" not in r]
                         error_viz = [r for r in judge_results_viz if "error" in r]
 
-                        # 加载当前 run 的 processed samples 构建 sample_map
+                        # 加载当前 run 的 processed samples 构建 sample_map（从缓存过滤）
+                        _rp = PROCESSED_DIR / "langfuse_samples.jsonl"
+                        _proc_mtime_local = str(_rp.stat().st_mtime) if _rp.exists() else ""
+                        _all_lookup = _load_sample_lookup(_proc_mtime_local)
                         _run_sample_map = {}
-                        _proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
-                        if _proc_path.exists():
-                            try:
-                                with _proc_path.open("r", encoding="utf-8") as _pf:
-                                    for _pline in _pf:
-                                        if not _pline.strip():
-                                            continue
-                                        _pobj = json.loads(_pline)
-                                        _p_run_id = _pobj.get("run_id", "")
-                                        if not _p_run_id:
-                                            _p_uid = _pobj.get("user_id", "")
-                                            if _p_uid.startswith("rag_eval:"):
-                                                _p_parts = _p_uid.split(":", 2)
-                                                if len(_p_parts) == 3:
-                                                    _p_run_id = _p_parts[1]
-                                        if _p_run_id == run_id:
-                                            _ptid = _pobj.get("trace_id", "")
-                                            if _ptid:
-                                                _run_sample_map[_ptid] = _pobj
-                            except (json.JSONDecodeError, IOError):
-                                pass
+                        for _tid, _pobj in _all_lookup.items():
+                            _p_run_id = _pobj.get("run_id", "")
+                            if not _p_run_id:
+                                _p_uid = _pobj.get("user_id", "")
+                                if _p_uid.startswith("rag_eval:"):
+                                    _p_parts = _p_uid.split(":", 2)
+                                    if len(_p_parts) == 3:
+                                        _p_run_id = _p_parts[1]
+                            if _p_run_id == run_id:
+                                _run_sample_map[_tid] = _pobj
 
                         st.markdown("---")
                         st.markdown("##### 评测结果可视化")
@@ -5530,11 +5706,16 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 }
                                 st.plotly_chart(build_retrieval_bar_chart(_ret_m), use_container_width=True, key=f"exp_ret_bar_{run_id}")
                             with ret_chart_col2:
-                                pq_fig = build_retrieval_per_question_chart(retrieval_viz)
-                                if pq_fig:
-                                    st.plotly_chart(pq_fig, use_container_width=True, key=f"exp_ret_pq_{run_id}")
-                                else:
-                                    st.info("无有效评测数据")
+                                st.markdown("**命中分布**")
+                                _t1h = sum(1 for r in retrieval_viz if r.get("retrieval_top1_hit"))
+                                _t3h = sum(1 for r in retrieval_viz if r.get("retrieval_top3_hit"))
+                                _t5h = sum(1 for r in retrieval_viz if r.get("retrieval_top5_hit"))
+                                _dist = pd.DataFrame([
+                                    {"指标": "Top1 命中", "数量": _t1h, "占比": f"{_t1h/n:.0%}"},
+                                    {"指标": "Top3 命中", "数量": _t3h, "占比": f"{_t3h/n:.0%}"},
+                                    {"指标": "Top5 命中", "数量": _t5h, "占比": f"{_t5h/n:.0%}"},
+                                ])
+                                st.dataframe(_dist, use_container_width=True, hide_index=True)
                         else:
                             st.info("当前运行无检索评测轨道数据")
 
@@ -5675,6 +5856,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         raw_dir=str(RAW_DIR),
                         processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
                         judged_file=str(JUDGED_FILE),
+                        include_judge_results=True,
                     )
                     j_results = rs.get("judge_results", [])
                     valid_j = [r for r in j_results if "error" not in r]

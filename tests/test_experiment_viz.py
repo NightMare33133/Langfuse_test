@@ -159,6 +159,7 @@ def test_run_filtering():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(processed_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         assert status["judge_count"] == 10, f"应有 10 条 Judge 结果，实际 {status['judge_count']}"
@@ -325,6 +326,7 @@ def test_cross_run_isolation():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(proc_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         # 查询 run B 的状态
@@ -350,6 +352,7 @@ def test_cross_run_isolation():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(proc_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         # 验证隔离
@@ -411,6 +414,7 @@ def test_history_judge_no_run_id_fallback():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(processed_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         assert status["judge_count"] == 10, \
@@ -515,6 +519,7 @@ def test_multi_run_comparison():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(proc_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
             status2 = get_run_status(
                 run2_id,
@@ -522,6 +527,7 @@ def test_multi_run_comparison():
                 raw_dir=str(dirs["raw"]),
                 processed_file=str(proc_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         metrics1 = compute_metrics(status1["judge_results"])

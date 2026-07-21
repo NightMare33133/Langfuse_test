@@ -92,7 +92,8 @@ def _collect_all_judge(config_runs, batch_dir, raw_dir, processed_file, judged_f
     for run in config_runs:
         rid = run.get("run_id", "")
         rs = get_run_status(rid, batch_dir=str(batch_dir), raw_dir=str(raw_dir),
-                           processed_file=str(processed_file), judged_file=str(judged_file))
+                           processed_file=str(processed_file), judged_file=str(judged_file),
+                           include_judge_results=True)
         for r in rs.get("judge_results", []):
             r_copy = dict(r)
             r_copy["_source_run_id"] = rid

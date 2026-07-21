@@ -125,12 +125,14 @@ def test_run_only_returns_own_results():
                                       batch_dir=str(dirs["batch"]),
                                       raw_dir=str(dirs["raw"]),
                                       processed_file=str(proc_file),
-                                      judged_file=str(judged_file))
+                                      judged_file=str(judged_file),
+                                      include_judge_results=True)
             status_b = get_run_status(run_b_id,
                                       batch_dir=str(dirs["batch"]),
                                       raw_dir=str(dirs["raw"]),
                                       processed_file=str(proc_file),
-                                      judged_file=str(judged_file))
+                                      judged_file=str(judged_file),
+                                      include_judge_results=True)
 
         # 验证 run_a 的 judge_results 只包含自己的
         assert len(status_a["judge_results"]) == 5, f"Run A 应有 5 条，实际 {len(status_a['judge_results'])}"
@@ -173,7 +175,8 @@ def test_trace_id_links_result_to_sample():
                                     batch_dir=str(dirs["batch"]),
                                     raw_dir=str(dirs["raw"]),
                                     processed_file=str(proc_file),
-                                    judged_file=str(judged_file))
+                                    judged_file=str(judged_file),
+                                    include_judge_results=True)
 
         judge_results = status["judge_results"]
 
@@ -241,7 +244,8 @@ def test_legacy_no_run_id_still_works():
                                     batch_dir=str(dirs["batch"]),
                                     raw_dir=str(dirs["raw"]),
                                     processed_file=str(proc_file),
-                                    judged_file=str(legacy_judged_file))
+                                    judged_file=str(legacy_judged_file),
+                                    include_judge_results=True)
 
         # 应通过 trace_id fallback 关联到 3 条
         assert len(status["judge_results"]) == 3, \
@@ -296,12 +300,14 @@ def test_retrieval_and_qa_tracks():
                                         batch_dir=str(dirs["batch"]),
                                         raw_dir=str(dirs["raw"]),
                                         processed_file=str(proc_file),
-                                        judged_file=str(judged_file))
+                                        judged_file=str(judged_file),
+                                        include_judge_results=True)
             status_qa = get_run_status(run_qa,
                                        batch_dir=str(dirs["batch"]),
                                        raw_dir=str(dirs["raw"]),
                                        processed_file=str(proc_file),
-                                       judged_file=str(judged_file))
+                                       judged_file=str(judged_file),
+                                       include_judge_results=True)
 
         # retrieval 轨道验证
         for r in status_ret["judge_results"]:
@@ -403,7 +409,8 @@ def test_cross_run_never_leaks():
                                       batch_dir=str(dirs["batch"]),
                                       raw_dir=str(dirs["raw"]),
                                       processed_file=str(proc_file),
-                                      judged_file=str(judged_file))
+                                      judged_file=str(judged_file),
+                                      include_judge_results=True)
 
         # Run A 的结果不应包含 QA 轨道
         tracks_a = set(r.get("evaluation_track") for r in status_a["judge_results"])

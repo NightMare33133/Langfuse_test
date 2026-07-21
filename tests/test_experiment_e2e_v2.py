@@ -196,6 +196,7 @@ def test_e2e_with_different_trace_ids():
                 raw_dir=str(raw_dir),
                 processed_file=str(processed_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         print(f"  Batch: {status.get('batch_success')}/{status.get('batch_total')}")

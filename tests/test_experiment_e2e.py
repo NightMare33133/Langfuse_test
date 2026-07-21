@@ -202,6 +202,7 @@ def test_e2e_experiment_pipeline():
                 raw_dir=str(raw_dir),
                 processed_file=str(processed_file),
                 judged_file=str(judged_file),
+                include_judge_results=True,
             )
 
         print(f"  question_set_id: {status.get('question_set_id')}")

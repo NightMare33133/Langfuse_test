@@ -981,8 +981,14 @@ def migrate_processed_samples(processed_file=None, experiments_dir=None, backup=
 
 
 def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
-                   processed_file=None, judged_file=None) -> dict:
+                   processed_file=None, judged_file=None,
+                   include_judge_results=False) -> dict:
     """获取运行状态统计。
+
+    Args:
+        include_judge_results: If True, include full judge_results list in the
+            return dict. Default False to reduce memory usage when only counts
+            are needed.
 
     Returns:
         dict: {
@@ -990,6 +996,7 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
             "raw_count": int, "processed_count": int,
             "judge_count": int, "question_count": int,
             "question_set_id": str, "question_set_name": str,
+            "judge_results": list (empty if include_judge_results=False),
         }
     """
     from pathlib import Path
@@ -1134,7 +1141,7 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
         "question_count": question_count,
         "question_set_id": question_set_id,
         "question_set_name": question_set_name,
-        "judge_results": judge_results_for_run,
+        "judge_results": judge_results_for_run if include_judge_results else [],
     }
 
 
