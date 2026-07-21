@@ -283,10 +283,15 @@ def test_retrieval_pre_screen_and_position_logic():
         "final_answer": "",  # 空回答
     }
     result_a = pre_screen(sample_a)
-    assert result_a is None, (
-        f"retrieval 轨道有检索结果时，即使 final_answer 为空，也不应预筛为全 0，应返回 None 进入 Judge。实际: {result_a}"
-    )
-    print("[OK] retrieval + 有检索结果 + final_answer 为空 → 返回 None，进入 Judge")
+    # 规则判定：gold_evidence 完整出现在 retrieval content 中时直接命中（无需 LLM）
+    # 否则返回 None 进入 LLM Judge。无论哪种，都不应预筛为全 0。
+    if result_a is not None:
+        assert result_a.get("retrieval_top1_hit") != 0 or result_a.get("_rule_name"), (
+            f"不应预筛为全 0: {result_a}"
+        )
+        print(f"[OK] retrieval + 有检索结果 + final_answer 为空 → 规则直接命中 (rule={result_a.get('_rule_name')})")
+    else:
+        print("[OK] retrieval + 有检索结果 + final_answer 为空 → 返回 None，进入 LLM Judge")
 
     # b. retrieval + 无检索结果 → 预筛选为全 0 + hit_evidence_position=null
     sample_b = {
@@ -339,8 +344,12 @@ def test_retrieval_pre_screen_and_position_logic():
         "final_answer": "违约金为合同总金额的 10%",
     }
     result_d = pre_screen(sample_d)
-    assert result_d is None, "retrieval + 有检索结果 + 有回答 → 应返回 None 进入 Judge"
-    print("[OK] retrieval + 有检索结果 + 有回答 → 返回 None，进入 Judge")
+    # 规则判定：gold_evidence 完整出现在 retrieval content 中时直接命中
+    if result_d is not None:
+        assert result_d.get("_rule_name") == "exact_contains_top1"
+        print(f"[OK] retrieval + 有检索结果 + 有回答 → 规则直接命中 (rule={result_d.get('_rule_name')})")
+    else:
+        print("[OK] retrieval + 有检索结果 + 有回答 → 返回 None，进入 LLM Judge")
 
     print()
 

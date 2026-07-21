@@ -58,26 +58,67 @@ def fetch_observations(host, public_key, secret_key, trace_id):
     return data.get("data", [])
 
 
-def fetch_all(host, public_key, secret_key, limit=50, max_pages=20):
+def fetch_all(host, public_key, secret_key, limit=50, max_pages=20,
+              progress_callback=None, max_retries=2):
     """Fetch traces and their observations, yielding JSONL-compatible rows.
 
-    Each row is an observation dict with traceId injected, matching the
-    format expected by parser.py's load_jsonl().
+    Args:
+        host: Langfuse API host URL.
+        public_key: Langfuse public key.
+        secret_key: Langfuse secret key.
+        limit: Number of traces per page.
+        max_pages: Maximum number of pages to fetch.
+        progress_callback: Optional callable(phase, traces_fetched, pages_done,
+            total_traces, retries). Called after each page completes.
+            Phases: "connecting", "fetching", "done".
+            total_traces comes from API meta.totalItems (may be None).
+        max_retries: Max retry attempts per page on transient failure.
+
+    Yields:
+        Row dicts compatible with parser.py's load_jsonl().
     """
     total_rows = 0
-    for page in range(1, max_pages + 1):
-        print(f"  拉取 traces page {page}...", end=" ", flush=True)
-        data = fetch_traces(host, public_key, secret_key, limit=limit, page=page)
-        traces = data.get("data", [])
-        if not traces:
-            print("无更多数据")
-            break
+    traces_fetched = 0
+    pages_done = 0
+    total_traces = None  # from API meta, may remain None
+    cumulative_retries = 0
 
-        print(f"获取到 {len(traces)} 条 trace", flush=True)
+    if progress_callback:
+        progress_callback("connecting", 0, 0, None, 0)
+
+    for page in range(1, max_pages + 1):
+        # --- fetch one page with retry ---
+        data = None
+        page_retries = 0
+        for attempt in range(max_retries + 1):
+            try:
+                data = fetch_traces(host, public_key, secret_key, limit=limit, page=page)
+                break
+            except Exception:
+                if attempt < max_retries:
+                    page_retries += 1
+                    cumulative_retries += 1
+                    time.sleep(1.0 * (attempt + 1))
+                else:
+                    raise
+
+        # Read meta.totalItems from first successful response
+        if total_traces is None and data is not None:
+            meta = data.get("meta") or {}
+            api_total = meta.get("totalItems")
+            if isinstance(api_total, int) and api_total > 0:
+                total_traces = api_total
+
+        traces = data.get("data", []) if data else []
+        if not traces:
+            pages_done = page
+            if progress_callback:
+                progress_callback("fetching", traces_fetched, pages_done,
+                                  total_traces, cumulative_retries)
+            break
 
         for trace in traces:
             trace_id = trace["id"]
-            # Yield the trace itself as a "root" row (like the UI export does)
             yield {
                 "id": trace_id,
                 "traceId": trace_id,
@@ -95,11 +136,9 @@ def fetch_all(host, public_key, secret_key, limit=50, max_pages=20):
             }
             total_rows += 1
 
-            # Fetch observations for this trace
             try:
                 observations = fetch_observations(host, public_key, secret_key, trace_id)
-            except Exception as e:
-                print(f"    ⚠️ 获取 observations 失败 (trace={trace_id[:8]}): {e}")
+            except Exception:
                 continue
 
             for obs in observations:
@@ -120,13 +159,21 @@ def fetch_all(host, public_key, secret_key, limit=50, max_pages=20):
                 }
                 total_rows += 1
 
-        # If fewer results than limit, we've reached the end
+        traces_fetched += len(traces)
+        pages_done = page
+
+        if progress_callback:
+            progress_callback("fetching", traces_fetched, pages_done,
+                              total_traces, cumulative_retries)
+
         if len(traces) < limit:
             break
 
-        time.sleep(0.2)  # rate limit courtesy
+        time.sleep(0.2)
 
-    print(f"  共获取 {total_rows} 行数据")
+    if progress_callback:
+        progress_callback("done", traces_fetched, pages_done,
+                          total_traces, cumulative_retries)
 
 
 def main():
@@ -173,11 +220,20 @@ def main():
     print(f"   输出: {output_path}")
     print()
 
+    def _cli_progress(phase, traces, pages, total, retries):
+        total_str = f"/{total}" if total else ""
+        retry_str = f" (重试 {retries} 次)" if retries else ""
+        if phase == "done":
+            print(f"  完成: {traces} 条 trace, {pages} 页{retry_str}")
+        else:
+            print(f"  [{phase}] 已拉取 {traces} 条 trace{total_str}, 第 {pages} 页{retry_str}")
+
     count = 0
     with output_path.open("w", encoding="utf-8") as f:
         for row in fetch_all(
             args.host, args.public_key, args.secret_key,
             limit=args.limit, max_pages=args.max_pages,
+            progress_callback=_cli_progress,
         ):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1

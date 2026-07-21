@@ -288,6 +288,16 @@ def build_judge_prompt(sample, template=None, max_content_chars=None, evaluation
             prompt = prompt.replace("{reference_answer}", sample.get("reference_answer"))
             prompt = prompt.replace("{source_excerpt}", sample.get("source_excerpt") or "(无)")
 
+    # 规则审计提示：精确匹配在 Top2-5，提醒 LLM 检查前序结果是否语义等价
+    rule_hint = sample.get("_rule_hint")
+    if rule_hint and evaluation_track == TRACK_RETRIEVAL:
+        prompt += (
+            f"\n\n【审计提示】"
+            f"\n金标准证据在 Top{rule_hint['matched_rank']} 检索结果中找到了完整文本匹配。"
+            f"\n请重点检查 Top1 至 Top{rule_hint['matched_rank'] - 1} 是否包含与金标准语义等价的同一证据。"
+            f"\n如果前序结果已包含语义等价证据，请以最早出现的位置作为 hit_evidence_position。"
+        )
+
     return prompt
 
 
@@ -488,8 +498,14 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
 
 
 def judge_all(samples, api_key, base_url, model, progress_callback=None,
-              timeout=60, max_workers=1):
+              timeout=60, max_workers=1, audit_rules=False):
     """Judge all samples. Yields results one by one in original order.
+
+    Args:
+        audit_rules: If True, also send rule-decided samples to LLM for
+            comparison. Audit results are stored in the result dict with
+            _audit_llm_agrees / _audit_llm_top1 / _audit_llm_reason fields.
+            Does NOT change the authoritative result (rule result is kept).
 
     内置规则预筛选和内容级去重：
     - 预筛选：无检索结果/无回答的样本直接出结果，不调 LLM
@@ -535,6 +551,7 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None,
     # --- Phase 1: classify, pre-screen, content dedup (sequential) ---
     immediate_results = {}  # idx -> result
     llm_queue = []          # (idx, sample)
+    audit_queue = []        # (idx, sample) — rule-decided, also send to LLM
     prescreened_count = 0
     cached_count = 0
     done = 0
@@ -551,6 +568,9 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None,
             immediate_results[i] = result
             prescreened_count += 1
             done += 1
+            # Audit: also queue for LLM if rule made a positive decision
+            if audit_rules and prescreened.get("_rule_name") == "exact_contains_top1":
+                audit_queue.append((i, sample))
             if progress_callback:
                 elapsed = time.monotonic() - start_time
                 info = {
@@ -702,12 +722,160 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None,
                     idx, result = future.result()
                     _on_llm_result(idx, result)
 
+    # --- Phase 2.5: audit rule decisions with LLM (if enabled) ---
+    if audit_queue:
+        for idx, sample in audit_queue:
+            try:
+                audit_result = judge_sample(sample, api_key, base_url, model, timeout=timeout)
+                rule_result = immediate_results[idx]
+                rule_pos = rule_result.get("_rule_match_rank")
+                llm_pos = audit_result.get("hit_evidence_position")
+                agrees = (rule_pos == llm_pos) or (
+                    rule_pos is not None and llm_pos is not None and rule_pos == llm_pos
+                ) or (rule_pos is None and llm_pos is None)
+                if agrees:
+                    immediate_results[idx]["_audit_llm_agrees"] = True
+                    immediate_results[idx]["_audit_llm_position"] = llm_pos
+                    immediate_results[idx]["_audit_llm_reason"] = audit_result.get("reason", "")
+                else:
+                    # Conflict: LLM result is authoritative
+                    immediate_results[idx] = {
+                        **audit_result,
+                        "_rule_conflict": True,
+                        "_rule_name": rule_result.get("_rule_name"),
+                        "_rule_result": {
+                            "hit_evidence_position": rule_pos,
+                            "snippet": rule_result.get("_rule_snippet"),
+                        },
+                        "_llm_result": {
+                            "hit_evidence_position": llm_pos,
+                            "reason": audit_result.get("reason"),
+                        },
+                        "_final_source": "llm",
+                    }
+                    # Re-apply metadata from original result
+                    for k in ("run_id", "config_id", "question_id",
+                              "question_set_id", "question_set_name"):
+                        if k in rule_result:
+                            immediate_results[idx].setdefault(k, rule_result[k])
+            except Exception:
+                pass
+
     # --- Phase 3: yield in original order (no progress callback) ---
     for i in range(total):
         if i in immediate_results:
             yield immediate_results[i]
         elif i in llm_results:
             yield llm_results[i]
+
+
+# ─── 检索评测规则判定 ────────────────────────────────────────────────────────
+
+def _normalize_text(text):
+    """安全规范化文本，用于确定性字符串匹配。
+
+    处理：空白/换行折叠、全半角统一、常见 Markdown 格式、标点差异。
+    不做语义改写、不丢弃实质内容。
+    """
+    if not text:
+        return ""
+    import unicodedata
+    t = text
+    # 全角 → 半角（字母、数字、标点）
+    t = unicodedata.normalize("NFKC", t)
+    # Markdown: 去掉行内代码反引号、粗体/斜体标记、链接语法
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"\*{1,2}([^*]*)\*{1,2}", r"\1", t)
+    t = re.sub(r"__([^_]*)__", r"\1", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    # HTML 标签
+    t = re.sub(r"<[^>]+>", "", t)
+    # 空白折叠（空格、tab、换行 → 单空格）
+    t = re.sub(r"\s+", " ", t).strip()
+    # 中文标点 → 半角
+    _punct_map = str.maketrans("，。！？；：（）【】「」、", ",.!?;:()[][],")
+    t = t.translate(_punct_map)
+    return t
+
+
+def retrieval_rule_judge(sample):
+    """确定性规则判定检索命中（零 LLM 调用）。
+
+    仅以下情况可跳过 LLM 并作为最终结果：
+    1. retrieval_results 为空或前 5 条均无有效 content → Top1/3/5 全部 false
+    2. gold_evidence 完整匹配在 Top1 → Top1/3/5 全部 true
+
+    gold_evidence 首次完整匹配在 Top2-Top5 时，返回 None 并附加 _rule_hint，
+    让 LLM 判断前序结果是否为语义等价的同一证据。
+
+    Returns:
+        dict with hit results, or None (needs LLM). When None, may include
+        _rule_hint in sample["_rule_hint"] for LLM prompt augmentation.
+    """
+    gold = get_gold_evidence(sample)
+    if not gold:
+        return None
+
+    retrieval_results = sample.get("retrieval_results") or []
+
+    # --- Layer 1: 确定性直接失败 ---
+    if not retrieval_results:
+        return {
+            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+            "retrieval_top5_hit": 0, "hit_evidence_position": None,
+            "reason": "规则判定：无检索结果",
+            "_rule_name": "empty_results",
+        }
+
+    has_any_content = any(
+        (r.get("content") or "").strip() for r in retrieval_results[:5]
+    )
+    if not has_any_content:
+        return {
+            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+            "retrieval_top5_hit": 0, "hit_evidence_position": None,
+            "reason": "规则判定：检索结果均无有效内容",
+            "_rule_name": "no_content",
+        }
+
+    # --- Layer 2: 确定性直接命中（仅 Top1） ---
+    gold_norm = _normalize_text(gold)
+    if len(gold_norm) < 8:
+        return None
+
+    for rank, r in enumerate(retrieval_results[:5]):
+        content = (r.get("content") or "").strip()
+        if not content:
+            continue
+        content_norm = _normalize_text(content)
+        if gold_norm in content_norm:
+            pos = rank + 1  # 1-based
+            idx = content_norm.find(gold_norm)
+            snippet_start = max(0, idx - 20)
+            snippet_end = min(len(content_norm), idx + len(gold_norm) + 20)
+            snippet = content_norm[snippet_start:snippet_end]
+
+            if pos == 1:
+                # Top1 完整匹配 → 可安全跳过 LLM
+                return {
+                    "retrieval_top1_hit": 1, "retrieval_top3_hit": 1,
+                    "retrieval_top5_hit": 1, "hit_evidence_position": 1,
+                    "reason": "规则判定：Top1 内容包含完整金标准证据（规范化匹配）",
+                    "_rule_name": "exact_contains_top1",
+                    "_rule_match_rank": 1,
+                    "_rule_snippet": snippet[:120],
+                }
+            else:
+                # Top2-5 匹配 → 必须交给 LLM 判断前序结果是否语义等价
+                # 将精确匹配 rank 作为审计提示附加到 sample
+                sample["_rule_hint"] = {
+                    "matched_rank": pos,
+                    "snippet": snippet[:120],
+                }
+                return None
+
+    # --- Layer 3: 无法确定 ---
+    return None
 
 
 def pre_screen(sample):
@@ -738,13 +906,12 @@ def pre_screen(sample):
     # 无检索结果 → top 全 0
     no_retrieval = len(retrieval_results) == 0
 
-    # 检索轨道：仅当检索结果为空时才预筛；final_answer 为空不影响检索命中判断
+    # 检索轨道：规则判定（空结果 / 直接命中）→ 无需 LLM
     if evaluation_track == TRACK_RETRIEVAL:
-        if no_retrieval:
-            return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
-                    "retrieval_top5_hit": 0, "hit_evidence_position": None,
-                    "reason": "规则判定：无检索结果"}
-        # 有检索结果 → 交给 LLM 判断，不管 final_answer 是否为空
+        rule_result = retrieval_rule_judge(sample)
+        if rule_result is not None:
+            return rule_result
+        # 规则无法确定 → 交给 LLM
         return None
 
     # QA 轨道：保持原有逻辑

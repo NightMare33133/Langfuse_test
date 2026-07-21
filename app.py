@@ -2892,27 +2892,72 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 langfuse_sk = st.text_input("Secret Key", value=os.getenv("LANGFUSE_SECRET_KEY", ""), type="password", key="lf_sk")
                 fetch_limit = st.number_input("每页 trace 数", min_value=1, max_value=500, value=50, key="lf_limit")
 
-            if st.button("拉取 Traces", key="fetch_traces"):
+            if st.button(
+                "拉取 Traces", key="fetch_traces",
+                disabled=st.session_state.get("_fetching", False),
+            ):
                 if not langfuse_pk or not langfuse_sk:
                     st.error("请填写 Langfuse Public Key 和 Secret Key")
                 else:
                     from fetch_traces import fetch_all
+                    st.session_state["_fetching"] = True
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"langfuse_api_export_{ts}.jsonl"
-                    output_path = RAW_DIR / filename
-                    with st.spinner(f"正在从 {langfuse_host} 拉取 Traces..."):
-                        try:
-                            count = 0
-                            with output_path.open("w", encoding="utf-8") as f:
-                                for row in fetch_all(langfuse_host, langfuse_pk, langfuse_sk, limit=fetch_limit):
-                                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                                    count += 1
-                            st.success(f"拉取完成！共 {count} 行，已保存为 {filename}")
-                            # API 拉取成功后自动选中新文件
-                            st.session_state["raw_select"] = filename
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"拉取失败: {e}")
+                    tmp_path = RAW_DIR / f".tmp_{filename}"
+                    final_path = RAW_DIR / filename
+
+                    fetch_status = st.status(f"正在从 {langfuse_host} 拉取 Traces...", expanded=True)
+                    progress_bar = st.progress(0, text="连接中...")
+                    detail_text = st.empty()
+                    t0 = time.time()
+                    _fetch_state = {"row_count": 0, "retries": 0}
+
+                    try:
+                        def _on_progress(phase, traces, pages, total, retries):
+                            _fetch_state["retries"] = retries
+                            if phase == "connecting":
+                                progress_bar.progress(0, text="连接 Langfuse API...")
+                                detail_text.caption("正在建立连接...")
+                            elif phase == "fetching":
+                                if total and total > 0:
+                                    pct = min(traces / total, 1.0)
+                                    progress_bar.progress(pct, text=f"已拉取 {traces}/{total} 条 Trace")
+                                else:
+                                    progress_bar.progress(0, text=f"已拉取 {traces} 条 Trace")
+                                detail_text.caption(f"已完成 {pages} 页" + (f" | 重试 {retries} 次" if retries else ""))
+                            elif phase == "done":
+                                progress_bar.progress(1.0, text="拉取完成")
+
+                        with tmp_path.open("w", encoding="utf-8") as f:
+                            for row in fetch_all(
+                                langfuse_host, langfuse_pk, langfuse_sk,
+                                limit=fetch_limit, progress_callback=_on_progress,
+                            ):
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                                _fetch_state["row_count"] += 1
+
+                        # Atomic replace: rename tmp to final
+                        tmp_path.rename(final_path)
+
+                        elapsed = time.time() - t0
+                        fetch_status.update(label="拉取完成", state="complete", expanded=False)
+                        _retries = _fetch_state["retries"]
+                        _retry_msg = f" | 重试 {_retries} 次" if _retries else ""
+                        st.success(
+                            f"拉取完成：**{_fetch_state['row_count']}** 行数据 | "
+                            f"输出: `{filename}` | 耗时 {elapsed:.1f}s{_retry_msg}"
+                        )
+                        st.session_state["raw_select"] = filename
+                        st.rerun()
+
+                    except Exception as e:
+                        fetch_status.update(label="拉取失败", state="error")
+                        st.error(f"拉取失败: {e}")
+                        # Clean up incomplete tmp file
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    finally:
+                        st.session_state["_fetching"] = False
 
         # Step 2: Select file & parse
         st.divider()
@@ -5838,6 +5883,210 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         update_run_snapshot(run_id, ss_updates, edit_note=ss_note)
                         st.success(f"本次运行的配置记录已修正，不影响其他运行。")
                         st.rerun()
+
+        # ========== 跨配置方案运行对比 ==========
+        st.markdown("---")
+        with st.expander("跨配置方案运行对比（点击展开）", expanded=False):
+            st.markdown("比较不同配置方案下同一题集的检索结果差异。支持跨配置对比，也可用于同配置稳定性诊断。")
+
+            # 读取全局所有 runs（不受当前 config_id 过滤）
+            _all_runs = list_experiment_runs()
+            _all_configs = {c["config_id"]: c for c in list_config_profiles()}
+
+            # 按 question_set_id 分组（仅 completed runs 且有 question_set_id）
+            _global_runs_by_qs = {}
+            for _run in _all_runs:
+                _qs = _run.get("question_set_id") or ""
+                if _qs:
+                    _global_runs_by_qs.setdefault(_qs, []).append(_run)
+
+            # 仅保留有 >=2 个 run 的题集
+            _eligible_qs = {qs: runs for qs, runs in _global_runs_by_qs.items() if len(runs) >= 2}
+
+            if not _eligible_qs:
+                st.info("全局没有相同题集的两次运行可供对比。请先确保至少两个 run 使用了相同的 question_set_id。")
+            else:
+                # Step 1: 选择题集
+                _qs_options = sorted(_eligible_qs.keys())
+                _qs_labels = []
+                for _qs in _qs_options:
+                    _qs_runs = _eligible_qs[_qs]
+                    _qs_name = _qs_runs[0].get("question_set_name") or _qs[:40]
+                    _config_ids = sorted(set(r.get("config_id", "") for r in _qs_runs))
+                    _qs_labels.append(f"{_qs_name} | {len(_qs_runs)} 次运行, {len(_config_ids)} 个配置")
+
+                _sel_qs_label = st.selectbox(
+                    "Step 1: 选择题集（仅显示有 ≥2 次运行的题集）",
+                    _qs_labels, key="_xcmp_qs",
+                )
+                _sel_qs = _qs_options[_qs_labels.index(_sel_qs_label)]
+                _qs_runs = _eligible_qs[_sel_qs]
+
+                # 按 config_id 分组该题集下的 runs
+                _qs_runs_by_cfg = {}
+                for _run in _qs_runs:
+                    _cid = _run.get("config_id", "")
+                    _qs_runs_by_cfg.setdefault(_cid, []).append(_run)
+
+                # 辅助：构建 run label
+                def _run_label(r):
+                    _cid = r.get("config_id", "")
+                    _cfg = _all_configs.get(_cid, {})
+                    _cname = _cfg.get("config_name", _cid[:20])
+                    _count = r.get("question_count", 0)
+                    _time = (r.get("started_at") or "")[:16].replace("T", " ")
+                    return f"{r['run_id'][:36]}... | {_cname} | {_time} | {_count}题"
+
+                # Step 2: 选择基准（旧）
+                _cfg_options = sorted(_qs_runs_by_cfg.keys())
+                _cfg_labels = []
+                for _cid in _cfg_options:
+                    _cfg = _all_configs.get(_cid, {})
+                    _cname = _cfg.get("config_name", _cid[:20])
+                    _n = len(_qs_runs_by_cfg[_cid])
+                    _cfg_labels.append(f"{_cname} ({_n} 次运行)")
+
+                _diff_col1, _diff_col2 = st.columns(2)
+                with _diff_col1:
+                    st.markdown("**基准（旧）**")
+                    _old_cfg_label = st.selectbox(
+                        "配置方案", _cfg_labels, key="_xcmp_old_cfg",
+                    )
+                    _old_cfg_id = _cfg_options[_cfg_labels.index(_old_cfg_label)]
+                    _old_cfg_runs = _qs_runs_by_cfg[_old_cfg_id]
+                    _old_run_label = st.selectbox(
+                        "运行", [_run_label(r) for r in _old_cfg_runs],
+                        key="_xcmp_old_run",
+                    )
+                    _old_run = _old_cfg_runs[
+                        [_run_label(r) for r in _old_cfg_runs].index(_old_run_label)
+                    ]
+
+                with _diff_col2:
+                    st.markdown("**对比（新）**")
+                    _new_cfg_label = st.selectbox(
+                        "配置方案", _cfg_labels,
+                        index=min(1, len(_cfg_labels) - 1),
+                        key="_xcmp_new_cfg",
+                    )
+                    _new_cfg_id = _cfg_options[_cfg_labels.index(_new_cfg_label)]
+                    _new_cfg_runs = _qs_runs_by_cfg[_new_cfg_id]
+                    _new_run_label = st.selectbox(
+                        "运行", [_run_label(r) for r in _new_cfg_runs],
+                        key="_xcmp_new_run",
+                    )
+                    _new_run = _new_cfg_runs[
+                        [_run_label(r) for r in _new_cfg_runs].index(_new_run_label)
+                    ]
+
+                # 验证
+                _old_rid = _old_run["run_id"]
+                _new_rid = _new_run["run_id"]
+                _old_qs = _old_run.get("question_set_id", "")
+                _new_qs = _new_run.get("question_set_id", "")
+
+                if _old_rid == _new_rid:
+                    st.warning("请选择两个不同的运行进行对比。")
+                elif _old_qs != _new_qs:
+                    st.error(
+                        f"两个 run 的 question_set_id 不同，无法对比。"
+                        f"旧: `{_old_qs[:30]}`，新: `{_new_qs[:30]}`"
+                    )
+                else:
+                    if st.button("开始对比", key="_xcmp_go"):
+                        from retrieval_diff import compare_runs
+                        with st.spinner("正在对比检索结果..."):
+                            try:
+                                _diff = compare_runs(_old_rid, _new_rid)
+                                st.session_state["_xcmp_result"] = _diff
+                            except Exception as _diff_err:
+                                st.error(f"对比失败: {_diff_err}")
+
+                # 显示已有对比结果
+                _diff = st.session_state.get("_xcmp_result")
+                if _diff and _diff.get("summary"):
+                    _s = _diff["summary"]
+                    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    # 对比元信息
+                    st.markdown("---")
+                    st.markdown("##### 对比元信息")
+                    _meta_rows = [
+                        {"项目": "基准 config_id", "值": _diff["old_config"].get("config_id", "N/A")},
+                        {"项目": "基准 config_name", "值": _diff["old_config"].get("config_name", "N/A")},
+                        {"项目": "基准 run_id", "值": _diff.get("old_run_id", _old_rid)},
+                        {"项目": "对比 config_id", "值": _diff["new_config"].get("config_id", "N/A")},
+                        {"项目": "对比 config_name", "值": _diff["new_config"].get("config_name", "N/A")},
+                        {"项目": "对比 run_id", "值": _diff.get("new_run_id", _new_rid)},
+                        {"项目": "question_set_id", "值": _sel_qs},
+                    ]
+                    st.dataframe(_meta_rows, use_container_width=True, hide_index=True)
+
+                    # TopK Cutoff 分解
+                    st.markdown("##### TopK Cutoff 分解")
+                    _cutoff = _s.get("cutoff", {})
+                    if _cutoff:
+                        _cut_rows = []
+                        for _K in (1, 3, 5):
+                            _cs = _cutoff.get(_K, {})
+                            _cut_rows.append({
+                                "Cutoff": f"Top{_K}",
+                                "旧命中": _cs.get("old_hit_count", 0),
+                                "新命中": _cs.get("new_hit_count", 0),
+                                "变化": _cs.get("delta", 0),
+                                "loss": _cs.get("loss", 0),
+                                "evidence_lost": _cs.get("evidence_lost", 0),
+                                "ranking_drop": _cs.get("ranking_drop", 0),
+                                "gain": _cs.get("gain", 0),
+                            })
+                        st.dataframe(_cut_rows, use_container_width=True, hide_index=True)
+
+                    st.markdown(f"**诊断**: {_s.get('primary_cause_desc', '')}")
+
+                    # 逐题分类摘要
+                    _rows = _diff.get("rows", [])
+                    _cat_counts = {}
+                    for _r in _rows:
+                        _c = _r.get("category", "unknown")
+                        _cat_counts[_c] = _cat_counts.get(_c, 0) + 1
+                    _cat_parts = [f"{k}={v}" for k, v in _cat_counts.items()]
+                    st.caption(f"逐题分类: {' | '.join(_cat_parts)}（共 {len(_rows)} 题）")
+
+                    # 可展开的分类明细
+                    for _cat_name, _cat_label in [
+                        ("evidence_lost", "evidence_lost 详情"),
+                        ("ranking_regression", "ranking_regression 详情"),
+                        ("judge_disagreement", "judge_disagreement 详情"),
+                    ]:
+                        _cat_rows = [r for r in _rows if r.get("category") == _cat_name]
+                        if _cat_rows:
+                            with st.expander(f"{_cat_label}（{len(_cat_rows)} 条）", expanded=False):
+                                for _r in _cat_rows:
+                                    _old_r = _r.get("old_rank", "—")
+                                    _new_r = _r.get("new_rank", "—")
+                                    st.markdown(
+                                        f"- **{_r['question_id']}**: {_r.get('question', '')[:60]}"
+                                        f"  | 旧 rank={_old_r} → 新 rank={_new_r}"
+                                    )
+
+                    # 下载
+                    _dl_col1, _dl_col2 = st.columns(2)
+                    with _dl_col1:
+                        st.download_button(
+                            label="下载 CSV",
+                            data=_diff["csv_string"].encode("utf-8"),
+                            file_name=f"retrieval_diff_{_ts}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    with _dl_col2:
+                        st.download_button(
+                            label="下载 Markdown 报告",
+                            data=_diff["markdown"].encode("utf-8"),
+                            file_name=f"retrieval_diff_{_ts}.md",
+                            mime="text/markdown",
+                            use_container_width=True,
+                        )
 
         # ========== 运行历史 ==========
         if len(config_runs) >= 1:
