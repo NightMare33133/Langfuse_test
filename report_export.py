@@ -7,6 +7,7 @@ RAG 评测报告导出模块。
 import csv
 import io
 import json
+import re
 from datetime import datetime
 from html import escape
 
@@ -124,6 +125,7 @@ def _build_one_diagnostic(judge_result, sample_lookup, config):
         "hit_evidence_position": judge_result.get("hit_evidence_position"),
         "judge_reason": judge_result.get("reason", ""),
         "config_name": config.get("config_name", ""),
+        "config_id": config.get("config_id", ""),
         "knowledge_base_version": config.get("knowledge_base_version", ""),
         "workflow_version": config.get("workflow_version", ""),
         "question_id": judge_result.get("question_id") or "",
@@ -335,6 +337,8 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     config_name = _safe_str(config.get("config_name", ""))
     config_id = _safe_str(config.get("config_id", ""))
+    kb_version = _safe_str(config.get("knowledge_base_version", ""))
+    wf_version = _safe_str(config.get("workflow_version", ""))
     sample_lookup = sample_lookup or {}
 
     # 按轨道分组
@@ -419,6 +423,8 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 <h1>RAG 评测报告</h1>
 <div class="meta">
   <p><strong>配置方案</strong>: {config_name} (<code>{config_id}</code>)</p>
+  <p><strong>知识库版本</strong>: {kb_version or '未指定'}</p>
+  <p><strong>工作流版本</strong>: {wf_version or '未指定'}</p>
   <p><strong>生成时间</strong>: {now}</p>
   <p><strong>导出范围</strong>: {_safe_str(export_scope) or '当前配置全部运行'}</p>
   <p><strong>数据口径</strong>: 通过 config_id → run_id → processed sample → 真实 Langfuse trace_id → judged result 关联；
@@ -774,6 +780,77 @@ def _render_diagnostic_cards(html_parts, records, total_count, empty_msg, show_d
             html_parts.append('</details>')
 
         html_parts.append('</div>')
+
+
+# ====== 文件名生成 ======
+
+def sanitize_filename_component(name, max_len=50):
+    """将配置名清洗为安全的文件名组成部分。
+
+    规则：
+    - 保留中文、英文、数字、空格、-、_、圆括号
+    - 替换 Windows 非法字符 < > : " / \\ | ? * 和控制字符为 _
+    - 去除末尾空格和句点
+    - 限制长度 max_len
+    - 空或清洗后为空时回退为 "未命名配置"
+    - 不含路径分隔符，无目录穿越风险
+    """
+    if not name or not isinstance(name, str):
+        return "未命名配置"
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name.strip())
+    safe = re.sub(r'[^\w\u4e00-\u9fff\s\-\(\)]', '_', safe)
+    safe = re.sub(r'_+', '_', safe)
+    safe = safe.strip('_ ')
+    safe = safe.rstrip('.')
+    if len(safe) > max_len:
+        safe = safe[:max_len].rstrip(' .')
+    if not safe or safe.strip('_') == '':
+        return "未命名配置"
+    return safe
+
+
+def build_export_filename(config_name, config_id, suffix, extension):
+    """生成含配置信息的安全文件名。
+
+    格式: {safe_name}__cfg_{short_id}__{timestamp}.{ext}
+    示例: 合同知识库入库_v2_4__cfg_ab12cd34__20260722_101530.html
+
+    Parameters
+    ----------
+    config_name : str
+        配置方案名称，会被 sanitize_filename_component 清洗。
+    config_id : str
+        完整 config_id，取末 8 字符作为短标识。
+    suffix : str
+        文件类型标识，如 "report"、"runs"、"failed_samples"。
+    extension : str
+        文件扩展名（不含点），如 "html"、"csv"。
+
+    Returns
+    -------
+    str
+        安全的文件名。
+
+    Raises
+    ------
+    ValueError
+        config_id 为空时抛出。
+    """
+    if not config_id or not config_id.strip():
+        raise ValueError("config_id 不能为空，无法生成导出文件名")
+
+    safe_name = sanitize_filename_component(config_name)
+    # 空格替换为下划线，保持文件名紧凑
+    safe_name = safe_name.replace(" ", "_")
+    short_id = config_id.strip()[-8:]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_name}__cfg_{short_id}__{ts}_{suffix}.{extension}"
+    # 总长度限制 200 字符
+    if len(filename) > 200:
+        trim = len(filename) - 200
+        safe_name = safe_name[:len(safe_name) - trim]
+        filename = f"{safe_name}__cfg_{short_id}__{ts}_{suffix}.{extension}"
+    return filename
 
 
 # ====== CSV 导出 ======

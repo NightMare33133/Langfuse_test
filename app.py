@@ -2079,13 +2079,24 @@ PISP和AISP的区别?
                 )
 
                 if selected_config_id:
+                    # 配置切换时清理依赖旧配置的缓存
+                    _prev_cfg = st.session_state.get("_batch_prev_config_id")
+                    if _prev_cfg and _prev_cfg != selected_config_id:
+                        st.session_state.pop("batch_existing_runs_by_qs", None)
+                        st.session_state.pop("batch_qs_strategy", None)
+                    st.session_state["_batch_prev_config_id"] = selected_config_id
+
                     selected_config = load_config_profile(selected_config_id)
                     if selected_config:
                         st.caption(f"当前使用历史配置: **{selected_config.get('config_name', '')}**")
-                        # 只读摘要（与运行看板编辑一致）
+                        # 只读摘要 — key_prefix 使用完整 config_id 的哈希，确保切换时 widget 状态完全隔离
+                        import hashlib as _hashlib
+                        _ro_key = f"ro_{_hashlib.md5(selected_config_id.encode()).hexdigest()}"
                         with st.container(border=True):
                             st.markdown("**当前配置（只读）**")
-                            render_config_form(selected_config, key_prefix="ro_batch", disabled=True)
+                            render_config_form(selected_config, key_prefix=_ro_key, disabled=True)
+                        # 记录实际渲染的 config_id，用于执行前一致性校验
+                        st.session_state["batch_displayed_config_id"] = selected_config_id
                                         # 另存为新方案（通过 trigger flag 在 widget 渲染前切换 radio）
                         if st.button("基于此配置另存为新方案", key="batch_save_as_new"):
                             st.session_state["_batch_switch_to_new"] = True
@@ -2401,6 +2412,33 @@ PISP和AISP的区别?
                 _config_id = st.session_state.get("batch_selected_config", "")
                 if not _config_id:
                     st.error("请选择历史配置")
+                    st.stop()
+
+                # ── 四重一致性校验（fail-closed） ──
+                # (1) selectbox 选中的 config_id
+                _check_selectbox = _config_id
+                # (2) 上次渲染只读快照时记录的 config_id
+                _check_displayed = st.session_state.get("batch_displayed_config_id", "")
+                # (3) 从磁盘重新加载的 profile.config_id
+                _verify_config = load_config_profile(_config_id)
+                _check_disk = _verify_config.get("config_id", "") if _verify_config else ""
+                # (4) 即将传入执行器的 config_id（即 _config_id 本身）
+                _check_executor = _config_id
+
+                _all_ids = {_check_selectbox, _check_displayed, _check_disk, _check_executor}
+                if len(_all_ids) > 1 or not _config_id:
+                    st.error(
+                        f"配置一致性校验失败，禁止执行。"
+                        f"下拉框: `{_check_selectbox[:20]}`，"
+                        f"显示快照: `{_check_displayed[:20]}`，"
+                        f"磁盘加载: `{_check_disk[:20]}`，"
+                        f"执行器: `{_check_executor[:20]}`。"
+                        f"请重新选择配置后重试。"
+                    )
+                    st.stop()
+
+                if not _verify_config:
+                    st.error(f"配置 {_config_id} 不存在或已被删除")
                     st.stop()
             else:
                 # 创建新配置方案（从统一 schema 的 session_state 读取）
@@ -3878,11 +3916,19 @@ Judge 有三层减少重复调用的机制：
                         st.session_state["judge_mode"] = "retry_failed"
 
             # 预览优化策略按钮
-            preview_optimization = st.button(
-                "预览优化策略",
-                use_container_width=True,
-                help="查看实际需要调用 LLM 的次数，不消耗 token",
-            )
+            preview_col1, preview_col2 = st.columns(2)
+            with preview_col1:
+                preview_optimization = st.button(
+                    "预览优化策略",
+                    use_container_width=True,
+                    help="查看实际需要调用 LLM 的次数，不消耗 token",
+                )
+            with preview_col2:
+                preview_rules = st.button(
+                    "快速规则预览（零 LLM）",
+                    use_container_width=True,
+                    help="仅用确定性规则判定所有候选样本，不调用 LLM，不写入正式结果",
+                )
 
         def _load_existing_for_session():
             if "judge_results" not in st.session_state and existing_results_map:
@@ -3959,15 +4005,24 @@ Judge 有三层减少重复调用的机制：
                         text=f"评测进度: {done}/{total}",
                     )
 
-                    # 阶段状态
+                    # 两阶段状态显示
                     if llm_total > 0 and llm_done < llm_total:
+                        # LLM 阶段进行中
                         status_text.info(
-                            f"⏳ 已完成 {done}/{total}（LLM {llm_done}/{llm_total}），并发 {concurrency}"
+                            f"**规则阶段**: 已完成 {prescreened} 条直接判定"
+                            f" | **LLM 阶段**: {llm_done}/{llm_total}，并发 {concurrency}"
                         )
                     elif llm_total > 0:
-                        status_text.success(f"⏳ 已完成 {done}/{total}，LLM 全部完成")
+                        # LLM 阶段完成
+                        status_text.success(
+                            f"**规则阶段**: {prescreened} 条直接判定"
+                            f" | **LLM 阶段**: {llm_done}/{llm_total} 完成"
+                        )
                     else:
-                        status_text.info(f"⏳ 已完成 {done}/{total}（规则预筛/去重）")
+                        # 仍在规则阶段
+                        status_text.info(
+                            f"**规则阶段**: 已处理 {done}/{total}（规则判定 {prescreened} 条，去重 {cached} 条）"
+                        )
 
                     # 最后完成的题目
                     _q = (result.get("question") or "")[:60]
@@ -3989,7 +4044,7 @@ Judge 有三层减少重复调用的机制：
                             f"⏱️ {_elapsed_str} | LLM {llm_done}/{llm_total} | ETA {eta_text}"
                         )
                     else:
-                        stats_text.caption(f"⏱️ {_elapsed_str} | 规则预筛/去重中...")
+                        stats_text.caption(f"⏱️ {_elapsed_str} | 规则阶段进行中...")
 
                 new_results = []
                 for result in judge_all(
@@ -4223,6 +4278,119 @@ Judge 有三层减少重复调用的机制：
                 st.success("所有样本都已被跳过或规则判定，不需要调用 LLM！")
 
             st.divider()
+
+        # ---------- 快速规则预览（零 LLM，不写入正式结果） ----------
+        if preview_rules:
+            _preview_mode = st.session_state.get("judge_mode", "incremental")
+            _preview_plan = build_judge_plan(filtered_samples, existing_results_map, _preview_mode)
+            _preview_candidates = _preview_plan["samples"]
+
+            if not _preview_candidates:
+                st.info("没有候选样本可供预览。")
+            else:
+                from judge import retrieval_rule_judge
+
+                _rule_hits = []       # exact_contains_top1
+                _rule_misses = []     # empty_results / no_content
+                _rule_pending = []    # 需 LLM
+                _rule_preview_rows = []
+
+                for _s in _preview_candidates:
+                    _track = _s.get("evaluation_track") or classify_evaluation_track(_s)
+                    _s["evaluation_track"] = _track
+
+                    if _track != TRACK_RETRIEVAL:
+                        # QA 轨道：用 pre_screen 判断
+                        _ps = pre_screen(_s)
+                        if _ps is not None:
+                            _rule_misses.append((_s, _ps))
+                        else:
+                            _rule_pending.append(_s)
+                        continue
+
+                    # 检索轨道：用 retrieval_rule_judge
+                    _rr = retrieval_rule_judge(_s)
+                    if _rr is not None:
+                        if _rr.get("hit_evidence_position"):
+                            _rule_hits.append((_s, _rr))
+                        else:
+                            _rule_misses.append((_s, _rr))
+                        _rule_preview_rows.append({
+                            "question_id": _s.get("question_id", ""),
+                            "question": (_s.get("question") or "")[:50],
+                            "rule_result": _rr.get("_rule_name", ""),
+                            "top1": _rr.get("retrieval_top1_hit"),
+                            "top3": _rr.get("retrieval_top3_hit"),
+                            "top5": _rr.get("retrieval_top5_hit"),
+                            "position": _rr.get("hit_evidence_position"),
+                            "needs_llm": False,
+                        })
+                    else:
+                        _rule_pending.append(_s)
+                        _rule_preview_rows.append({
+                            "question_id": _s.get("question_id", ""),
+                            "question": (_s.get("question") or "")[:50],
+                            "rule_result": "待 LLM",
+                            "top1": None, "top3": None, "top5": None,
+                            "position": None,
+                            "needs_llm": True,
+                        })
+
+                st.markdown("---")
+                st.markdown("##### 快速规则预览（零 LLM）")
+                st.warning("⚠️ 以下为规则预览结果，**不是正式评测指标**。正式评测需运行 Judge 模式。")
+
+                _total = len(_preview_candidates)
+                _hit_n = len(_rule_hits)
+                _miss_n = len(_rule_misses)
+                _pending_n = len(_rule_pending)
+
+                _prev_col1, _prev_col2, _prev_col3 = st.columns(3)
+                with _prev_col1:
+                    st.metric("规则确认命中", _hit_n)
+                with _prev_col2:
+                    st.metric("规则确认未命中", _miss_n)
+                with _prev_col3:
+                    st.metric("待 LLM 语义判断", _pending_n)
+
+                # 规则确认 Top1/3/5 统计（仅检索轨道规则判定结果）
+                _ret_rows = [r for r in _rule_preview_rows if r["top1"] is not None]
+                if _ret_rows:
+                    _t1_hit = sum(1 for r in _ret_rows if r["top1"])
+                    _t3_hit = sum(1 for r in _ret_rows if r["top3"])
+                    _t5_hit = sum(1 for r in _ret_rows if r["top5"])
+                    _n = len(_ret_rows)
+                    st.caption(
+                        f"规则确认的检索结果（{_n} 条）："
+                        f"Top1={_t1_hit}/{_n} | Top3={_t3_hit}/{_n} | Top5={_t5_hit}/{_n}"
+                        f"  — 预览，不是正式评测指标"
+                    )
+
+                # 命中明细
+                if _rule_hits:
+                    with st.expander(f"规则确认命中（{_hit_n} 条）", expanded=False):
+                        for _s, _rr in _rule_hits[:20]:
+                            _q = (_s.get("question") or "")[:50]
+                            _pos = _rr.get("hit_evidence_position")
+                            _reason = _rr.get("reason", "")
+                            st.caption(f"  - `{_q}` | Top{_pos} 命中 | {_reason}")
+
+                # 未命中明细
+                if _rule_misses:
+                    with st.expander(f"规则确认未命中（{_miss_n} 条）", expanded=False):
+                        for _s, _rr in _rule_misses[:20]:
+                            _q = (_s.get("question") or "")[:50]
+                            _reason = _rr.get("reason", "")
+                            st.caption(f"  - `{_q}` | {_reason}")
+
+                # 待 LLM 明细
+                if _rule_pending:
+                    with st.expander(f"待 LLM 语义判断（{_pending_n} 条）", expanded=False):
+                        for _s in _rule_pending[:20]:
+                            _q = (_s.get("question") or "")[:50]
+                            _hint = _s.get("_rule_hint", {})
+                            _hint_str = f" | Top{_hint['matched_rank']} 有完整匹配" if _hint else ""
+                            st.caption(f"  - `{_q}`{_hint_str}")
 
         # ---------- 统一执行入口：根据 judge_mode 执行对应计划 ----------
         _run_mode = st.session_state.get("judge_mode")
@@ -4850,7 +5018,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         EXPERIMENTS_DIR,
     )
     from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
-    from report_export import build_evaluation_html, build_runs_csv, build_failed_samples_csv
+    from report_export import build_evaluation_html, build_runs_csv, build_failed_samples_csv, build_export_filename
     from optimization_analysis import (
         build_analysis_context, analyze_overview, analyze_failure_groups,
         synthesize_optimization_report, save_analysis_report, get_analysis_config,
@@ -5260,6 +5428,9 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 st.plotly_chart(fig_status_dist, use_container_width=True, key="cum_status_dist")
 
     # ---------- 一键导出评测报告 ----------
+    if not config_runs:
+        st.markdown("---")
+        st.info("当前配置方案下无运行记录，无法导出报告。请先执行批量提问并完成评测。")
     if config_runs:
         st.markdown("---")
         st.markdown("##### 一键导出评测报告")
@@ -5278,8 +5449,9 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         _proc_mtime = str(_proc_path.stat().st_mtime) if _proc_path.exists() else ""
         _sample_lookup = _load_sample_lookup(_proc_mtime)
 
-        _export_scope = f"配置 {selected_config.get('config_name', '')}，{len(config_runs)} 次运行"
-        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _disp_name = selected_config.get('config_name', '未命名')
+        _cid = selected_config.get('config_id', '')
+        _export_scope = f"配置 {_disp_name}，{len(config_runs)} 次运行"
 
         with _export_cols[0]:
             _html_bytes = build_evaluation_html(
@@ -5288,18 +5460,18 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 export_scope=_export_scope, sample_lookup=_sample_lookup,
             ).encode("utf-8")
             st.download_button(
-                label="下载 HTML 报告",
+                label=f"下载 HTML 报告（{_disp_name}）",
                 data=_html_bytes,
-                file_name=f"rag_evaluation_report_{_ts}.html",
+                file_name=build_export_filename(_disp_name, _cid, "report", "html"),
                 mime="text/html",
                 use_container_width=True,
                 help="自包含 HTML 报告，可在浏览器直接打开并打印为 PDF",
             )
         with _export_cols[1]:
             st.download_button(
-                label="下载运行汇总 CSV",
+                label=f"下载运行汇总 CSV（{_disp_name}）",
                 data=build_runs_csv(_run_data_list),
-                file_name=f"rag_evaluation_report_{_ts}_runs.csv",
+                file_name=build_export_filename(_disp_name, _cid, "runs", "csv"),
                 mime="text/csv",
                 use_container_width=True,
                 help="每个运行一行，含 Top1/3/5 指标",
@@ -5307,9 +5479,9 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         with _export_cols[2]:
             _failed_csv = build_failed_samples_csv(all_judge_results, _sample_lookup, selected_config)
             st.download_button(
-                label="下载未命中样本 CSV",
+                label=f"下载未命中样本 CSV（{_disp_name}）",
                 data=_failed_csv,
-                file_name=f"rag_evaluation_report_{_ts}_failed_samples.csv",
+                file_name=build_export_filename(_disp_name, _cid, "failed_samples", "csv"),
                 mime="text/csv",
                 use_container_width=True,
                 help="仅 Top5 未命中的检索样本",
