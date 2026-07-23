@@ -47,8 +47,8 @@ def parse_document(file_path: str = None, file_bytes: bytes = None, file_name: s
 
     # 推断格式
     ext = Path(file_name).suffix.lower()
-    if ext not in (".txt", ".md", ".docx", ".xlsx"):
-        raise ValueError(f"不支持的文件格式: {ext}（支持 .txt, .md, .docx, .xlsx）")
+    if ext not in (".txt", ".md", ".docx", ".xlsx", ".xls", ".csv"):
+        raise ValueError(f"不支持的文件格式: {ext}（支持 .txt, .md, .docx, .xlsx, .xls, .csv）")
 
     source_type = ext.lstrip(".")
 
@@ -59,6 +59,10 @@ def parse_document(file_path: str = None, file_bytes: bytes = None, file_name: s
         result = _parse_docx(file_bytes, file_name)
     elif source_type == "xlsx":
         result = _parse_xlsx(file_bytes, file_name)
+    elif source_type == "csv":
+        result = _parse_csv(file_bytes, file_name)
+    elif source_type == "xls":
+        result = _parse_xls(file_bytes, file_name)
     else:
         raise ValueError(f"未实现的解析器: {source_type}")
 
@@ -338,11 +342,157 @@ def _format_cell_value(cell, warnings: list, sheet_name: str, row_idx: int, head
     return val_str
 
 
+# ========== CSV 解析 ==========
+
+def _parse_csv(file_bytes: bytes, file_name: str) -> dict:
+    """解析 CSV 文件。支持 UTF-8、UTF-8 BOM、GBK 编码探测。"""
+    import io
+    import pandas as pd
+
+    warnings = []
+
+    # 编码探测
+    encoding = None
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            file_bytes.decode(enc)
+            encoding = enc
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if encoding is None:
+        try:
+            import charset_normalizer
+            result = charset_normalizer.from_bytes(file_bytes).best()
+            encoding = result.encoding if result else "utf-8"
+        except Exception:
+            encoding = "utf-8"
+        warnings.append(f"自动检测编码: {encoding}")
+
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding, dtype=str, keep_default_na=False)
+    except Exception as e:
+        raise ValueError(f"无法解析 CSV 文件: {e}")
+
+    if df.empty:
+        raise ValueError(f"CSV 文件 {file_name} 为空或无有效数据")
+
+    headers = [str(c) for c in df.columns.tolist()]
+    blocks = []
+    row_count = 0
+
+    for row_idx, row in enumerate(df.values.tolist(), start=2):
+        row_values = [str(v) for v in row]
+        if not any(v.strip() for v in row_values):
+            continue
+
+        parts = [f"行：{row_idx}"]
+        for header, val in zip(headers, row_values):
+            if val.strip():
+                parts.append(f"{header}：{val}")
+
+        block_text = "；".join(parts)
+        blocks.append({
+            "text": block_text,
+            "location": {
+                "source_file": file_name,
+                "source_type": "csv",
+                "sheet_name": "CSV",
+                "row_number": row_idx,
+                "headers": headers,
+            },
+        })
+        row_count += 1
+
+    if not blocks:
+        raise ValueError(f"CSV 文件 {file_name} 中未提取到任何数据")
+
+    full_text = "\n\n".join(b["text"] for b in blocks)
+
+    return {
+        "text": full_text,
+        "blocks": blocks,
+        "summary": {"sheet_count": 1, "row_count": row_count, "table_count": 1},
+        "warnings": warnings,
+    }
+
+
+# ========== XLS 解析 ==========
+
+def _parse_xls(file_bytes: bytes, file_name: str) -> dict:
+    """解析 Excel .xls 文件。使用 pandas + xlrd。"""
+    import io
+    import pandas as pd
+
+    warnings = []
+
+    try:
+        sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, engine='xlrd', dtype=str)
+    except ImportError:
+        raise ValueError("XLS 格式需要安装 xlrd 库。请运行: pip install xlrd")
+    except Exception as e:
+        raise ValueError(f"无法打开 XLS 文件: {e}")
+
+    warnings.append("XLS 格式不保留公式信息，单元格显示值可能为缓存计算结果")
+
+    blocks = []
+    sheet_count = 0
+    row_count = 0
+
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            warnings.append(f"工作表「{sheet_name}」为空，已跳过")
+            continue
+
+        df = df.fillna("")
+        headers = [str(c) for c in df.columns.tolist()]
+
+        sheet_row_count = 0
+        for row_idx, row in enumerate(df.values.tolist(), start=2):
+            row_values = [str(v) for v in row]
+            if not any(v.strip() for v in row_values):
+                continue
+
+            parts = [f"工作表：{sheet_name}；行：{row_idx}"]
+            for header, val in zip(headers, row_values):
+                if val.strip():
+                    parts.append(f"{header}：{val}")
+
+            block_text = "；".join(parts)
+            blocks.append({
+                "text": block_text,
+                "location": {
+                    "source_file": file_name,
+                    "source_type": "xls",
+                    "sheet_name": str(sheet_name),
+                    "row_number": row_idx,
+                    "headers": headers,
+                },
+            })
+            sheet_row_count += 1
+
+        if sheet_row_count > 0:
+            sheet_count += 1
+            row_count += sheet_row_count
+
+    if not blocks:
+        raise ValueError(f"XLS 文件 {file_name} 中未提取到任何数据")
+
+    full_text = "\n\n".join(b["text"] for b in blocks)
+
+    return {
+        "text": full_text,
+        "blocks": blocks,
+        "summary": {"sheet_count": sheet_count, "row_count": row_count, "table_count": sheet_count},
+        "warnings": warnings,
+    }
+
+
 # ========== 工具函数 ==========
 
 def get_supported_extensions() -> list:
     """返回支持的文件扩展名列表。"""
-    return [".txt", ".md", ".docx", ".xlsx"]
+    return [".txt", ".md", ".docx", ".xlsx", ".xls", ".csv"]
 
 
 def is_supported_file(file_name: str) -> bool:

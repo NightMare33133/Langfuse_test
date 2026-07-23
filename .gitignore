@@ -17,6 +17,7 @@ data/questions/
 data/batch/
 *.jsonl
 *.json
+data/langfuse_connections.json
 
 /7.08进度汇报.md
 

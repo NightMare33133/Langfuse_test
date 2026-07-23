@@ -636,13 +636,16 @@ def test_utility_functions():
     assert ".md" in exts
     assert ".docx" in exts
     assert ".xlsx" in exts
+    assert ".csv" in exts
+    assert ".xls" in exts
     print(f"  支持格式: {exts}")
 
     assert is_supported_file("test.txt") is True
     assert is_supported_file("test.docx") is True
     assert is_supported_file("test.xlsx") is True
+    assert is_supported_file("test.csv") is True
+    assert is_supported_file("test.xls") is True
     assert is_supported_file("test.pdf") is False
-    assert is_supported_file("test.csv") is False
     print("[OK] 工具函数正确")
 
     print()

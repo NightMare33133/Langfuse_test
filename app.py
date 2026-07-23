@@ -981,7 +981,7 @@ st.sidebar.markdown(
 st.sidebar.divider()
 st.sidebar.markdown("**四步工作流**")
 st.sidebar.markdown(
-    "1. **题目生成** — 上传知识库文件（.txt/.md/.docx/.xlsx），自动按章节切分后调用 LLM 出题，"
+    "1. **题目生成** — 上传知识库文件（.txt/.md/.docx/.xlsx/.xls/.csv），自动按章节切分后调用 LLM 出题，"
     "生成带参考答案的评测题集\n"
     "2. **批量提问** — 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，"
     "收集回答与检索结果\n"
@@ -1109,7 +1109,7 @@ with tab_qgen:
 
     # --- Config section (collapsible) ---
     with st.expander("配置", expanded=True):
-        qgen_uploaded = st.file_uploader("上传知识库文件", type=["txt", "md", "docx", "xlsx"], key="qgen_upload")
+        qgen_uploaded = st.file_uploader("上传知识库文件", type=["txt", "md", "docx", "xlsx", "xls", "csv"], key="qgen_upload")
 
         # 出题模式选择（放在最显眼的位置）
         qgen_mode_selection = st.radio(
@@ -1256,6 +1256,14 @@ with tab_qgen:
         info_col2.metric("文件大小", f"{file_size_kb:.1f} KB")
         info_col3.metric("字符数", f"{char_count:,}")
 
+        # 电子表格格式额外指标
+        if parse_result.get("source_type") in ("xlsx", "xls", "csv"):
+            _summary = parse_result.get("summary", {})
+            _ex1, _ex2, _ex3 = st.columns(3)
+            _ex1.metric("工作表数", _summary.get("sheet_count", "?"))
+            _ex2.metric("数据行数", _summary.get("row_count", "?"))
+            _ex3.metric("表格数", _summary.get("table_count", "?"))
+
         # 解析摘要
         _parse_summary = format_parse_summary(parse_result)
         st.caption(_parse_summary)
@@ -1267,19 +1275,47 @@ with tab_qgen:
                 for w in _warnings:
                     st.warning(w)
 
-        with st.expander("文件内容预览", expanded=False):
-            preview_len = 500
-            if char_count > preview_len:
-                st.text(file_content[:preview_len] + "...")
-                st.caption(f"（显示前 {preview_len} 字，共 {char_count:,} 字）")
-            else:
-                st.text(file_content)
+        # 电子表格检索模式：显示 Markdown 表格块预览
+        _is_spreadsheet_preview = (
+            parse_result.get("source_type") in ("xlsx", "xls", "csv")
+            and mode_val == MODE_RETRIEVAL
+        )
+        if _is_spreadsheet_preview:
+            with st.expander("发送给 LLM 的表格 Markdown（检索模式专用）", expanded=True):
+                try:
+                    from spreadsheet_question_generator import (
+                        parse_xlsx_to_sheet_contexts,
+                        parse_csv_to_sheet_contexts,
+                        parse_xls_to_sheet_contexts,
+                        _build_prompt,
+                    )
+                    _ext = Path(file_name).suffix.lower()
+                    if _ext == ".xlsx":
+                        _preview_sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+                    elif _ext == ".xls":
+                        _preview_sheets = parse_xls_to_sheet_contexts(file_bytes)
+                    else:
+                        _preview_sheets = parse_csv_to_sheet_contexts(file_bytes, file_name)
+                    _preview_prompt = _build_prompt(_preview_sheets, qgen_num, qgen_topic_hint)
+                    st.code(_preview_prompt, language=None)
+                    st.caption(f"Prompt 长度：{len(_preview_prompt)} 字符 | 工作表 {len(_preview_sheets)} 个 | 表格块 {sum(len(s.table_blocks) for s in _preview_sheets)} 个")
+                except Exception as e:
+                    st.error(f"表格解析预览失败: {e}")
+        else:
+            with st.expander("文件内容预览", expanded=False):
+                preview_len = 500
+                if char_count > preview_len:
+                    st.text(file_content[:preview_len] + "...")
+                    st.caption(f"（显示前 {preview_len} 字，共 {char_count:,} 字）")
+                else:
+                    st.text(file_content)
 
-        if char_count > 8000:
+        if char_count > 8000 and not _is_spreadsheet_preview:
             st.info(f"文件较长（{char_count:,} 字），建议使用「标准」或「深度」策略以确保内容覆盖完整。")
 
         # --- Auto-mode analysis (show when strategy is auto) ---
-        if qgen_strategy == "自动":
+        # 电子表格检索模式不使用 chunking 策略，跳过此分析
+        if qgen_strategy == "自动" and not _is_spreadsheet_preview:
             from question_generator import _split_markdown_sections
             sections = _split_markdown_sections(file_content)
             is_plain = len(sections) == 1 and sections[0][0] == "(前言)"
@@ -1309,29 +1345,35 @@ with tab_qgen:
 
         # --- Prompt 示例 ---
         with st.expander("Prompt 示例（点击展开）", expanded=False):
-            from question_generator import (
-                load_qgen_prompt_template, chunk_document, allocate_questions,
-                choose_strategy, _BALANCED_MAX_CHARS, _BALANCED_MAX_CHUNKS,
-                MAX_CHUNK_CHARS, MAX_CHUNKS, _FAST_MAX_CHARS,
-            )
-            _qgen_template = load_qgen_prompt_template(mode_val)
-
-            # 显示当前模式
-            if mode_val == MODE_RETRIEVAL:
-                st.markdown("**当前模式：检索评测** — Prompt 侧重生成具体、可定位、答案明确的检索测试题目")
+            if _is_spreadsheet_preview:
+                # 电子表格检索模式：显示专用 prompt（已在上方表格 Markdown 预览中展示）
+                st.markdown("**当前模式：电子表格检索评测** — 使用专用表格 prompt，LLM 只输出题目和锚定区域，金标准由本地渲染")
+                st.markdown("实际发送给 LLM 的完整 prompt 已在上方「发送给 LLM 的表格 Markdown」中展示。")
+                st.caption("该 prompt 包含：表格内容（带 Excel 行号和 allowed_anchor_ranges 白名单）、出题规范、输出格式要求。LLM 不会输出 reference_answer。")
             else:
-                st.markdown("**当前模式：全流程问答评测** — Prompt 侧重生成适合完整问答能力测试的题目")
+                from question_generator import (
+                    load_qgen_prompt_template, chunk_document, allocate_questions,
+                    choose_strategy, _BALANCED_MAX_CHARS, _BALANCED_MAX_CHUNKS,
+                    MAX_CHUNK_CHARS, MAX_CHUNKS, _FAST_MAX_CHARS,
+                )
+                _qgen_template = load_qgen_prompt_template(mode_val)
 
-            # 构造示例参数
-            _difficulty_map = {"混合": "混合", "基础概念题": "基础", "理解题": "理解", "综合题": "综合"}
-            _qgen_diff_val = _difficulty_map.get(qgen_difficulty, "混合")
+                # 显示当前模式
+                if mode_val == MODE_RETRIEVAL:
+                    st.markdown("**当前模式：检索评测** — Prompt 侧重生成具体、可定位、答案明确的检索测试题目")
+                else:
+                    st.markdown("**当前模式：全流程问答评测** — Prompt 侧重生成适合完整问答能力测试的题目")
 
-            _topic_hint_section = ""
-            if qgen_topic_hint:
-                _topic_hint_section = f"- 主题方向：{qgen_topic_hint}"
+                # 构造示例参数
+                _difficulty_map = {"混合": "混合", "基础概念题": "基础", "理解题": "理解", "综合题": "综合"}
+                _qgen_diff_val = _difficulty_map.get(qgen_difficulty, "混合")
 
-            # --- 运行机制说明 ---
-            st.markdown("""
+                _topic_hint_section = ""
+                if qgen_topic_hint:
+                    _topic_hint_section = f"- 主题方向：{qgen_topic_hint}"
+
+                # --- 运行机制说明 ---
+                st.markdown("""
 **题目生成的真实运行流程：**
 
 1. **切分文档** — 将整篇知识库文件按章节/段落切分为多个 chunk
@@ -1342,93 +1384,93 @@ with tab_qgen:
 因此，"题目数量 10"是整篇文档的总目标，不是单个 chunk 要出 10 道。
 """)
 
-            # --- chunk 分配预览 ---
-            if qgen_uploaded is not None:
-                strategy_map = {"自动": "auto", "极速": "fast", "标准": "balanced", "深度": "deep"}
-                _strategy_val = strategy_map.get(qgen_strategy, "auto")
+                # --- chunk 分配预览 ---
+                if qgen_uploaded is not None:
+                    strategy_map = {"自动": "auto", "极速": "fast", "标准": "balanced", "深度": "deep"}
+                    _strategy_val = strategy_map.get(qgen_strategy, "auto")
 
-                # 根据策略选择切分参数
-                if _strategy_val == "auto":
-                    _predicted = choose_strategy(file_content)
-                    _strategy_val = _predicted
-                    _strategy_name = f"自动 → {STRATEGY_LABELS[_predicted]}"
+                    # 根据策略选择切分参数
+                    if _strategy_val == "auto":
+                        _predicted = choose_strategy(file_content)
+                        _strategy_val = _predicted
+                        _strategy_name = f"自动 → {STRATEGY_LABELS[_predicted]}"
+                    else:
+                        _strategy_name = qgen_strategy
+
+                    if _strategy_val == "fast":
+                        _chunks = []  # fast 模式不真正切分，只有 1 个 chunk
+                        _chunk_count = 1
+                        _alloc = [qgen_num]
+                    elif _strategy_val == "balanced":
+                        _chunks = chunk_document(file_content, max_chars=_BALANCED_MAX_CHARS, max_chunks=_BALANCED_MAX_CHUNKS)
+                        _chunk_count = len(_chunks)
+                        _alloc = allocate_questions(_chunks, qgen_num)
+                    else:  # deep
+                        _chunks = chunk_document(file_content, max_chars=MAX_CHUNK_CHARS, max_chunks=MAX_CHUNKS)
+                        _chunk_count = len(_chunks)
+                        _alloc = allocate_questions(_chunks, qgen_num)
+
+                    st.markdown(f"**当前文档切分预览**（策略：{_strategy_name}）：")
+                    _alloc_display = [f"chunk {i+1}: {n} 题" for i, n in enumerate(_alloc[:10])]
+                    if len(_alloc) > 10:
+                        _alloc_display.append(f"...共 {_chunk_count} 个 chunk")
+                    st.caption(" → ".join(_alloc_display))
+
+                    # 展示前 3 个 chunk 的 prompt 示例
+                    if _chunks:
+                        _preview_count = min(3, len(_chunks))
+                        st.markdown(f"**Prompt 示例**（前 {_preview_count} 个 chunk，与真实执行完全一致）：")
+                        for _pi in range(_preview_count):
+                            _pc = _chunks[_pi]
+                            _pa = _alloc[_pi]
+                            _pc_len = _pc["char_count"]
+                            _pc_context = f"\n当前章节：「{_pc['section_title']}」"
+                            with st.expander(
+                                f"chunk {_pi+1} — 「{_pc['section_title'][:30]}」"
+                                f"（{_pc_len:,} 字 | 分配 {_pa} 题）",
+                                expanded=(_pi == 0),
+                            ):
+                                _p = _qgen_template
+                                _p = _p.replace("{content}", _pc["text"])
+                                _p = _p.replace("{num_questions}", str(_pa))
+                                _p = _p.replace("{difficulty}", _qgen_diff_val)
+                                _p = _p.replace("{topic_hint_section}", _topic_hint_section)
+                                _p = _p.replace("{section_context}", _pc_context)
+                                if _pa <= 1:
+                                    _cov = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
+                                else:
+                                    _cov = f"- 当前片段需生成 {_pa} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
+                                _p = _p.replace("{coverage_instruction}", _cov)
+                                st.code(_p, language=None)
+                                st.caption(f"prompt 长度：{len(_p)} 字符（含 {_pc_len:,} 字 chunk 内容）")
+                        if len(_chunks) > 3:
+                            st.caption(f"...还有 {len(_chunks) - 3} 个 chunk，结构相同，每个 chunk 独立调用 LLM")
+                    else:
+                        # fast 模式：单个 prompt
+                        st.markdown("**Prompt 示例**（极速模式，整个文档前部）：")
+                        _p = _qgen_template
+                        _p = _p.replace("{content}", file_content[:800] + ("..." if len(file_content) > 800 else ""))
+                        _p = _p.replace("{num_questions}", str(qgen_num))
+                        _p = _p.replace("{difficulty}", _qgen_diff_val)
+                        _p = _p.replace("{topic_hint_section}", _topic_hint_section)
+                        _p = _p.replace("{section_context}", "\n当前章节：「文档前部」")
+                        if qgen_num <= 1:
+                            _p = _p.replace("{coverage_instruction}", "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点")
+                        else:
+                            _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
+                        st.code(_p, language=None)
+                        st.caption(f"prompt 长度：{len(_p)} 字符")
                 else:
-                    _strategy_name = qgen_strategy
-
-                if _strategy_val == "fast":
-                    _chunks = []  # fast 模式不真正切分，只有 1 个 chunk
-                    _chunk_count = 1
-                    _alloc = [qgen_num]
-                elif _strategy_val == "balanced":
-                    _chunks = chunk_document(file_content, max_chars=_BALANCED_MAX_CHARS, max_chunks=_BALANCED_MAX_CHUNKS)
-                    _chunk_count = len(_chunks)
-                    _alloc = allocate_questions(_chunks, qgen_num)
-                else:  # deep
-                    _chunks = chunk_document(file_content, max_chars=MAX_CHUNK_CHARS, max_chunks=MAX_CHUNKS)
-                    _chunk_count = len(_chunks)
-                    _alloc = allocate_questions(_chunks, qgen_num)
-
-                st.markdown(f"**当前文档切分预览**（策略：{_strategy_name}）：")
-                _alloc_display = [f"chunk {i+1}: {n} 题" for i, n in enumerate(_alloc[:10])]
-                if len(_alloc) > 10:
-                    _alloc_display.append(f"...共 {_chunk_count} 个 chunk")
-                st.caption(" → ".join(_alloc_display))
-
-                # 展示前 3 个 chunk 的 prompt 示例
-                if _chunks:
-                    _preview_count = min(3, len(_chunks))
-                    st.markdown(f"**Prompt 示例**（前 {_preview_count} 个 chunk，与真实执行完全一致）：")
-                    for _pi in range(_preview_count):
-                        _pc = _chunks[_pi]
-                        _pa = _alloc[_pi]
-                        _pc_len = _pc["char_count"]
-                        _pc_context = f"\n当前章节：「{_pc['section_title']}」"
-                        with st.expander(
-                            f"chunk {_pi+1} — 「{_pc['section_title'][:30]}」"
-                            f"（{_pc_len:,} 字 | 分配 {_pa} 题）",
-                            expanded=(_pi == 0),
-                        ):
-                            _p = _qgen_template
-                            _p = _p.replace("{content}", _pc["text"])
-                            _p = _p.replace("{num_questions}", str(_pa))
-                            _p = _p.replace("{difficulty}", _qgen_diff_val)
-                            _p = _p.replace("{topic_hint_section}", _topic_hint_section)
-                            _p = _p.replace("{section_context}", _pc_context)
-                            if _pa <= 1:
-                                _cov = "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点"
-                            else:
-                                _cov = f"- 当前片段需生成 {_pa} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题"
-                            _p = _p.replace("{coverage_instruction}", _cov)
-                            st.code(_p, language=None)
-                            st.caption(f"prompt 长度：{len(_p)} 字符（含 {_pc_len:,} 字 chunk 内容）")
-                    if len(_chunks) > 3:
-                        st.caption(f"...还有 {len(_chunks) - 3} 个 chunk，结构相同，每个 chunk 独立调用 LLM")
-                else:
-                    # fast 模式：单个 prompt
-                    st.markdown("**Prompt 示例**（极速模式，整个文档前部）：")
+                    st.markdown("**Prompt 模板结构**（上传文件后将展示真实 chunk 分配）：")
                     _p = _qgen_template
-                    _p = _p.replace("{content}", file_content[:800] + ("..." if len(file_content) > 800 else ""))
+                    _p = _p.replace("{content}", "（上传知识库文件后，此处将展示实际文档内容片段）")
                     _p = _p.replace("{num_questions}", str(qgen_num))
                     _p = _p.replace("{difficulty}", _qgen_diff_val)
                     _p = _p.replace("{topic_hint_section}", _topic_hint_section)
-                    _p = _p.replace("{section_context}", "\n当前章节：「文档前部」")
-                    if qgen_num <= 1:
-                        _p = _p.replace("{coverage_instruction}", "- 当前片段只需生成 1 道题，请聚焦于该片段中最核心、最有考查价值的知识点")
-                    else:
-                        _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
+                    _p = _p.replace("{section_context}", "")
+                    _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
                     st.code(_p, language=None)
-                    st.caption(f"prompt 长度：{len(_p)} 字符")
-            else:
-                st.markdown("**Prompt 模板结构**（上传文件后将展示真实 chunk 分配）：")
-                _p = _qgen_template
-                _p = _p.replace("{content}", "（上传知识库文件后，此处将展示实际文档内容片段）")
-                _p = _p.replace("{num_questions}", str(qgen_num))
-                _p = _p.replace("{difficulty}", _qgen_diff_val)
-                _p = _p.replace("{topic_hint_section}", _topic_hint_section)
-                _p = _p.replace("{section_context}", "")
-                _p = _p.replace("{coverage_instruction}", f"- 当前片段需生成 {qgen_num} 道题，如果涉及多个知识点，尽量覆盖不同知识点出题")
-                st.code(_p, language=None)
-                st.caption(f"prompt 模板长度：{len(_p)} 字符")
+                    st.caption(f"prompt 模板长度：{len(_p)} 字符")
 
         # --- Generate button ---
         if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
@@ -1454,9 +1496,9 @@ with tab_qgen:
 
                 mode_label = MODE_LABELS[mode_val]
 
-                # XLSX 直传路径：仅检索模式 + XLSX 文件
-                _is_xlsx_direct = (
-                    parse_result.get("source_type") == "xlsx"
+                # 电子表格直传路径：检索模式 + XLSX/XLS/CSV 文件
+                _is_spreadsheet_direct = (
+                    parse_result.get("source_type") in ("xlsx", "xls", "csv")
                     and mode_val == MODE_RETRIEVAL
                 )
 
@@ -1470,32 +1512,19 @@ with tab_qgen:
                         )
 
                     try:
-                        if _is_xlsx_direct:
-                            from xlsx_question_generator import (
-                                check_xlsx_llm_support, generate_xlsx_questions,
-                            )
-                            status_text.write("检测模型是否支持 XLSX 文件输入...")
-                            _xlsx_ok = check_xlsx_llm_support(
-                                qgen_api_key, qgen_base_url, qgen_model, timeout=15,
-                            )
-                            if not _xlsx_ok:
-                                gen_status.update(label="模型不支持 XLSX 文件输入", state="error")
-                                st.error(
-                                    "当前模型/API 不支持 XLSX 文件输入。"
-                                    "请更换支持文件输入的模型，或切换到「全流程问答评测」模式使用文本解析路径。"
-                                )
-                                st.stop()
+                        if _is_spreadsheet_direct:
+                            from spreadsheet_question_generator import generate_spreadsheet_questions
 
-                            def _on_progress_xlsx(step, total, desc):
-                                status_text.write(f"XLSX 直传出题: {desc} ({step}/{total})")
+                            def _on_progress_spreadsheet(step, total, desc):
+                                status_text.write(f"电子表格出题: {desc} ({step}/{total})")
 
-                            questions, gen_stats = generate_xlsx_questions(
+                            questions, gen_stats = generate_spreadsheet_questions(
                                 file_bytes, file_name,
                                 qgen_api_key, qgen_base_url, qgen_model,
                                 num_questions=qgen_num, difficulty=difficulty_val,
                                 topic_hint=qgen_topic_hint,
                                 timeout=120,
-                                progress_callback=_on_progress_xlsx,
+                                progress_callback=_on_progress_spreadsheet,
                             )
                         else:
                             questions, gen_stats = generate_questions(
@@ -1535,6 +1564,13 @@ with tab_qgen:
                                 f"补题 {gen_stats['supplement_rounds']} 轮，新增 {gen_stats['supplement_new']}"
                             )
                         _stats_parts.append(f"最终 {gen_stats.get('final_count', len(questions))}")
+                        # 电子表格特有统计
+                        if gen_stats.get("sheet_count"):
+                            _stats_parts.append(f"工作表 {gen_stats['sheet_count']}")
+                        if gen_stats.get("block_count"):
+                            _stats_parts.append(f"表格块 {gen_stats['block_count']}")
+                        if gen_stats.get("formula_warnings"):
+                            _stats_parts.append(f"公式警告 {gen_stats['formula_warnings']}")
                         _stats_summary = " | ".join(_stats_parts)
 
                         # 验证文件是否保存成功
@@ -2922,20 +2958,136 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 st.rerun()
 
         elif source_mode == "从 API 拉取":
-            fetch_col1, fetch_col2 = st.columns(2)
-            with fetch_col1:
-                langfuse_host = st.text_input("Langfuse 地址", value=os.getenv("LANGFUSE_HOST", "http://localhost:3000"), key="lf_host")
-                langfuse_pk = st.text_input("Public Key", value=os.getenv("LANGFUSE_PUBLIC_KEY", ""), key="lf_pk")
-            with fetch_col2:
-                langfuse_sk = st.text_input("Secret Key", value=os.getenv("LANGFUSE_SECRET_KEY", ""), type="password", key="lf_sk")
-                fetch_limit = st.number_input("每页 trace 数", min_value=1, max_value=500, value=50, key="lf_limit")
+            from langfuse_connection import (
+                list_profiles, load_profile, create_profile, update_profile,
+                delete_profile, check_connection, mask_public_key,
+            )
+
+            # 连接模式选择
+            _conn_mode = st.radio(
+                "连接方式",
+                ["使用已保存连接（推荐）", "临时手动填写"],
+                horizontal=True,
+                key="lf_conn_mode",
+            )
+
+            langfuse_host = ""
+            langfuse_pk = ""
+            langfuse_sk = ""
+
+            if _conn_mode == "使用已保存连接（推荐）":
+                profiles = list_profiles()
+                if not profiles:
+                    st.info("暂无已保存的 Langfuse 连接配置，请在下方新建，或切换为「临时手动填写」。")
+                else:
+                    _pid_options = {p["profile_id"]: f"{p['display_name']} | {p['host']}" for p in profiles}
+                    _pid_list = list(_pid_options.keys())
+                    selected_pid = st.selectbox(
+                        "选择连接配置",
+                        options=_pid_list,
+                        format_func=lambda x: _pid_options.get(x, x),
+                        key="lf_profile_select",
+                    )
+                    _sel_profile = load_profile(selected_pid)
+                    if _sel_profile:
+                        st.caption(
+                            f"Host: {_sel_profile['host']}　|　"
+                            f"Public Key: {mask_public_key(_sel_profile.get('public_key', ''))}　|　"
+                            f"Secret Key: 已配置"
+                        )
+
+                # 管理连接配置
+                with st.expander("管理连接配置", expanded=False):
+                    _mgmt_action = st.radio(
+                        "操作",
+                        ["新建配置", "编辑当前", "删除当前"],
+                        horizontal=True,
+                        key="lf_mgmt_action",
+                        disabled=not profiles if 'profiles' in dir() else True,
+                    )
+
+                    if _mgmt_action == "新建配置":
+                        with st.form("lf_new_profile_form", clear_on_submit=True):
+                            _new_name = st.text_input("配置名称", key="lf_new_name", placeholder="例如：本地 Langfuse 测试环境")
+                            _new_host = st.text_input("Host", value="http://localhost:3000", key="lf_new_host")
+                            _new_pk = st.text_input("Public Key", key="lf_new_pk")
+                            _new_sk = st.text_input("Secret Key", key="lf_new_sk", type="password")
+                            if st.form_submit_button("保存"):
+                                try:
+                                    create_profile(_new_name, _new_host, _new_pk, _new_sk)
+                                    st.success(f"已保存: {_new_name}")
+                                    st.rerun()
+                                except ValueError as e:
+                                    st.error(str(e))
+
+                    elif _mgmt_action == "编辑当前" and profiles:
+                        _ep = load_profile(st.session_state.get("lf_profile_select", ""))
+                        if _ep:
+                            with st.form("lf_edit_profile_form"):
+                                _ed_name = st.text_input("配置名称", value=_ep["display_name"], key="lf_ed_name")
+                                _ed_host = st.text_input("Host", value=_ep["host"], key="lf_ed_host")
+                                _ed_pk = st.text_input("Public Key", value=_ep.get("public_key", ""), key="lf_ed_pk")
+                                _ed_sk = st.text_input("Secret Key（留空保持原值）", key="lf_ed_sk", type="password")
+                                if st.form_submit_button("保存修改"):
+                                    try:
+                                        sk_val = _ed_sk if _ed_sk else None
+                                        update_profile(_ep["profile_id"], _ed_name, _ed_host, _ed_pk, sk_val)
+                                        st.success("已更新")
+                                        st.rerun()
+                                    except ValueError as e:
+                                        st.error(str(e))
+
+                    elif _mgmt_action == "删除当前" and profiles:
+                        _dp = load_profile(st.session_state.get("lf_profile_select", ""))
+                        if _dp:
+                            st.warning(f"确认删除配置「{_dp['display_name']}」？此操作不可撤销，本地凭据将一并删除。")
+                            if st.button("确认删除", key="lf_confirm_delete"):
+                                delete_profile(_dp["profile_id"])
+                                for k in ("lf_profile_select",):
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                st.success(f"已删除: {_dp['display_name']}")
+                                st.rerun()
+
+                # 测试连接
+                if profiles and st.session_state.get("lf_profile_select"):
+                    _tp = load_profile(st.session_state["lf_profile_select"])
+                    if _tp and st.button("测试连接", key="lf_test_conn"):
+                        try:
+                            ok, msg = check_connection(_tp["host"], _tp.get("public_key", ""), _tp.get("secret_key", ""))
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+                        except ValueError as e:
+                            st.error(str(e))
+
+                # 从 profile 读取凭据
+                if profiles and st.session_state.get("lf_profile_select"):
+                    _cp = load_profile(st.session_state["lf_profile_select"])
+                    if _cp:
+                        langfuse_host = _cp.get("host", "")
+                        langfuse_pk = _cp.get("public_key", "")
+                        langfuse_sk = _cp.get("secret_key", "")
+
+            else:
+                # 临时手动填写模式（仅当前请求内存，不保存）
+                fetch_col1, fetch_col2 = st.columns(2)
+                with fetch_col1:
+                    langfuse_host = st.text_input("Langfuse 地址", value="http://localhost:3000", key="lf_host")
+                    langfuse_pk = st.text_input("Public Key", key="lf_pk")
+                with fetch_col2:
+                    langfuse_sk = st.text_input("Secret Key", key="lf_sk", type="password")
+
+            # 公共：每页 trace 数 + 拉取按钮
+            fetch_limit = st.number_input("每页 trace 数", min_value=1, max_value=500, value=50, key="lf_limit")
 
             if st.button(
                 "拉取 Traces", key="fetch_traces",
                 disabled=st.session_state.get("_fetching", False),
             ):
                 if not langfuse_pk or not langfuse_sk:
-                    st.error("请填写 Langfuse Public Key 和 Secret Key")
+                    st.error("请填写或选择包含 Langfuse Public Key 和 Secret Key 的配置")
                 else:
                     from fetch_traces import fetch_all
                     st.session_state["_fetching"] = True
@@ -2974,7 +3126,6 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                                 _fetch_state["row_count"] += 1
 
-                        # Atomic replace: rename tmp to final
                         tmp_path.rename(final_path)
 
                         elapsed = time.time() - t0
@@ -2991,7 +3142,6 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     except Exception as e:
                         fetch_status.update(label="拉取失败", state="error")
                         st.error(f"拉取失败: {e}")
-                        # Clean up incomplete tmp file
                         if tmp_path.exists():
                             tmp_path.unlink()
                     finally:

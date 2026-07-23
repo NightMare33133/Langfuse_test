@@ -330,76 +330,15 @@ def _render_evidence_range(cell_values):
 def generate_xlsx_questions(file_bytes, file_name, api_key, base_url, model,
                             num_questions=5, difficulty="混合", topic_hint="",
                             timeout=120, progress_callback=None):
-    """XLSX 直传检索题生成。
+    """XLSX 检索题生成 — 委托给统一电子表格模块。
 
-    Args:
-        file_bytes: XLSX 文件原始字节
-        file_name: 文件名
-        api_key, base_url, model: LLM 配置
-        num_questions: 目标题数
-        difficulty: 难度偏好
-        topic_hint: 主题方向
-        timeout: LLM 超时秒数
-        progress_callback: 进度回调
-
-    Returns:
-        tuple: (questions_list, stats_dict)
+    保持原有函数签名不变，内部委托给 spreadsheet_question_generator。
+    原有的内部函数（_validate_and_render_evidence 等）保留以维持测试兼容性。
     """
-    if progress_callback:
-        progress_callback(0, 3, "解析 Excel 文件")
-
-    # 打开 workbook 用于后续验证
-    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
-
-    if progress_callback:
-        progress_callback(1, 3, "调用 LLM 生成检索查询")
-
-    # 构建 prompt
-    prompt = _build_xlsx_prompt(wb, num_questions, difficulty, topic_hint)
-
-    # 调用 LLM
-    response_text = _call_llm_with_file(
-        prompt, file_bytes, file_name,
-        api_key, base_url, model, timeout=timeout,
+    from spreadsheet_question_generator import generate_spreadsheet_questions
+    return generate_spreadsheet_questions(
+        file_bytes, file_name, api_key, base_url, model,
+        num_questions=num_questions, difficulty=difficulty,
+        topic_hint=topic_hint, timeout=timeout,
+        progress_callback=progress_callback, mode="retrieval",
     )
-
-    # 解析响应
-    raw_questions = _parse_xlsx_qgen_response(response_text)
-    raw_count = len(raw_questions)
-
-    if progress_callback:
-        progress_callback(2, 3, "验证证据并渲染金标准")
-
-    # 验证并渲染
-    valid_questions = []
-    validation_eliminated = 0
-    for q in raw_questions:
-        validated, reason = _validate_and_render_evidence(q, wb, file_name)
-        if validated:
-            validated["question_mode"] = MODE_RETRIEVAL
-            valid_questions.append(validated)
-        else:
-            validation_eliminated += 1
-            print(f"  ⚠️ XLSX 证据校验不通过（{reason}），已过滤")
-
-    wb.close()
-
-    # 去重
-    unique_questions = deduplicate_questions(valid_questions)
-    dedup_eliminated = len(valid_questions) - len(unique_questions)
-
-    # 裁剪到目标数
-    if len(unique_questions) > num_questions:
-        unique_questions = unique_questions[:num_questions]
-
-    if not unique_questions:
-        raise ValueError("XLSX 出题失败：所有查询均未通过证据校验")
-
-    stats = {
-        "raw_count": raw_count,
-        "validation_eliminated": validation_eliminated,
-        "dedup_eliminated": dedup_eliminated,
-        "final_count": len(unique_questions),
-        "target": num_questions,
-    }
-    return unique_questions, stats
