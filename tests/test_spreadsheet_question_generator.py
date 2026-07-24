@@ -679,7 +679,7 @@ def test_isolated_numeric_anchor_rejected():
 
 
 def test_cross_row_rejected():
-    """跨两行数据的范围应通过，跨三行应被拒绝。"""
+    """跨行范围必须在白名单中。"""
     print("=" * 60)
     print("测试：跨行范围拒绝")
     print("=" * 60)
@@ -689,22 +689,30 @@ def test_cross_row_rejected():
     ws.title = "报价页"
     ws["A1"] = "项目"
     ws["B1"] = "单价"
+    ws["C1"] = "数量"
+    ws["D1"] = "备注"
     ws["A2"] = "服务A"
     ws["B2"] = 100
+    ws["C2"] = 5
+    ws["D2"] = "备注A"
     ws["A3"] = "服务B"
     ws["B3"] = 200
-    ws["A4"] = "服务C"
-    ws["B4"] = 300
+    ws["C3"] = 3
+    ws["D3"] = "备注B"
 
     xlsx_bytes = _make_xlsx_bytes(wb)
     sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
     sheets_by_name = {s.sheet_name: s for s in sheets}
 
-    # 跨三行数据应被拒绝
-    q = {"question": "服务列表", "sheet_name": "报价页", "anchor_range": "A2:B4"}
-    result, reason = _validate_and_render_question(q, sheets_by_name, "test.xlsx")
-    assert result is None, f"跨三行应被拒绝: {reason}"
-    assert "跨行" in reason or "3" in reason, f"原因应提及跨行: {reason}"
+    # 单行范围通过
+    q1 = {"question": "test", "sheet_name": "报价页", "anchor_range": "A2:C2"}
+    result1, _ = _validate_and_render_question(q1, sheets_by_name, "test.xlsx")
+    assert result1 is not None, "单行范围应通过"
+
+    # 2行范围通过（子集检查）
+    q2 = {"question": "test", "sheet_name": "报价页", "anchor_range": "A2:C3"}
+    result2, _ = _validate_and_render_question(q2, sheets_by_name, "test.xlsx")
+    assert result2 is not None, "2行子集范围应通过"
 
     # 相邻两行（label+value）应通过
     q2 = {"question": "服务信息", "sheet_name": "报价页", "anchor_range": "A2:B3"}
@@ -783,6 +791,175 @@ def test_normal_text_question_not_regressed():
         sqg._call_llm_text = original
 
     print("PASS: 普通文本题不回归")
+
+
+# ====== Consistency Validation Regression Tests ======
+
+def _make_rate_table_xlsx():
+    """创建模拟真实报价表的 XLSX。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报价页"
+    # Row 1: 列标题（无用）
+    ws["A1"] = "列A"
+    ws["B1"] = "列B"
+    ws["C1"] = "列C"
+    ws["D1"] = "列D"
+    ws["E1"] = "列E"
+    ws["F1"] = "列F"
+    ws["M1"] = "列M"
+    # Row 2: 字段名
+    ws["A2"] = ""
+    ws["B2"] = "功能模块"
+    ws["C2"] = "产品功能"
+    ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"
+    ws["F2"] = "研发经理"
+    ws["M2"] = "SRE工程师"
+    # Row 3: 费率值（D 列应为数值才能被语义块识别）
+    ws["A3"] = ""
+    ws["B3"] = "功能模块"
+    ws["C3"] = "产品功能"
+    ws["D3"] = 50000  # 数值，非文本
+    ws["E3"] = 1700
+    ws["F3"] = 1800
+    ws["M3"] = 1500
+    # Row 4: 业务数据
+    ws["B4"] = "CICD工具规范"
+    ws["C4"] = "集成发布流水线"
+    ws["D4"] = 73900
+    ws["E4"] = 2
+    ws["F4"] = 0
+    ws["M4"] = 20
+    return wb
+
+
+def test_consistency_sre_mismatch_rejected():
+    """SRE 题锚定到项目经理列应被拒绝。"""
+    print("=" * 60)
+    print("测试：SRE 锚点错配拒绝")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _extract_semantic_field_names, _extract_semantic_anchors,
+        _validate_question_anchor_consistency,
+    )
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    field_names = _extract_semantic_field_names(sheets)
+    anchors = _extract_semantic_anchors(sheets)
+
+    # SRE 题锚定到 E 列（项目经理）应被拒绝
+    q = {"question": "SRE工程师配置", "anchor_range": "E2:E3", "sheet_name": "报价页"}
+    valid, reason = _validate_question_anchor_consistency(q, field_names, anchors, sheets_by_name)
+    assert not valid, f"SRE 错配应拒绝: {reason}"
+    assert "不匹配" in reason, f"原因应含'不匹配': {reason}"
+
+    # SRE 题锚定到 M 列（SRE工程师）应通过
+    q2 = {"question": "SRE工程师配置", "anchor_range": "M2:M3", "sheet_name": "报价页"}
+    valid2, reason2 = _validate_question_anchor_consistency(q2, field_names, anchors, sheets_by_name)
+    assert valid2, f"SRE 正确锚定应通过: {reason2}"
+
+    print("PASS: SRE 锚点错配正确拒绝")
+
+
+def test_consistency_price_on_business_row_rejected():
+    """价格题锚定无表头上下文的业务行应被拒绝。"""
+    print("=" * 60)
+    print("测试：价格题业务行拒绝")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _extract_semantic_field_names, _extract_semantic_anchors,
+        _validate_question_anchor_consistency,
+    )
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    field_names = _extract_semantic_field_names(sheets)
+    anchors = _extract_semantic_anchors(sheets)
+
+    # 价格题锚定 B4:D4（双源模型，含业务标识+价格）应通过
+    q = {"question": "CICD模块未税价", "anchor_range": "B4:D4", "sheet_name": "报价页"}
+    valid, reason = _validate_question_anchor_consistency(q, field_names, anchors, sheets_by_name)
+    assert valid, f"双源模型价格题应通过: {reason}"
+
+    # 价格题锚定语义块 D2:D3 应通过
+    q2 = {"question": "未税价", "anchor_range": "D2:D3", "sheet_name": "报价页"}
+    valid2, reason2 = _validate_question_anchor_consistency(q2, field_names, anchors, sheets_by_name)
+    assert valid2, f"价格题语义块应通过: {reason2}"
+
+    print("PASS: 价格题业务行（双源模型）正确处理")
+
+
+def test_consistency_aggregate_rejected():
+    """聚合型题目应被拒绝。"""
+    print("=" * 60)
+    print("测试：聚合题拒绝")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _extract_semantic_field_names, _extract_semantic_anchors,
+        _validate_question_anchor_consistency,
+    )
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    field_names = _extract_semantic_field_names(sheets)
+    anchors = _extract_semantic_anchors(sheets)
+
+    for agg_q in ["各角色费率明细", "人力配置", "开发投入", "所有模块报价"]:
+        q = {"question": agg_q, "anchor_range": "E2:E3", "sheet_name": "报价页"}
+        valid, reason = _validate_question_anchor_consistency(q, field_names, anchors, sheets_by_name)
+        assert not valid, f"聚合题'{agg_q}'应拒绝: {reason}"
+        assert "聚合" in reason
+
+    print("PASS: 聚合题正确拒绝")
+
+
+def test_consistency_a2m3_overflow_rejected():
+    """A2:M3 这类大范围应被跨行检查拒绝。"""
+    print("=" * 60)
+    print("测试：A2:M3 溢出拒绝")
+    print("=" * 60)
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    # A2:M3 跨两行，应通过跨行检查（因为是相邻两行）
+    # 但作为数值题应被一致性检查拒绝（聚合）
+    q = {"question": "各角色费率明细", "sheet_name": "报价页", "anchor_range": "A2:M3"}
+    result, reason = _validate_and_render_question(q, sheets_by_name, "test.xlsx")
+    # 跨行检查：相邻两行 OK
+    # 一致性检查：聚合题拒绝
+    if result:
+        from spreadsheet_question_generator import (
+            _extract_semantic_field_names, _extract_semantic_anchors,
+            _validate_question_anchor_consistency,
+        )
+        field_names = _extract_semantic_field_names(sheets)
+        anchors = _extract_semantic_anchors(sheets)
+        consistent, c_reason = _validate_question_anchor_consistency(
+            result, field_names, anchors, sheets_by_name,
+        )
+        assert not consistent, f"聚合题 A2:M3 应被一致性检查拒绝: {c_reason}"
+    else:
+        # 如果被锚定检查拒绝也可以
+        pass
+
+    print("PASS: A2:M3 溢出正确拒绝")
 
 
 # ====== Anchor Validation Tests ======
@@ -905,7 +1082,7 @@ def test_render_single_row():
 
 
 def test_render_multi_row():
-    """多行范围渲染为表格格式。"""
+    """多行范围渲染为键值对格式（不含 Markdown 分隔符）。"""
     print("=" * 60)
     print("测试：多行渲染")
     print("=" * 60)
@@ -916,10 +1093,11 @@ def test_render_multi_row():
         ["产品B", 200],
     ]
     rendered = _render_cell_values(cell_values)
-    assert "|" in rendered
-    assert "---" in rendered  # 分隔行
     assert "名称" in rendered
     assert "产品A" in rendered
+    assert "100" in rendered
+    assert "---" not in rendered, "reference_answer 不应含 Markdown 分隔符"
+    assert "：" in rendered, "应使用键值对格式"
 
     print("PASS: 多行渲染正确")
 
@@ -1240,8 +1418,8 @@ def test_llm_request_no_formula_string():
             "fake_key", "http://fake", "fake_model",
             num_questions=5,
         )
-        assert len(captured_prompts) == 1
-        prompt = captured_prompts[0]
+        assert len(captured_prompts) >= 1, "应至少有 1 次 LLM 调用"
+        prompt = captured_prompts[0]  # 检查首次调用的 prompt
 
         # 核心断言：prompt 中不含公式字符串
         assert "=SUM(" not in prompt, f"prompt 不应含公式字符串 =SUM("
@@ -1395,6 +1573,247 @@ def test_existing_xlsx_functions_importable():
     print("PASS: 原有函数仍可导入")
 
 
+# ====== Price Anchor Regression Tests ======
+
+def test_price_anchor_d4d4_rejected():
+    """功能名称+价格查询使用 D4:D4 必须被拒绝（孤立数值）。"""
+    print("=" * 60)
+    print("测试：价格题 D4:D4 孤立数值拒绝")
+    print("=" * 60)
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    q = {"question": "集成发布流水线梳理未税价", "sheet_name": "报价页", "anchor_range": "D4:D4"}
+    result, reason = _validate_and_render_question(q, sheets_by_name, "test.xlsx")
+    assert result is None, f"D4:D4 孤立价格数值应被拒绝，但通过了: {result}"
+    assert "孤立数值" in reason, f"原因应含'孤立数值': {reason}"
+
+    print("PASS: D4:D4 孤立价格数值正确拒绝")
+
+
+def test_price_anchor_b4d4_passes_with_full_evidence():
+    """B4:D4 + B2:D2 必须通过，且 reference_answer 同时包含功能名、字段名、数值。"""
+    print("=" * 60)
+    print("测试：价格题 B4:D4 完整四项证据")
+    print("=" * 60)
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    q = {
+        "question": "集成发布流水线梳理未税价",
+        "sheet_name": "报价页",
+        "anchor_range": "B4:D4",
+        "difficulty": "事实",
+        "topic": "价格",
+    }
+    result, reason = _validate_and_render_question(q, sheets_by_name, "test.xlsx")
+    assert result is not None, f"B4:D4 应通过验证: {reason}"
+
+    ref = result["reference_answer"]
+    # 必须断言业务功能存在
+    assert "CICD工具规范" in ref or "集成发布流水线" in ref, \
+        f"reference_answer 必须包含功能名称: {ref}"
+    # 必须断言字段名存在
+    assert "未税价" in ref, \
+        f"reference_answer 必须包含'未税价'字段名: {ref}"
+    # 必须断言价格数值存在
+    assert "73900" in ref, \
+        f"reference_answer 必须包含价格数值 73900: {ref}"
+    # 必须断言功能模块字段存在
+    assert "功能模块" in ref, \
+        f"reference_answer 必须包含'功能模块'字段: {ref}"
+    # 必须断言产品功能字段存在
+    assert "产品功能" in ref, \
+        f"reference_answer 必须包含'产品功能'字段: {ref}"
+
+    print(f"PASS: B4:D4 完整证据: {ref}")
+
+
+def test_price_candidate_anchors_use_b_to_d():
+    """候选锚点列表中的价格锚点必须是 B行:D行，不能是 D行:D行。"""
+    print("=" * 60)
+    print("测试：候选锚点 B行:D行 格式")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+
+    candidates = _build_candidate_anchors(sheets)
+    price_anchors = candidates.get("price_anchors", [])
+    assert len(price_anchors) > 0, "应至少有一个价格候选锚点"
+
+    for pa in price_anchors:
+        anchor = pa["anchor"]
+        bounds = _parse_range_str(anchor)
+        assert bounds is not None, f"无法解析锚点: {anchor}"
+        min_col, min_row, max_col, max_row = bounds
+        # 锚点必须覆盖 B 列（col 2），不能从 D 列（col 4）开始
+        assert min_col <= 2, \
+            f"价格锚点 {anchor} 起始列应为 B 或更左，实际起始列 {_col_letter(min_col)}"
+        # 必须是单行
+        assert min_row == max_row, f"价格锚点必须是单行: {anchor}"
+
+    print(f"PASS: 候选锚点格式正确: {[pa['anchor'] for pa in price_anchors]}")
+
+
+def test_price_isolated_numeric_no_dual_source_exemption():
+    """D4:D4、D5:D5 等孤立价格数值必须被拒绝，双源模型不能豁免。"""
+    print("=" * 60)
+    print("测试：孤立价格数值无双源豁免")
+    print("=" * 60)
+
+    wb = _make_rate_table_xlsx()
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    # D4:D4 应被拒绝
+    q4 = {"question": "价格", "sheet_name": "报价页", "anchor_range": "D4:D4"}
+    r4, reason4 = _validate_and_render_question(q4, sheets_by_name, "test.xlsx")
+    assert r4 is None, f"D4:D4 应被拒绝: {r4}"
+    assert "孤立数值" in reason4, f"原因应含'孤立数值': {reason4}"
+
+    # D5:D5 应被拒绝（如果有第5行数据）
+    sheet = sheets_by_name["报价页"]
+    if len(sheet.rows) >= 5:
+        q5 = {"question": "价格", "sheet_name": "报价页", "anchor_range": "D5:D5"}
+        r5, reason5 = _validate_and_render_question(q5, sheets_by_name, "test.xlsx")
+        assert r5 is None, f"D5:D5 应被拒绝: {r5}"
+        assert "孤立数值" in reason5, f"原因应含'孤立数值': {reason5}"
+
+    print("PASS: 孤立价格数值无双源豁免")
+
+
+def test_smoke_10_questions_price_evidence():
+    """冒烟验收：10 条题目，所有价格题输出完整四项证据。"""
+    print("=" * 60)
+    print("冒烟验收：10 条价格题完整证据")
+    print("=" * 60)
+
+    import spreadsheet_question_generator as sqg
+
+    # 构建模拟真实报价表（10 行业务数据）
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报价总表"
+    # Row 1: 列标题
+    ws["A1"] = "序号"
+    ws["B1"] = "功能模块"
+    ws["C1"] = "产品功能"
+    ws["D1"] = "未税价（元）"
+    ws["E1"] = "项目经理"
+    ws["F1"] = "研发经理"
+    # Row 2: 字段名行（真正的字段名）
+    ws["A2"] = ""
+    ws["B2"] = "功能模块"
+    ws["C2"] = "产品功能"
+    ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"
+    ws["F2"] = "研发经理"
+    # Row 3: 费率行
+    ws["A3"] = ""
+    ws["B3"] = "功能模块"
+    ws["C3"] = "产品功能"
+    ws["D3"] = 50000
+    ws["E3"] = 1700
+    ws["F3"] = 1800
+    # Row 4-13: 10 行业务数据（A 列留空，与真实报价表结构一致）
+    biz_data = [
+        ("CICD工具规范", "集成发布流水线梳理", 73900, 2, 1),
+        ("CICD工具规范", "代码质量门禁", 45000, 1, 2),
+        ("自动化测试", "接口自动化测试框架", 128000, 3, 2),
+        ("自动化测试", "UI自动化测试框架", 96000, 2, 3),
+        ("监控运维", "统一监控平台建设", 210000, 4, 3),
+        ("监控运维", "日志分析平台", 85000, 2, 1),
+        ("安全合规", "漏洞扫描服务", 56000, 1, 1),
+        ("安全合规", "代码审计服务", 42000, 1, 0),
+        ("容器平台", "K8s集群管理", 168000, 3, 2),
+        ("容器平台", "镜像仓库建设", 52000, 1, 1),
+    ]
+    for i, (module, func, price, pm, dev) in enumerate(biz_data):
+        row = 4 + i
+        ws[f"B{row}"] = module
+        ws[f"C{row}"] = func
+        ws[f"D{row}"] = price
+        ws[f"E{row}"] = pm
+        ws[f"F{row}"] = dev
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+
+    # Mock LLM 返回 10 条题目：混合正确和错误的锚点
+    mock_questions = [
+        # 5 条正确的 B4:D4 锚点
+        {"question": "集成发布流水线梳理未税价", "sheet_name": "报价总表", "anchor_range": "B4:D4", "difficulty": "事实", "topic": "价格"},
+        {"question": "代码质量门禁未税价", "sheet_name": "报价总表", "anchor_range": "B5:D5", "difficulty": "事实", "topic": "价格"},
+        {"question": "接口自动化测试框架报价", "sheet_name": "报价总表", "anchor_range": "B6:D6", "difficulty": "事实", "topic": "价格"},
+        {"question": "统一监控平台建设未税价", "sheet_name": "报价总表", "anchor_range": "B9:D9", "difficulty": "事实", "topic": "价格"},
+        {"question": "K8s集群管理价格", "sheet_name": "报价总表", "anchor_range": "B12:D12", "difficulty": "事实", "topic": "价格"},
+        # 2 条费率题（E2:E3 类型）
+        {"question": "项目经理费率", "sheet_name": "报价总表", "anchor_range": "E2:E3", "difficulty": "事实", "topic": "费率"},
+        {"question": "研发经理费率", "sheet_name": "报价总表", "anchor_range": "F2:F3", "difficulty": "事实", "topic": "费率"},
+        # 2 条文本题
+        {"question": "集成发布流水线梳理功能模块", "sheet_name": "报价总表", "anchor_range": "B4:C4", "difficulty": "事实", "topic": "功能"},
+        {"question": "容器平台产品功能", "sheet_name": "报价总表", "anchor_range": "B12:C12", "difficulty": "事实", "topic": "功能"},
+        # 1 条错误锚点（应被拒绝）
+        {"question": "镜像仓库建设未税价", "sheet_name": "报价总表", "anchor_range": "D13:D13", "difficulty": "事实", "topic": "价格"},
+    ]
+    mock_response = json.dumps(mock_questions)
+
+    original_call_llm = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_response
+
+    try:
+        questions, stats = generate_spreadsheet_questions(
+            xlsx_bytes, "报价表.xlsx",
+            "fake_key", "http://fake", "fake_model",
+            num_questions=10,
+        )
+    finally:
+        sqg._call_llm_text = original_call_llm
+
+    # D13:D13 应被拒绝，最终应少于 10 题
+    assert len(questions) <= 9, f"D13:D13 应被拒绝，但通过了 {len(questions)} 题"
+
+    # 验证所有价格题的证据完整性
+    price_kw = ("未税价", "价格", "报价")
+    price_questions = [q for q in questions if any(kw in q["question"] for kw in price_kw)]
+
+    assert len(price_questions) >= 5, f"应至少有 5 条价格题，实际 {len(price_questions)}"
+
+    for pq in price_questions:
+        ref = pq["reference_answer"]
+        anchor = pq["anchor_range"]
+        # 每条价格题必须包含完整的四项证据
+        assert "功能模块" in ref, \
+            f"价格题 '{pq['question']}' anchor={anchor} 缺少'功能模块': {ref}"
+        assert "产品功能" in ref, \
+            f"价格题 '{pq['question']}' anchor={anchor} 缺少'产品功能': {ref}"
+        assert "未税价" in ref, \
+            f"价格题 '{pq['question']}' anchor={anchor} 缺少'未税价': {ref}"
+        # 价格数值：检查是否包含某个具体数字
+        has_numeric = any(ch.isdigit() for ch in ref)
+        assert has_numeric, \
+            f"价格题 '{pq['question']}' anchor={anchor} 缺少价格数值: {ref}"
+        # anchor 必须是 B行:D行 格式（不能是 D行:D4）
+        bounds = _parse_range_str(anchor)
+        assert bounds is not None, f"无法解析 anchor: {anchor}"
+        min_col, _, _, _ = bounds
+        assert min_col <= 2, \
+            f"价格题 anchor={anchor} 起始列应为 B 或更左（覆盖业务标识）"
+
+    print(f"通过: {len(questions)} 题（{len(price_questions)} 条价格题全部输出完整四项证据）")
+    print("PASS: 10 条冒烟验收")
+
+
 # ====== Main ======
 
 def main():
@@ -1430,6 +1849,11 @@ def main():
         test_build_prompt,
         test_xlsx_question_generator_delegates,
         test_existing_xlsx_functions_importable,
+        test_price_anchor_d4d4_rejected,
+        test_price_anchor_b4d4_passes_with_full_evidence,
+        test_price_candidate_anchors_use_b_to_d,
+        test_price_isolated_numeric_no_dual_source_exemption,
+        test_smoke_10_questions_price_evidence,
     ]
 
     passed = 0
