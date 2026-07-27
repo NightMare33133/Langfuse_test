@@ -960,7 +960,10 @@ def _validate_question_anchor_consistency(question, semantic_field_names, semant
 
 # ─── 汇总行检测 ──────────────────────────────────────────────────────────────
 
-_SUMMARY_KEYWORDS = ("总计", "合计", "小计", "汇总", "总成本", "总费用", "总金额", "小合计")
+_SUMMARY_KEYWORDS = (
+    "总计", "合计", "小计", "汇总", "总成本", "总费用", "总金额", "小合计",
+    "total", "subtotal", "grand total", "sum",
+)
 
 
 def _is_summary_row(row_data):
@@ -992,6 +995,17 @@ def _is_summary_row(row_data):
     if not text_cells:
         return True
 
+    return False
+
+
+def _range_overlaps_multicell_merge(min_row, min_col, max_row, max_col, merged_cells):
+    """检查范围是否与跨行合并单元格重叠。"""
+    for mr_min, mc_min, mr_max, mc_max in merged_cells:
+        if mr_max > mr_min:  # 跨行合并
+            # 检查矩形重叠
+            if (min_row <= mr_max and max_row >= mr_min and
+                    min_col <= mc_max and max_col >= mc_min):
+                return True
     return False
 
 
@@ -1085,6 +1099,10 @@ def _build_candidate_anchors(sheets):
                             continue
                         seen.add(sr_key)
 
+                        # 跳过与跨行合并单元格重叠的子范围
+                        if _range_overlaps_multicell_merge(a_min_row, sr_start, a_min_row, sr_end, sheet.merged_cells):
+                            continue
+
                         sub_anchor = f"{_col_letter(sr_start)}{a_min_row}:{_col_letter(sr_end)}{a_min_row}"
                         fact_fields = []
                         focus_parts = []
@@ -1118,6 +1136,9 @@ def _build_candidate_anchors(sheets):
                     min_col, min_row, max_col, max_row = bounds
                     row_count = max_row - min_row + 1
                     if row_count != 2:
+                        continue
+                    # 跳过与跨行合并单元格重叠的范围
+                    if _range_overlaps_multicell_merge(min_row, min_col, max_row, max_col, sheet.merged_cells):
                         continue
                     field_name = ""
                     value = ""
@@ -1162,17 +1183,22 @@ def _build_candidate_anchors(sheets):
                 row_data = sheet.rows[min_row - 1] if min_row - 1 < len(sheet.rows) else []
                 if _is_summary_row(row_data):
                     continue
+                if _range_overlaps_multicell_merge(min_row, min_col, max_row, max_col, sheet.merged_cells):
+                    continue
                 text_cols = []
                 header_names = []
+                non_empty_count = 0
                 for c in range(min_col, max_col + 1):
                     val = sheet.rows[min_row - 1][c - 1] if c - 1 < len(sheet.rows[min_row - 1]) else None
+                    if val is not None and str(val).strip():
+                        non_empty_count += 1
                     if val and not _is_numeric_value(val) and str(val).strip():
                         text_cols.append(str(val).strip())
                     # 读取表头名
                     hdr = sheet.rows[0][c - 1] if c - 1 < len(sheet.rows[0]) else None
                     if hdr and str(hdr).strip():
                         header_names.append(str(hdr).strip())
-                if len(text_cols) >= 2:
+                if len(text_cols) >= 1 and non_empty_count >= 2:
                     candidates.append({
                         "evidence_mode": "text_fact",
                         "sheet_name": sheet.sheet_name,
@@ -1739,6 +1765,12 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
 
     # 2. 构建候选锚点清单
     candidate_anchors = _build_candidate_anchors(sheets)
+
+    if not candidate_anchors:
+        raise ValueError(
+            f"文件 {file_name} 中未生成任何合法候选锚点。"
+            "可能原因：所有数据行均为汇总/合计行，或表格结构不支持生成检索题。"
+        )
 
     # 3. 构建 prompt（含候选锚点）
     prompt = _build_prompt(sheets, num_questions, topic_hint, candidate_anchors)
