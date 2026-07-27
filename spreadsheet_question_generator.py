@@ -877,15 +877,10 @@ _NUMERIC_KEYWORDS = (
     "未税价", "价格", "报价", "费率", "投入", "人月", "人数", "工期",
     "比例", "金额", "配置", "人力", "开发", "工时",
 )
-_ROLE_KEYWORDS = (
-    "项目经理", "研发经理", "DevOps专家", "DevOps工程师",
-    "前端工程师", "后端工程师", "BA", "测试", "SRE工程师", "SRE",
-)
 _AGGREGATE_KEYWORDS = (
     "各角色", "各模块", "所有", "明细", "汇总", "总计", "配置清单",
     "人力配置", "开发投入",
 )
-_PRICE_KEYWORDS = ("未税价", "价格", "报价")
 
 
 def _extract_semantic_field_names(sheets):
@@ -925,49 +920,26 @@ def _extract_semantic_anchors(sheets):
     return anchors
 
 
-def _is_standalone_role_mention(text, role):
-    """检查角色名是否在文本中作为独立实体出现（非子串）。
-
-    使用排除法：如果角色名前面紧接特定前缀字符（构成复合词），则不是独立提及。
-    """
-    # 常见的会与角色名构成复合词的前缀
-    _PREFIX_CHARS = set('自动化半全手动智能')
-    idx = text.find(role)
-    while idx >= 0:
-        # 检查前一个字符是否是会构成复合词的前缀
-        if idx > 0 and text[idx - 1] in _PREFIX_CHARS:
-            idx = text.find(role, idx + 1)
-            continue
-        return True
-    return False
-
-
 def _validate_question_anchor_consistency(question, semantic_field_names, semantic_anchors, sheets_by_name):
-    """校验题意与锚点的一致性。
+    """校验题意与锚点的一致性（通用结构检查）。
 
     Returns (is_valid, reason).
     """
     q_text = (question.get("question") or "").strip()
     anchor_range = (question.get("anchor_range") or "").strip()
-    sheet_name = (question.get("sheet_name") or "").strip()
-
-    q_lower = q_text.lower()
 
     # 1. 检测聚合型题目
     for kw in _AGGREGATE_KEYWORDS:
         if kw in q_text:
             return False, f"聚合型题目（含'{kw}'），每题只能考一个知识点"
 
-    # 2. 检测数值/角色相关题目
+    # 2. 数值题必须使用语义块锚点
     is_numeric_question = any(kw in q_text for kw in _NUMERIC_KEYWORDS)
-    is_role_question = any(kw in q_text for kw in _ROLE_KEYWORDS)
 
-    if (is_numeric_question or is_role_question) and semantic_anchors:
-        # 2a. anchor 必须是语义块来源的子集
+    if is_numeric_question and semantic_anchors:
         anchor_bounds = _parse_range_str(anchor_range)
         is_in_semantic = anchor_range in semantic_anchors
         if not is_in_semantic and anchor_bounds:
-            # 检查是否是某个语义 anchor 的子集
             a_min_col, a_min_row, a_max_col, a_max_row = anchor_bounds
             for sa in semantic_anchors:
                 sa_bounds = _parse_range_str(sa)
@@ -979,106 +951,60 @@ def _validate_question_anchor_consistency(question, semantic_field_names, semant
                         break
         if not is_in_semantic:
             return False, (
-                f"数值/角色题'{q_text}'的 anchor '{anchor_range}' "
+                f"数值题'{q_text}'的 anchor '{anchor_range}' "
                 f"不在语义块中，数值类题只能使用语义块的字段名+数值锚点"
             )
 
-        # 2b. 问题中出现具体角色名时，anchor 对应的字段名必须包含该角色
-        # 只匹配独立的角色名（前后是标点、空格或字符串边界），避免"自动化测试"误匹配"测试"
-        for role in _ROLE_KEYWORDS:
-            if _is_standalone_role_mention(q_text, role):
-                bounds = _parse_range_str(anchor_range)
-                if bounds and sheet_name in sheets_by_name:
-                    sheet = sheets_by_name[sheet_name]
-                    min_col, min_row, _, _ = bounds
-                    field_in_anchor = str(sheet.rows[min_row - 1][min_col - 1] or "").strip()
-                    if role not in field_in_anchor:
-                        return False, (
-                            f"问题含角色'{role}'但 anchor '{anchor_range}' "
-                            f"对应字段'{field_in_anchor}'，角色不匹配"
-                        )
-                break
-
-        # 2c. 价格题：检查表头上下文是否包含价格字段列
-        for kw in _PRICE_KEYWORDS:
-            if kw in q_text:
-                # 查找该锚点对应的语义块的 header_context_range
-                header_ctx = None
-                if sheet_name in sheets_by_name:
-                    sheet = sheets_by_name[sheet_name]
-                    anchor_bounds = _parse_range_str(anchor_range)
-                    for block in sheet.table_blocks:
-                        if not block.header_context_range:
-                            continue
-                        # 检查 anchor 是否在该块的 allowed_anchor_ranges 中（精确或子集）
-                        for allowed in block.allowed_anchor_ranges:
-                            if anchor_range == allowed:
-                                header_ctx = block.header_context_range
-                                break
-                            allowed_bounds = _parse_range_str(allowed)
-                            if anchor_bounds and allowed_bounds:
-                                a_min_col, a_min_row, a_max_col, a_max_row = anchor_bounds
-                                s_min_col, s_min_row, s_max_col, s_max_row = allowed_bounds
-                                if (a_min_col >= s_min_col and a_max_col <= s_max_col and
-                                        a_min_row >= s_min_row and a_max_row <= s_max_row):
-                                    header_ctx = block.header_context_range
-                                    break
-                        if header_ctx:
-                            break
-
-                if header_ctx:
-                    # 双源模型：检查表头上下文是否包含价格字段
-                    h_bounds = _parse_range_str(header_ctx)
-                    if h_bounds and sheet_name in sheets_by_name:
-                        sheet = sheets_by_name[sheet_name]
-                        h_min_col, h_min_row, h_max_col, _ = h_bounds
-                        has_price_field = False
-                        for c in range(h_min_col, h_max_col + 1):
-                            field = str(sheet.rows[h_min_row - 1][c - 1] or "").strip()
-                            if any(pk in field for pk in _PRICE_KEYWORDS):
-                                has_price_field = True
-                                break
-                        if not has_price_field:
-                            return False, (
-                                f"价格题'{q_text}'的表头上下文不包含价格字段列"
-                            )
-                else:
-                    # 非双源模型：检查 anchor 本身是否包含价格字段
-                    bounds = _parse_range_str(anchor_range)
-                    if bounds and sheet_name in sheets_by_name:
-                        sheet = sheets_by_name[sheet_name]
-                        min_col, min_row, max_col_r, _ = bounds
-                        has_price_field = False
-                        for c in range(min_col, max_col_r + 1):
-                            field = str(sheet.rows[min_row - 1][c - 1] or "").strip()
-                            if any(pk in field for pk in _PRICE_KEYWORDS):
-                                has_price_field = True
-                                break
-                        if not has_price_field:
-                            return False, (
-                                f"价格题'{q_text}'的 anchor '{anchor_range}' "
-                                f"不包含价格字段列"
-                            )
-                break
-
     return True, ""
+
+
+# ─── 汇总行检测 ──────────────────────────────────────────────────────────────
+
+_SUMMARY_KEYWORDS = ("总计", "合计", "小计", "汇总", "总成本", "总费用", "总金额", "小合计")
+
+
+def _is_summary_row(row_data):
+    """检测行是否为汇总/合计行。
+
+    判断逻辑：
+    1. 第一个非空单元格包含汇总关键词
+    2. 行中所有非空单元格都是数值（纯数值行无业务标识）
+    """
+    if not row_data:
+        return False
+
+    # 检查第一个非空单元格
+    first_text = None
+    for v in row_data:
+        if v is not None and str(v).strip():
+            first_text = str(v).strip()
+            break
+    if first_text:
+        for kw in _SUMMARY_KEYWORDS:
+            if kw in first_text:
+                return True
+
+    # 纯数值行无业务标识（如 M52:N22 区域的总计行）
+    non_empty = [v for v in row_data if v is not None and str(v).strip()]
+    if not non_empty:
+        return False
+    text_cells = [v for v in non_empty if not _is_numeric_value(v)]
+    if not text_cells:
+        return True
+
+    return False
 
 
 # ─── 候选锚点构建 ─────────────────────────────────────────────────────────────
 
 def _build_candidate_anchors(sheets):
-    """为 LLM 构建合法候选锚点清单，按类别分组。
+    """为 LLM 构建合法候选证据清单（统一格式）。
 
     Returns:
-        dict: {
-            "rate_anchors": [{"anchor": "E2:E3", "field": "项目经理", "value": "1700"}, ...],
-            "price_anchors": [{"anchor": "D4:D4", "header_ctx": "B2:M2", "product": "集成发布流水线梳理"}, ...],
-            "text_anchors": [{"anchor": "B4:C4", "content": "CICD工具规范 | 集成发布流水线梳理"}, ...],
-        }
+        list[dict]: 每项含 evidence_mode, sheet_name, anchor_range,
+                    header_context_range, fact_fields, query_focus
     """
-    rate_anchors = []
-    price_anchors = []
-    text_anchors = []
+    candidates = []
 
     for sheet in sheets:
         for block in sheet.table_blocks:
@@ -1086,64 +1012,105 @@ def _build_candidate_anchors(sheets):
                 continue  # 跳过标准块
 
             if block.header_context_range:
-                # 双源模型：业务行锚点
-                # 收集本块所有单行锚点的行号和列范围，构建完整业务行锚点
-                row_anchors = {}  # row_num -> (min_col, max_col)
-                for anchor in block.allowed_anchor_ranges:
-                    bounds = _parse_range_str(anchor)
-                    if not bounds:
-                        continue
-                    min_col, min_row, max_col, max_row = bounds
-                    if max_row != min_row:
-                        continue  # 只取单行锚点
-                    row_num = min_row
-                    if row_num not in row_anchors:
-                        row_anchors[row_num] = (min_col, max_col)
-                    else:
-                        old_min, old_max = row_anchors[row_num]
-                        row_anchors[row_num] = (min(min_col, old_min), max(max_col, old_max))
-
+                # ── record_with_schema_context：带表头上下文的业务行记录 ──
                 h_bounds = _parse_range_str(block.header_context_range)
                 if not h_bounds:
                     continue
                 h_min_col, h_min_row, h_max_col, _ = h_bounds
 
-                for row_num, (rc_min, rc_max) in row_anchors.items():
-                    # 构建完整业务行锚点：覆盖 header_context_range 的全部列
-                    biz_anchor = f"{_col_letter(h_min_col)}{row_num}:{_col_letter(h_max_col)}{row_num}"
-                    # 读取业务行数据
-                    row_data = sheet.rows[row_num - 1] if row_num - 1 < len(sheet.rows) else []
-                    # 找价格字段
-                    price_field = None
-                    for c in range(h_min_col, h_max_col + 1):
-                        h_val = sheet.rows[h_min_row - 1][c - 1] if c - 1 < len(sheet.rows[h_min_row - 1]) else None
-                        if h_val and any(pk in str(h_val) for pk in _PRICE_KEYWORDS):
-                            price_field = str(h_val).strip()
-                            break
-                    # 找功能模块和产品功能
-                    func_module = ""
-                    product_func = ""
-                    for c in range(h_min_col, h_max_col + 1):
-                        h_val = sheet.rows[h_min_row - 1][c - 1] if c - 1 < len(sheet.rows[h_min_row - 1]) else None
-                        if not h_val:
-                            continue
-                        h_str = str(h_val).strip()
-                        if "功能模块" in h_str:
-                            v = row_data[c - 1] if c - 1 < len(row_data) else None
-                            func_module = str(v).strip() if v else ""
-                        elif "产品功能" in h_str:
-                            v = row_data[c - 1] if c - 1 < len(row_data) else None
-                            product_func = str(v).strip() if v else ""
+                # 每个 allowed_anchor_range 生成独立候选，不合并
+                for anchor in block.allowed_anchor_ranges:
+                    bounds = _parse_range_str(anchor)
+                    if not bounds:
+                        continue
+                    a_min_col, a_min_row, a_max_col, a_max_row = bounds
+                    if a_max_row != a_min_row:
+                        continue
 
-                    if product_func:
-                        price_anchors.append({
-                            "anchor": biz_anchor,
-                            "header_ctx": block.header_context_range,
-                            "product": product_func,
-                            "module": func_module,
-                        })
+                    row_data = sheet.rows[a_min_row - 1] if a_min_row - 1 < len(sheet.rows) else []
+
+                    # 跳过汇总/合计行
+                    if _is_summary_row(row_data):
+                        continue
+
+                    # 扫描业务行，找出 anchor 范围内连续文本列的分组
+                    # 每个分组生成一个子范围候选
+                    text_col_groups = []  # list of (start_col, end_col)
+                    group_start = None
+                    for c in range(a_min_col, a_max_col + 1):
+                        v = row_data[c - 1] if c - 1 < len(row_data) else None
+                        is_text = v is not None and str(v).strip() and not _is_numeric_value(v)
+                        if is_text:
+                            if group_start is None:
+                                group_start = c
+                        else:
+                            if group_start is not None:
+                                text_col_groups.append((group_start, c - 1))
+                                group_start = None
+                    if group_start is not None:
+                        text_col_groups.append((group_start, a_max_col))
+
+                    # 如果没有找到文本分组，回退到完整 anchor 范围
+                    if not text_col_groups:
+                        text_col_groups = [(a_min_col, a_max_col)]
+
+                    # 为每个连续文本列分组生成候选
+                    # 同时生成包含紧邻数值列的扩展候选（身份+数值模式）
+                    sub_ranges = []
+                    for g_start, g_end in text_col_groups:
+                        # 纯文本子范围
+                        sub_ranges.append((g_start, g_end))
+                        # 扩展：包含紧随其后的第一个数值列（身份+主值模式）
+                        first_numeric_end = None
+                        for c in range(g_end + 1, a_max_col + 1):
+                            v = row_data[c - 1] if c - 1 < len(row_data) else None
+                            if v is not None and _is_numeric_value(v):
+                                first_numeric_end = c
+                                break
+                            else:
+                                break
+                        if first_numeric_end is not None:
+                            sub_ranges.append((g_start, first_numeric_end))
+
+                    # 完整 anchor 范围也作为候选（用于需要多列数值的查询）
+                    full_key = (a_min_col, a_max_col)
+                    if full_key not in {(s, e) for s, e in sub_ranges}:
+                        sub_ranges.append(full_key)
+
+                    # 去重并生成候选
+                    seen = set()
+                    for sr_start, sr_end in sub_ranges:
+                        sr_key = (sr_start, sr_end)
+                        if sr_key in seen:
+                            continue
+                        seen.add(sr_key)
+
+                        sub_anchor = f"{_col_letter(sr_start)}{a_min_row}:{_col_letter(sr_end)}{a_min_row}"
+                        fact_fields = []
+                        focus_parts = []
+                        for c in range(sr_start, sr_end + 1):
+                            h_val = None
+                            if h_min_col <= c <= h_max_col:
+                                h_val = sheet.rows[h_min_row - 1][c - 1] if c - 1 < len(sheet.rows[h_min_row - 1]) else None
+                            fname = str(h_val).strip() if h_val else ""
+                            if not fname or _is_numeric_value(h_val):
+                                continue
+                            fact_fields.append(fname)
+                            v = row_data[c - 1] if c - 1 < len(row_data) else None
+                            if v is not None and str(v).strip():
+                                focus_parts.append(str(v).strip())
+
+                        if fact_fields and focus_parts:
+                            candidates.append({
+                                "evidence_mode": "record_with_schema_context",
+                                "sheet_name": sheet.sheet_name,
+                                "anchor_range": sub_anchor,
+                                "header_context_range": block.header_context_range,
+                                "fact_fields": fact_fields,
+                                "query_focus": " | ".join(focus_parts[:4]),
+                            })
             else:
-                # 费率表语义块
+                # ── field_value_pair：字段名+数值垂直对 ──
                 for anchor in block.allowed_anchor_ranges:
                     bounds = _parse_range_str(anchor)
                     if not bounds:
@@ -1152,9 +1119,9 @@ def _build_candidate_anchors(sheets):
                     row_count = max_row - min_row + 1
                     if row_count != 2:
                         continue
-                    # 读取字段名和值
                     field_name = ""
                     value = ""
+                    row_values = []
                     for r in range(min_row, max_row + 1):
                         for c in range(min_col, max_col + 1):
                             val = sheet.rows[r - 1][c - 1] if c - 1 < len(sheet.rows[r - 1]) else None
@@ -1163,18 +1130,25 @@ def _build_candidate_anchors(sheets):
                             val_str = str(val).strip()
                             if not val_str or val_str == "[公式未计算]":
                                 continue
+                            row_values.append(val_str)
                             if _is_numeric_value(val):
                                 value = val_str
                             else:
                                 field_name = val_str
+                    # 跳过含汇总关键词的行
+                    if any(kw in v for v in row_values for kw in _SUMMARY_KEYWORDS):
+                        continue
                     if field_name and value:
-                        rate_anchors.append({
-                            "anchor": anchor,
-                            "field": field_name,
-                            "value": value,
+                        candidates.append({
+                            "evidence_mode": "field_value_pair",
+                            "sheet_name": sheet.sheet_name,
+                            "anchor_range": anchor,
+                            "header_context_range": None,
+                            "fact_fields": [field_name],
+                            "query_focus": f"{field_name}：{value}",
                         })
 
-        # 文本锚点：从标准块中找功能归属
+        # ── text_fact：标准块中的多列文本事实 ──
         for block in sheet.table_blocks:
             if block.block_index != 0:
                 continue
@@ -1185,23 +1159,30 @@ def _build_candidate_anchors(sheets):
                 min_col, min_row, max_col, max_row = bounds
                 if max_row != min_row:
                     continue
-                # 检查是否包含文本列
+                row_data = sheet.rows[min_row - 1] if min_row - 1 < len(sheet.rows) else []
+                if _is_summary_row(row_data):
+                    continue
                 text_cols = []
+                header_names = []
                 for c in range(min_col, max_col + 1):
                     val = sheet.rows[min_row - 1][c - 1] if c - 1 < len(sheet.rows[min_row - 1]) else None
                     if val and not _is_numeric_value(val) and str(val).strip():
                         text_cols.append(str(val).strip())
+                    # 读取表头名
+                    hdr = sheet.rows[0][c - 1] if c - 1 < len(sheet.rows[0]) else None
+                    if hdr and str(hdr).strip():
+                        header_names.append(str(hdr).strip())
                 if len(text_cols) >= 2:
-                    text_anchors.append({
-                        "anchor": anchor,
-                        "content": " | ".join(text_cols[:3]),
+                    candidates.append({
+                        "evidence_mode": "text_fact",
+                        "sheet_name": sheet.sheet_name,
+                        "anchor_range": anchor,
+                        "header_context_range": None,
+                        "fact_fields": header_names if header_names else text_cols[:3],
+                        "query_focus": " | ".join(text_cols[:3]),
                     })
 
-    return {
-        "rate_anchors": rate_anchors,
-        "price_anchors": price_anchors,
-        "text_anchors": text_anchors,
-    }
+    return candidates
 
 
 # ─── Prompt 构建 ──────────────────────────────────────────────────────────────
@@ -1236,30 +1217,36 @@ def _build_prompt(sheets, num_questions, topic_hint="", candidate_anchors=None):
 
     table_blocks_text = "\n\n---\n\n".join(block_texts)
 
-    # 构建候选锚点清单
+    # 构建候选证据清单
     candidate_text = ""
     if candidate_anchors:
+        _MODE_LABELS = {
+            "record_with_schema_context": "带表头上下文的记录证据（anchor_range 覆盖单行业务行，header_context_range 自动附带）",
+            "field_value_pair": "字段-数值对证据（anchor_range 包含字段名和数值，如参数表、费率表）",
+            "text_fact": "文本事实证据（anchor_range 覆盖连续文本列）",
+        }
         parts = []
-        if candidate_anchors.get("rate_anchors"):
-            lines = ["**角色费率锚点**（anchor_range 必须精确使用这些值）："]
-            for a in candidate_anchors["rate_anchors"]:
-                lines.append(f"- `{a['anchor']}` → {a['field']}：{a['value']}")
-            parts.append("\n".join(lines))
-
-        if candidate_anchors.get("price_anchors"):
-            lines = ["**业务功能未税价锚点**（anchor_range 使用单行业务行，表头上下文自动附带）："]
-            for a in candidate_anchors["price_anchors"]:
-                lines.append(f"- `{a['anchor']}` → {a['product']}（{a.get('module', '')}）")
-            parts.append("\n".join(lines))
-
-        if candidate_anchors.get("text_anchors"):
-            lines = ["**功能归属文本锚点**（可用于模块/功能名称类检索题）："]
-            for a in candidate_anchors["text_anchors"][:20]:  # 限制显示数量
-                lines.append(f"- `{a['anchor']}` → {a['content']}")
+        for mode, label in _MODE_LABELS.items():
+            items = [a for a in candidate_anchors if a.get("evidence_mode") == mode]
+            if not items:
+                continue
+            lines = [f"**{label}**："]
+            for a in items[:20]:
+                item_parts = [
+                    f"**sheet_name**: {a['sheet_name']}",
+                    f"**anchor_range**: `{a['anchor_range']}`",
+                ]
+                if a.get("header_context_range"):
+                    item_parts.append(f"**header_context_range**: `{a['header_context_range']}`")
+                if a.get("fact_fields"):
+                    item_parts.append(f"**fact_fields**: [{', '.join(a['fact_fields'])}]")
+                item_parts.append(f"**query_focus**: {a['query_focus']}")
+                line = "- " + " | ".join(item_parts)
+                lines.append(line)
             parts.append("\n".join(lines))
 
         if parts:
-            candidate_text = "\n\n---\n\n## 合法候选锚点清单\n\n" + "\n\n".join(parts)
+            candidate_text = "\n\n---\n\n## 合法候选证据清单\n\n" + "\n\n".join(parts)
 
     prompt = template.replace("{table_blocks_text}", table_blocks_text)
     prompt = prompt.replace("{num_questions}", str(num_questions))
@@ -1671,12 +1658,8 @@ def _categorize_rejection(reason):
         return "whitelist"
     if "聚合" in r:
         return "aggregate"
-    if "不匹配" in r or "角色" in r:
-        return "role_mismatch"
     if "孤立数值" in r:
         return "isolated_numeric"
-    if "价格" in r or "价格字段" in r:
-        return "price_field"
     if "跨行" in r:
         return "cross_row"
     if "空" in r or "为空" in r:
@@ -1797,10 +1780,9 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
         remaining = num_questions - len(unique_questions)
         # 找出未使用的候选锚点
         unused_candidates = []
-        for cat in ("rate_anchors", "price_anchors", "text_anchors"):
-            for a in candidate_anchors.get(cat, []):
-                if a["anchor"] not in used_anchors:
-                    unused_candidates.append(a)
+        for a in candidate_anchors:
+            if a["anchor_range"] not in used_anchors:
+                unused_candidates.append(a)
 
         if unused_candidates and remaining > 0:
             if progress_callback:
@@ -1809,7 +1791,7 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
             # 构建补充 prompt
             used_anchors_str = ", ".join(f"`{a}`" for a in sorted(used_anchors))
             unused_str = "\n".join(
-                f"- `{a['anchor']}` → {a.get('field', '') or a.get('product', '') or a.get('content', '')}"
+                f"- `{a['anchor_range']}` → {a['query_focus']}"
                 for a in unused_candidates[:remaining * 2]
             )
             supplement_prompt = (
@@ -1859,9 +1841,8 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
         "formula_warnings": total_formula_warnings,
         "format_warnings": format_warnings,
         "candidate_counts": {
-            "rate_anchors": len(candidate_anchors.get("rate_anchors", [])),
-            "price_anchors": len(candidate_anchors.get("price_anchors", [])),
-            "text_anchors": len(candidate_anchors.get("text_anchors", [])),
+            mode: sum(1 for a in candidate_anchors if a.get("evidence_mode") == mode)
+            for mode in ("record_with_schema_context", "field_value_pair", "text_fact")
         },
     }
     return unique_questions, stats

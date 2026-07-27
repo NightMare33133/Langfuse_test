@@ -834,37 +834,34 @@ def _make_rate_table_xlsx():
     return wb
 
 
-def test_consistency_sre_mismatch_rejected():
-    """SRE 题锚定到项目经理列应被拒绝。"""
+def test_candidate_anchors_have_correct_fact_fields():
+    """候选锚点的 fact_fields 应正确反映字段名。"""
     print("=" * 60)
-    print("测试：SRE 锚点错配拒绝")
+    print("测试：候选锚点 fact_fields 正确性")
     print("=" * 60)
 
-    from spreadsheet_question_generator import (
-        _extract_semantic_field_names, _extract_semantic_anchors,
-        _validate_question_anchor_consistency,
-    )
+    from spreadsheet_question_generator import _build_candidate_anchors
 
     wb = _make_rate_table_xlsx()
     xlsx_bytes = _make_xlsx_bytes(wb)
     sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
-    sheets_by_name = {s.sheet_name: s for s in sheets}
 
-    field_names = _extract_semantic_field_names(sheets)
-    anchors = _extract_semantic_anchors(sheets)
+    candidates = _build_candidate_anchors(sheets)
 
-    # SRE 题锚定到 E 列（项目经理）应被拒绝
-    q = {"question": "SRE工程师配置", "anchor_range": "E2:E3", "sheet_name": "报价页"}
-    valid, reason = _validate_question_anchor_consistency(q, field_names, anchors, sheets_by_name)
-    assert not valid, f"SRE 错配应拒绝: {reason}"
-    assert "不匹配" in reason, f"原因应含'不匹配': {reason}"
+    # field_value_pair 候选项的 fact_fields 应包含正确字段名
+    fvp = [c for c in candidates if c["evidence_mode"] == "field_value_pair"]
+    assert len(fvp) > 0, "应有 field_value_pair 候选项"
+    fvp_fields = {c["fact_fields"][0] for c in fvp}
+    assert "项目经理" in fvp_fields, f"应含'项目经理': {fvp_fields}"
 
-    # SRE 题锚定到 M 列（SRE工程师）应通过
-    q2 = {"question": "SRE工程师配置", "anchor_range": "M2:M3", "sheet_name": "报价页"}
-    valid2, reason2 = _validate_question_anchor_consistency(q2, field_names, anchors, sheets_by_name)
-    assert valid2, f"SRE 正确锚定应通过: {reason2}"
+    # record_with_schema_context 候选项的 fact_fields 应包含业务标识列
+    rsc = [c for c in candidates if c["evidence_mode"] == "record_with_schema_context"]
+    assert len(rsc) > 0, "应有 record_with_schema_context 候选项"
+    for c in rsc:
+        assert len(c["fact_fields"]) >= 2, f"fact_fields 应含至少2个字段: {c['fact_fields']}"
+        assert c["header_context_range"] is not None, "应有 header_context_range"
 
-    print("PASS: SRE 锚点错配正确拒绝")
+    print(f"PASS: field_value_pair {len(fvp)} 条, record_with_schema_context {len(rsc)} 条")
 
 
 def test_consistency_price_on_business_row_rejected():
@@ -1648,21 +1645,21 @@ def test_price_candidate_anchors_use_b_to_d():
     sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
 
     candidates = _build_candidate_anchors(sheets)
-    price_anchors = candidates.get("price_anchors", [])
-    assert len(price_anchors) > 0, "应至少有一个价格候选锚点"
+    rsc = [c for c in candidates if c["evidence_mode"] == "record_with_schema_context"]
+    assert len(rsc) > 0, "应至少有一个 record_with_schema_context 候选项"
 
-    for pa in price_anchors:
-        anchor = pa["anchor"]
+    for pa in rsc:
+        anchor = pa["anchor_range"]
         bounds = _parse_range_str(anchor)
         assert bounds is not None, f"无法解析锚点: {anchor}"
         min_col, min_row, max_col, max_row = bounds
         # 锚点必须覆盖 B 列（col 2），不能从 D 列（col 4）开始
         assert min_col <= 2, \
-            f"价格锚点 {anchor} 起始列应为 B 或更左，实际起始列 {_col_letter(min_col)}"
+            f"锚点 {anchor} 起始列应为 B 或更左，实际起始列 {_col_letter(min_col)}"
         # 必须是单行
-        assert min_row == max_row, f"价格锚点必须是单行: {anchor}"
+        assert min_row == max_row, f"锚点必须是单行: {anchor}"
 
-    print(f"PASS: 候选锚点格式正确: {[pa['anchor'] for pa in price_anchors]}")
+    print(f"PASS: 候选锚点格式正确: {[pa['anchor_range'] for pa in rsc]}")
 
 
 def test_price_isolated_numeric_no_dual_source_exemption():
@@ -1814,6 +1811,462 @@ def test_smoke_10_questions_price_evidence():
     print("PASS: 10 条冒烟验收")
 
 
+# ====== Generic Evidence Mode Tests ======
+
+def test_candidate_anchors_inventory_table():
+    """库存/产品表应生成 record_with_schema_context 候选项。"""
+    print("=" * 60)
+    print("测试：库存表候选锚点")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "库存表"
+    ws["A1"] = "商品编号"
+    ws["B1"] = "商品名称"
+    ws["C1"] = "库存数量"
+    ws["D1"] = "单价"
+    ws["A2"] = "P001"
+    ws["B2"] = "笔记本电脑"
+    ws["C2"] = 50
+    ws["D2"] = 6999
+    ws["A3"] = "P002"
+    ws["B3"] = "机械键盘"
+    ws["C3"] = 200
+    ws["D3"] = 399
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+
+    candidates = _build_candidate_anchors(sheets)
+    assert len(candidates) > 0, "应生成候选锚点"
+
+    # 检查是否有文本事实候选项
+    tf = [c for c in candidates if c["evidence_mode"] == "text_fact"]
+    assert len(tf) > 0, "库存表应有 text_fact 候选项"
+    for c in tf:
+        assert "evidence_mode" in c
+        assert "anchor_range" in c
+        assert "fact_fields" in c
+        assert "query_focus" in c
+
+    print(f"PASS: 库存表生成 {len(candidates)} 条候选项（text_fact: {len(tf)}）")
+
+
+def test_candidate_anchors_kv_parameter_table():
+    """键值参数表（费率表结构）应生成 field_value_pair 候选项。"""
+    print("=" * 60)
+    print("测试：参数表候选锚点")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    # 使用费率表结构（label行 + value行），与 _detect_header_value_row_pairs 兼容
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "参数配置"
+    ws["A1"] = "参数类别"
+    ws["B1"] = "最大连接数"
+    ws["C1"] = "超时时间"
+    ws["D1"] = "重试次数"
+    ws["A2"] = "系统参数"
+    ws["B2"] = 1000
+    ws["C2"] = 30
+    ws["D2"] = 3
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+
+    candidates = _build_candidate_anchors(sheets)
+    fvp = [c for c in candidates if c["evidence_mode"] == "field_value_pair"]
+    assert len(fvp) >= 1, f"参数表应有至少1个 field_value_pair 候选项: {len(fvp)}"
+
+    for c in fvp:
+        assert len(c["fact_fields"]) == 1, f"field_value_pair 应有1个字段: {c['fact_fields']}"
+        assert "：" in c["query_focus"], f"query_focus 应含分隔符: {c['query_focus']}"
+
+    print(f"PASS: 参数表生成 {len(fvp)} 条 field_value_pair 候选项")
+
+
+def test_candidate_anchors_csv_plain_table():
+    """CSV 普通表应生成 text_fact 候选项。"""
+    print("=" * 60)
+    print("测试：CSV 普通表候选锚点")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors, parse_csv_to_sheet_contexts
+
+    csv_bytes = "姓名,部门,职位\n张三,技术部,工程师\n李四,市场部,经理\n".encode("utf-8")
+    sheets = parse_csv_to_sheet_contexts(csv_bytes)
+
+    candidates = _build_candidate_anchors(sheets)
+    tf = [c for c in candidates if c["evidence_mode"] == "text_fact"]
+    assert len(tf) > 0, "CSV 表应有 text_fact 候选项"
+
+    for c in tf:
+        assert c["sheet_name"] == "CSV"
+        assert len(c["fact_fields"]) >= 1
+
+    print(f"PASS: CSV 表生成 {len(tf)} 条 text_fact 候选项")
+
+
+def test_candidate_anchor_metadata_no_out_of_bounds():
+    """fact_fields 和 query_focus 不得包含 anchor_range 之外的列。"""
+    print("=" * 60)
+    print("测试：候选锚点元数据不越界")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    # 构造表：B-D 列为业务字段，E 列为额外数值
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报价页"
+    # Row 1: 列标题
+    ws["A1"] = "序号"
+    ws["B1"] = "功能模块"
+    ws["C1"] = "产品功能"
+    ws["D1"] = "未税价（元）"
+    ws["E1"] = "项目经理人数"
+    ws["F1"] = "研发经理人数"
+    # Row 2: 字段名行
+    ws["B2"] = "功能模块"
+    ws["C2"] = "产品功能"
+    ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"
+    ws["F2"] = "研发经理"
+    # Row 3: 费率行
+    ws["B3"] = "功能模块"
+    ws["C3"] = "产品功能"
+    ws["D3"] = 50000
+    ws["E3"] = 1700
+    ws["F3"] = 1800
+    # Row 4: 业务数据
+    ws["B4"] = "CICD工具规范"
+    ws["C4"] = "集成发布流水线"
+    ws["D4"] = 73900
+    ws["E4"] = 2
+    ws["F4"] = 1
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    # 找到 B4:D4 对应的 record_with_schema_context 候选项
+    rsc = [c for c in candidates
+           if c["evidence_mode"] == "record_with_schema_context"
+           and "4" in c["anchor_range"]]
+    assert len(rsc) > 0, f"应有行4的 record 候选项: {candidates}"
+
+    for c in rsc:
+        anchor = c["anchor_range"]
+        bounds = _parse_range_str(anchor)
+        a_min_col, _, a_max_col, _ = bounds
+
+        # fact_fields 数量应等于 anchor 覆盖列中的文本字段数
+        # 不得包含 anchor 范围之外的列
+        # anchor B4:D4 → 只能含 B/C/D 列字段；E/F 列字段不得出现
+        anchor_col_count = a_max_col - a_min_col + 1
+        assert len(c["fact_fields"]) <= anchor_col_count, \
+            f"anchor={anchor} fact_fields 数量({len(c['fact_fields'])})不应超过列数({anchor_col_count}): {c['fact_fields']}"
+
+        # 验证 fact_fields 中每个字段名都对应 anchor 覆盖的列
+        # 通过检查 header 行确认字段位置
+        header_row = sheets[0].rows[0]  # row 1 = headers
+        for ff in c["fact_fields"]:
+            # 找到字段名在 header 中的列位置
+            ff_col = None
+            for ci, hv in enumerate(header_row):
+                if hv and str(hv).strip() == ff:
+                    ff_col = ci + 1  # 1-indexed
+                    break
+            if ff_col is not None:
+                assert a_min_col <= ff_col <= a_max_col, \
+                    f"字段'{ff}'在列{_col_letter(ff_col)}，但 anchor 只覆盖 {_col_letter(a_min_col)}-{_col_letter(a_max_col)}"
+
+        # query_focus 不得包含 anchor 范围外单元格的值
+        # E4=2, F4=1 不应出现在 B4:D4 的 query_focus 中
+        row_data = sheets[0].rows[3]  # row 4
+        for col_idx in range(a_max_col, len(row_data)):  # anchor 之后的列
+            val = row_data[col_idx]
+            if val is not None and str(val).strip() and not isinstance(val, (int, float)):
+                assert str(val).strip() not in c["query_focus"], \
+                    f"anchor={anchor} query_focus 不应含锚点外列的文本值'{val}': {c['query_focus']}"
+
+    print(f"PASS: {len(rsc)} 条候选项元数据均不越界")
+
+
+def test_real_appendix_d_candidate_metadata():
+    """真实 Appendix D 结构：B4:D4 候选只含功能模块、产品功能、未税价及对应值。"""
+    print("=" * 60)
+    print("测试：Appendix D 候选元数据正确性")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    # 模拟真实 Appendix D 结构
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报价页"
+    # Row 1: 列标题
+    ws["A1"] = "序号"; ws["B1"] = "功能模块"; ws["C1"] = "产品功能"; ws["D1"] = "未税价（元）"
+    ws["E1"] = "项目经理"; ws["F1"] = "研发经理"; ws["G1"] = "DevOps专家"
+    ws["H1"] = "DevOps工程师"; ws["I1"] = "前端工程师"; ws["J1"] = "后端工程师"
+    ws["K1"] = "BA"; ws["L1"] = "测试"; ws["M1"] = "SRE工程师"
+    # Row 2: 字段名行
+    ws["B2"] = "功能模块"; ws["C2"] = "产品功能"; ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"; ws["F2"] = "研发经理"; ws["G2"] = "DevOps专家"
+    ws["H2"] = "DevOps工程师"; ws["I2"] = "前端工程师"; ws["J2"] = "后端工程师"
+    ws["K2"] = "BA"; ws["L2"] = "测试"; ws["M2"] = "SRE工程师"
+    # Row 3: 费率行
+    ws["D3"] = 50000; ws["E3"] = 1700; ws["F3"] = 1800; ws["G3"] = 1600
+    ws["H3"] = 1500; ws["I3"] = 1500; ws["J3"] = 1500; ws["K3"] = 1400
+    ws["L3"] = 1300; ws["M3"] = 1500
+    # Row 4: 业务数据
+    ws["B4"] = "CICD工具规范及Pipeline建设优化"; ws["C4"] = "集成发布流水线梳理"; ws["D4"] = 73900
+    ws["E4"] = 2; ws["F4"] = 1; ws["G4"] = 0; ws["H4"] = 3; ws["I4"] = 0
+    ws["J4"] = 0; ws["K4"] = 0; ws["L4"] = 1; ws["M4"] = 0
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    # 找 B4 对应的 record 候选项
+    rsc_row4 = [c for c in candidates
+                if c["evidence_mode"] == "record_with_schema_context"
+                and c["anchor_range"].startswith("B4:")]
+    assert len(rsc_row4) > 0, f"应有 B4 开头的 record 候选项"
+
+    # 找 anchor 为 B4:D4 的候选项
+    b4d4 = [c for c in rsc_row4 if c["anchor_range"] == "B4:D4"]
+    if b4d4:
+        c = b4d4[0]
+        assert c["fact_fields"] == ["功能模块", "产品功能", "未税价（元）"], \
+            f"B4:D4 fact_fields 应为三列: {c['fact_fields']}"
+        assert "CICD工具规范" in c["query_focus"], f"query_focus 应含功能模块值: {c['query_focus']}"
+        assert "集成发布流水线" in c["query_focus"], f"query_focus 应含产品功能值: {c['query_focus']}"
+        assert "73900" in c["query_focus"], f"query_focus 应含未税价值: {c['query_focus']}"
+        # 不得含 E-M 列的值
+        assert "项目经理" not in str(c["fact_fields"]), "不应含角色字段"
+        assert "1700" not in c["query_focus"], "不应含费率值"
+
+    print(f"PASS: B4:D4 候选元数据正确: {b4d4[0] if b4d4 else 'N/A'}")
+
+
+def test_prompt_no_business_terms():
+    """Prompt 模板规则中不应出现硬编码的业务术语。"""
+    print("=" * 60)
+    print("测试：Prompt 模板无业务术语")
+    print("=" * 60)
+
+    # 直接读取模板文件检查（不含渲染后的表格内容）
+    from pathlib import Path
+    template_path = Path(__file__).parent.parent / "prompts" / "qgen_prompt_spreadsheet_retrieval.txt"
+    template = template_path.read_text(encoding="utf-8")
+
+    forbidden_in_template = ["功能模块", "产品功能", "未税价", "B4:D4", "报价表", "费率表"]
+    found = [t for t in forbidden_in_template if t in template]
+    assert not found, f"Prompt 模板中不应出现业务术语: {found}"
+
+    # 应包含通用证据模式描述
+    assert "record_with_schema_context" in template, "模板应描述 record_with_schema_context"
+    assert "field_value_pair" in template, "模板应描述 field_value_pair"
+    assert "text_fact" in template, "模板应描述 text_fact"
+
+    print("PASS: Prompt 模板无业务术语，含通用证据模式描述")
+
+
+# ====== Candidate Section & Summary Row Regression Tests ======
+
+def test_candidate_section_appears_in_prompt():
+    """候选证据清单实际出现在 Prompt 中，且包含结构化字段。"""
+    print("=" * 60)
+    print("测试：候选清单出现在 Prompt")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报价页"
+    ws["B1"] = "功能模块"; ws["C1"] = "产品功能"; ws["D1"] = "未税价（元）"
+    ws["E1"] = "项目经理"
+    ws["B2"] = "功能模块"; ws["C2"] = "产品功能"; ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"
+    ws["B3"] = "功能模块"; ws["C3"] = "产品功能"; ws["D3"] = 50000; ws["E3"] = 1700
+    ws["B4"] = "CICD工具规范"; ws["C4"] = "集成发布流水线"; ws["D4"] = 73900; ws["E4"] = 2
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    prompt = _build_prompt(sheets, 5, "", candidate_anchors=candidates)
+
+    # 候选清单必须出现
+    assert "候选证据清单" in prompt, "prompt 应含 '候选证据清单' 标题"
+
+    # 验证至少一个候选项的全部关键字段出现在 prompt 中
+    if candidates:
+        c = candidates[0]
+        assert c["anchor_range"] in prompt, f"prompt 应含 anchor_range: {c['anchor_range']}"
+        assert c["sheet_name"] in prompt, f"prompt 应含 sheet_name: {c['sheet_name']}"
+        if c.get("fact_fields"):
+            for ff in c["fact_fields"]:
+                assert ff in prompt, f"prompt 应含 fact_field: {ff}"
+        if c.get("query_focus"):
+            focus_first = c["query_focus"].split(" | ")[0]
+            assert focus_first in prompt, f"prompt 应含 query_focus 片段: {focus_first}"
+
+    print("PASS: 候选清单完整出现在 Prompt")
+
+
+def test_summary_rows_excluded_from_candidates():
+    """汇总行（总计/合计/小计）不生成候选锚点。"""
+    print("=" * 60)
+    print("测试：汇总行被排除")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "费用表"
+    # 表头
+    ws["A1"] = "项目编号"; ws["B1"] = "项目名称"; ws["C1"] = "部门"; ws["D1"] = "金额"
+    # 正常业务行
+    ws["A2"] = "P001"; ws["B2"] = "服务A"; ws["C2"] = "技术部"; ws["D2"] = 10000
+    ws["A3"] = "P002"; ws["B3"] = "服务B"; ws["C3"] = "市场部"; ws["D3"] = 20000
+    # 汇总行
+    ws["A4"] = "合计"; ws["B4"] = ""; ws["C4"] = ""; ws["D4"] = 30000
+    ws["A5"] = "总计"; ws["B5"] = ""; ws["C5"] = ""; ws["D5"] = 30000
+    ws["A6"] = "小计"; ws["B6"] = ""; ws["C6"] = ""; ws["D6"] = 15000
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    # 候选中不应出现包含"合计"/"总计"/"小计"的行
+    for c in candidates:
+        anchor = c["anchor_range"]
+        bounds = _parse_range_str(anchor)
+        if bounds:
+            _, row, _, _ = bounds
+            row_data = sheets[0].rows[row - 1]
+            first_cell = ""
+            for v in row_data:
+                if v is not None and str(v).strip():
+                    first_cell = str(v).strip()
+                    break
+            assert first_cell not in ("合计", "总计", "小计"), \
+                f"汇总行 '{first_cell}' 不应生成候选: anchor={anchor}"
+
+    # 应有正常业务行的候选
+    assert len(candidates) > 0, "应有正常业务行的候选"
+
+    print(f"PASS: 汇总行正确排除，保留 {len(candidates)} 条候选")
+
+
+def test_appendix_e_smoke_with_summary_and_merged():
+    """Appendix E 风格冒烟测试：含汇总行、合并单元格。"""
+    print("=" * 60)
+    print("冒烟测试：Appendix E 汇总行+合并单元格")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _build_candidate_anchors
+    import spreadsheet_question_generator as sqg
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "价格清单"
+    # Row 1: 列标题
+    ws["A1"] = "序号"; ws["B1"] = "功能模块"; ws["C1"] = "产品功能"
+    ws["D1"] = "未税价（元）"; ws["E1"] = "项目经理"; ws["F1"] = "研发经理"
+    ws["M1"] = "SRE工程师"; ws["N1"] = "备注"; ws["O1"] = "状态"
+    # Row 2: 字段名行
+    ws["B2"] = "功能模块"; ws["C2"] = "产品功能"; ws["D2"] = "未税价（元）"
+    ws["E2"] = "项目经理"; ws["F2"] = "研发经理"; ws["M2"] = "SRE工程师"
+    ws["N2"] = "备注"; ws["O2"] = "状态"
+    # Row 3: 费率行
+    ws["D3"] = 50000; ws["E3"] = 1700; ws["F3"] = 1800; ws["M3"] = 1500
+    ws["O3"] = "进行中"
+    # Row 4-8: 业务数据
+    biz = [
+        ("CICD工具规范", "集成发布流水线", 73900, 2, 1, 0, "正常"),
+        ("自动化测试", "接口自动化测试", 128000, 3, 2, 1, "正常"),
+        ("监控运维", "统一监控平台", 210000, 4, 3, 2, "正常"),
+        ("安全合规", "漏洞扫描服务", 56000, 1, 1, 0, "正常"),
+        ("容器平台", "K8s集群管理", 168000, 3, 2, 1, "正常"),
+    ]
+    for i, (mod, func, price, pm, dev, sre, status) in enumerate(biz):
+        r = 4 + i
+        ws[f"B{r}"] = mod; ws[f"C{r}"] = func; ws[f"D{r}"] = price
+        ws[f"E{r}"] = pm; ws[f"F{r}"] = dev; ws[f"M{r}"] = sre
+        ws[f"N{r}"] = "无"; ws[f"O{r}"] = status
+
+    # Row 52: 汇总行
+    ws["A52"] = "总计"; ws["D52"] = 637900
+    ws["E52"] = 13; ws["F52"] = 9; ws["M52"] = 4
+
+    # 合并 O3:O24 模拟合并单元格
+    ws.merge_cells("O3:O24")
+
+    xlsx_bytes = _make_xlsx_bytes(wb)
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    # 验证：总计行（row 52）不应生成候选
+    for c in candidates:
+        anchor = c["anchor_range"]
+        bounds = _parse_range_str(anchor)
+        if bounds:
+            _, row, _, _ = bounds
+            assert row != 52, f"汇总行 52 不应生成候选: {anchor}"
+
+    # 验证：正常业务行应生成候选
+    rsc = [c for c in candidates if c["evidence_mode"] == "record_with_schema_context"]
+    assert len(rsc) >= 4, f"应至少有 4 个业务行候选: {len(rsc)}"
+
+    # 验证：fact_fields 不应包含 anchor 外列
+    for c in rsc:
+        anchor = c["anchor_range"]
+        bounds = _parse_range_str(anchor)
+        if bounds:
+            a_min_col, _, a_max_col, _ = bounds
+            assert len(c["fact_fields"]) <= (a_max_col - a_min_col + 1), \
+                f"anchor={anchor} fact_fields 越界: {c['fact_fields']}"
+
+    # 端到端：mock LLM 验证整体流程
+    mock_response = json.dumps([
+        {"question": "CICD工具规范未税价", "sheet_name": "价格清单",
+         "anchor_range": "B4:D4", "difficulty": "事实", "topic": "价格"},
+        {"question": "自动化测试接口", "sheet_name": "价格清单",
+         "anchor_range": "B5:C5", "difficulty": "事实", "topic": "功能"},
+    ])
+
+    original_call_llm = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_response
+
+    try:
+        questions, stats = generate_spreadsheet_questions(
+            xlsx_bytes, "appendix_e.xlsx",
+            "fake_key", "http://fake", "fake_model",
+            num_questions=5,
+        )
+        assert len(questions) >= 2, f"应至少生成 2 题: {len(questions)}"
+
+        for q in questions:
+            if "未税价" in q.get("question", ""):
+                ref = q["reference_answer"]
+                assert "功能模块" in ref, f"价格题缺功能模块: {ref}"
+                assert "未税价" in ref, f"价格题缺未税价字段: {ref}"
+    finally:
+        sqg._call_llm_text = original_call_llm
+
+    print(f"PASS: Appendix E 冒烟测试通过 ({len(candidates)} 候选, {len(questions)} 题)")
+
+
 # ====== Main ======
 
 def main():
@@ -1854,6 +2307,15 @@ def main():
         test_price_candidate_anchors_use_b_to_d,
         test_price_isolated_numeric_no_dual_source_exemption,
         test_smoke_10_questions_price_evidence,
+        test_candidate_anchors_inventory_table,
+        test_candidate_anchors_kv_parameter_table,
+        test_candidate_anchors_csv_plain_table,
+        test_candidate_anchor_metadata_no_out_of_bounds,
+        test_real_appendix_d_candidate_metadata,
+        test_prompt_no_business_terms,
+        test_candidate_section_appears_in_prompt,
+        test_summary_rows_excluded_from_candidates,
+        test_appendix_e_smoke_with_summary_and_merged,
     ]
 
     passed = 0

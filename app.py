@@ -5301,21 +5301,48 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
     st.caption(f"创建时间: {_created[:19] if _created else '未知'}" +
                (f"　最后编辑: {_updated[:19]}" if _updated else ""))
 
-    # 编辑配置说明
+    # ---------- 编辑配置：动态 key_prefix 防止跨配置状态串扰 ----------
+    import hashlib as _hashlib
+    _ecfg_key_prefix = f"ecfg_{_hashlib.md5(selected_config_id.encode()).hexdigest()[:12]}"
+
+    # 检测配置切换：清理上一配置的编辑态 session_state
+    _ecfg_prev_id = st.session_state.get("_ecfg_form_bound_id")
+    if _ecfg_prev_id and _ecfg_prev_id != selected_config_id:
+        _old_prefix = f"ecfg_{_hashlib.md5(_ecfg_prev_id.encode()).hexdigest()[:12]}"
+        _keys_to_clean = [k for k in st.session_state if k.startswith(_old_prefix)]
+        for _k in _keys_to_clean:
+            del st.session_state[_k]
+        # 同时清理旧的编辑说明
+        if "ec_edit_note" in st.session_state:
+            del st.session_state["ec_edit_note"]
+    # 记录当前表单绑定的 config_id
+    st.session_state["_ecfg_form_bound_id"] = selected_config_id
+
     with st.expander("编辑/查看配置详情", expanded=False):
         with st.form("edit_config_form"):
             st.markdown("**可编辑字段**（核心字段 config_id / created_at 不可修改）")
-            ec_values = render_config_form(selected_config, key_prefix="ecfg")
+            ec_values = render_config_form(selected_config, key_prefix=_ecfg_key_prefix)
             ec_note = st.text_input("修改说明（可选）", value="", key="ec_edit_note",
                                     help="简要说明本次修改原因，如：补录 Rerank 配置")
             ec_submit = st.form_submit_button("保存配置修改", type="primary")
 
         if ec_submit:
             from experiment import update_config_profile_safe
-            updates = collect_config_updates(ec_values)
-            update_config_profile_safe(selected_config_id, updates, edit_note=ec_note)
-            st.success("配置已保存，config_id 未变。")
-            st.rerun()
+            # 一致性保护：三重校验 config_id
+            _form_bound = st.session_state.get("_ecfg_form_bound_id")
+            _disk_config = load_config_profile(selected_config_id)
+            _disk_id = _disk_config.get("config_id") if _disk_config else None
+            if not (_form_bound == selected_config_id == _disk_id):
+                st.error(
+                    f"配置不一致，保存已阻止。"
+                    f" 表单绑定: {_form_bound}, 选择: {selected_config_id}, 磁盘: {_disk_id}"
+                    f" 请刷新页面后重试。"
+                )
+            else:
+                updates = collect_config_updates(ec_values)
+                update_config_profile_safe(selected_config_id, updates, edit_note=ec_note)
+                st.success("配置已保存，config_id 未变。")
+                st.rerun()
 
     # 技术详情（核心字段只读）
     with st.expander("技术详情（只读）", expanded=False):
