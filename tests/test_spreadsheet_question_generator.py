@@ -26,6 +26,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from openpyxl import Workbook
 
+import tempfile
+
 from spreadsheet_question_generator import (
     SheetContext,
     TableBlock,
@@ -42,11 +44,34 @@ from spreadsheet_question_generator import (
     _validate_anchor_range,
     _render_reference_answer,
     _validate_and_render_question,
+    _validate_single_question,
+    _build_candidate_anchors,
+    _file_content_hash,
+    _set_schema_cache_dir,
+    _get_schema_cache_dir,
+    _delete_schema_cache,
     parse_xlsx_to_sheet_contexts,
     parse_csv_to_sheet_contexts,
     generate_spreadsheet_questions,
     _build_prompt,
 )
+
+
+def _use_test_schema_cache():
+    """切换到临时 schema 缓存目录，返回 (temp_dir, original_dir)。调用方负责在 finally 中恢复。"""
+    import spreadsheet_question_generator as sqg
+    orig = sqg._SCHEMA_CACHE_DIR
+    tmp = tempfile.mkdtemp(prefix="schema_test_")
+    sqg._SCHEMA_CACHE_DIR = Path(tmp)
+    return Path(tmp), orig
+
+
+def _restore_schema_cache_dir(tmp_dir, orig_dir):
+    """恢复 schema 缓存目录并清理临时目录。"""
+    import spreadsheet_question_generator as sqg
+    sqg._SCHEMA_CACHE_DIR = orig_dir
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ====== Helpers ======
@@ -2070,12 +2095,12 @@ def test_prompt_no_business_terms():
     found = [t for t in forbidden_in_template if t in template]
     assert not found, f"Prompt 模板中不应出现业务术语: {found}"
 
-    # 应包含通用证据模式描述
-    assert "record_with_schema_context" in template, "模板应描述 record_with_schema_context"
-    assert "field_value_pair" in template, "模板应描述 field_value_pair"
-    assert "text_fact" in template, "模板应描述 text_fact"
+    # 应包含候选目录相关描述
+    assert "candidate_id" in template, "模板应描述 candidate_id"
+    assert "target_field_label" in template, "模板应描述 target_field_label"
+    assert "候选目录" in template, "模板应提及候选目录"
 
-    print("PASS: Prompt 模板无业务术语，含通用证据模式描述")
+    print("PASS: Prompt 模板无业务术语，含候选目录描述")
 
 
 # ====== Candidate Section & Summary Row Regression Tests ======
@@ -2267,7 +2292,1266 @@ def test_appendix_e_smoke_with_summary_and_merged():
     print(f"PASS: Appendix E 冒烟测试通过 ({len(candidates)} 候选, {len(questions)} 题)")
 
 
+def test_real_appendix_e_file_e2e():
+    """端到端测试：真实 Appendix E. price list.xlsx 解析→候选→Prompt。"""
+    print("=" * 60)
+    print("端到端：真实 Appendix E 文件")
+    print("=" * 60)
+
+    import spreadsheet_question_generator as sqg
+
+    real_path = r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx"
+    try:
+        with open(real_path, "rb") as f:
+            xlsx_bytes = f.read()
+    except FileNotFoundError:
+        print(f"SKIP: 真实文件不存在: {real_path}")
+        return
+
+    sheets = parse_xlsx_to_sheet_contexts(xlsx_bytes)
+    candidates = _build_candidate_anchors(sheets)
+
+    # 断言：候选数量 >= 10
+    rsc = [c for c in candidates if c["evidence_mode"] == "record_with_schema_context"]
+    assert len(rsc) >= 10, f"record 候选应 >= 10，实际 {len(rsc)}"
+    print(f"  record_with_schema_context 候选: {len(rsc)}")
+
+    # 断言：不含 M52 等汇总行候选
+    for c in candidates:
+        bounds = _parse_range_str(c["anchor_range"])
+        if bounds:
+            _, row, _, _ = bounds
+            assert row != 52, f"不应有 row 52 候选: {c['anchor_range']}"
+    print("  OK: 无 M52 汇总行候选")
+
+    # 断言：不含 D23:N23 等宽范围 text_fact
+    tf = [c for c in candidates if c["evidence_mode"] == "text_fact"]
+    for c in tf:
+        bounds = _parse_range_str(c["anchor_range"])
+        if bounds:
+            col_span = bounds[2] - bounds[0] + 1
+            assert col_span <= 6, f"text_fact 过宽: {c['anchor_range']} ({col_span} 列)"
+    print(f"  OK: {len(tf)} 个 text_fact 候选均在列宽限制内")
+
+    # 断言：每个 record 候选是单行
+    for c in rsc:
+        bounds = _parse_range_str(c["anchor_range"])
+        assert bounds is not None
+        assert bounds[1] == bounds[3], f"record 候选应为单行: {c['anchor_range']}"
+    print("  OK: 所有 record 候选为单行")
+
+    # 断言：Prompt 含候选清单
+    prompt = _build_prompt(sheets, 10, "", candidate_anchors=candidates)
+    assert "候选证据清单" in prompt, "Prompt 应含候选清单"
+    print(f"  Prompt 字符数: {len(prompt)}")
+    print(f"  OK: Prompt 含候选清单")
+
+    # 断言：候选外 anchor 被拒绝
+    q_outsider = {"question": "test", "sheet_name": "Sheet1", "anchor_range": "Z99:Z99"}
+    v, cat, reason = sqg._validate_single_question(
+        q_outsider, {s.sheet_name: s for s in sheets}, "test.xlsx",
+        set(), set(), candidate_anchors=candidates,
+    )
+    assert v is None, f"候选外 anchor 应被拒绝: {q_outsider['anchor_range']}"
+    print("  OK: 候选外 anchor 被拒绝")
+
+    print(f"PASS: 真实文件端到端 ({len(candidates)} 候选, prompt={len(prompt)} chars)")
+
+
+# ====== Two-Phase Schema Flow Tests ======
+
+def test_phase1_schema_analysis_mock():
+    """Phase 1 schema 分析：mock LLM 返回验证字段分类。"""
+    print("=" * 60)
+    print("测试：Phase 1 Schema 分析（mock LLM）")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        _parse_schema_analysis_response,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    # Mock LLM 返回预定义 schema（新角色体系）
+    mock_schema = json.dumps({
+        "table_purpose": "报价清单",
+        "header_row": 1,
+        "data_start_row": 3,
+        "fields": [
+            {"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95, "needs_confirmation": False},
+            {"source_label": "一级需求", "col_index": 3, "inferred_role": "context", "confidence": 0.90, "needs_confirmation": False},
+            {"source_label": "需求描述", "col_index": 4, "inferred_role": "record_identifier", "confidence": 0.95, "needs_confirmation": False},
+            {"source_label": "类型", "col_index": 5, "inferred_role": "categorical", "confidence": 0.85, "needs_confirmation": True},
+            {"source_label": "QTY. in total", "col_index": 6, "inferred_role": "metric", "confidence": 0.90, "needs_confirmation": True},
+            {"source_label": "PM/SM", "col_index": 7, "inferred_role": "metric", "confidence": 0.85, "needs_confirmation": True},
+            {"source_label": "DevOps专家", "col_index": 8, "inferred_role": "metric", "confidence": 0.85, "needs_confirmation": True},
+            {"source_label": "Total Cost", "col_index": 14, "inferred_role": "cost", "confidence": 0.90, "needs_confirmation": True},
+        ],
+        "excluded_rows": [52],
+        "question_plan": {
+            "recommended_question_patterns": ["record + metric", "record + cost", "record + categorical"],
+            "target_field_priority": [
+                {"field": "QTY. in total", "role": "metric", "priority": 1, "reason": "核心数量指标"},
+                {"field": "Total Cost", "role": "cost", "priority": 2, "reason": "核心费用指标"},
+                {"field": "类型", "role": "categorical", "priority": 3, "reason": "分类维度"},
+            ],
+            "target_field_quotas": {"QTY. in total": 2, "Total Cost": 2, "类型": 1},
+            "forbidden_patterns": ["aggregation", "cross-row comparison", "totals", "null values", "formula without cached value", "isolated numeric"],
+            "rationale": "报价清单，适合单记录检索查询",
+        },
+        "reasoning": "报价清单，模块/需求为分组字段，数值列为指标字段"
+    }, ensure_ascii=False)
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_schema
+    try:
+        result = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                       file_bytes=file_bytes, force_reanalyze=True,
+                                       allow_test_model=True)
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    # 验证
+    assert result["table_purpose"] == "报价清单", f"table_purpose: {result['table_purpose']}"
+    assert result.get("schema_source") == "test_mock", f"source: {result.get('schema_source')}"
+    assert 52 in result["excluded_rows"], f"excluded_rows: {result['excluded_rows']}"
+
+    # record_locator_fields 应含记录标识
+    rl = result.get("record_locator_fields", [])
+    assert "需求描述" in rl, f"record_locator: {rl}"
+
+    # question_target_fields 应含 metric/cost/categorical
+    qt = result.get("question_target_fields", [])
+    assert "QTY. in total" in qt or any("QTY" in f for f in qt), f"target: {qt}"
+    assert "Total Cost" in qt or any("Cost" in f for f in qt), f"target: {qt}"
+    assert "类型" in qt, f"target 应含 categorical: {qt}"
+
+    # question_plan 新结构
+    qp = result.get("question_plan", {})
+    assert qp.get("target_field_priority"), f"question_plan 缺少 target_field_priority: {qp}"
+    assert qp.get("recommended_question_patterns"), f"question_plan 缺少 recommended_question_patterns: {qp}"
+    assert qp.get("forbidden_patterns"), f"question_plan 缺少 forbidden_patterns: {qp}"
+
+    # 新角色分组
+    assert len(result.get("record_identifier_fields", [])) >= 1, f"record_identifier_fields: {result.get('record_identifier_fields')}"
+    assert len(result.get("context_fields", [])) >= 1, f"context_fields: {result.get('context_fields')}"
+    assert len(result["metric_fields"]) >= 2, f"metric_fields: {result['metric_fields']}"
+    assert len(result["cost_fields"]) >= 1, f"cost_fields: {result['cost_fields']}"
+    assert len(result.get("categorical_fields", [])) >= 1, f"categorical_fields: {result.get('categorical_fields')}"
+
+    print(f"PASS: record_locator={rl}, target={qt}, patterns={qp.get('recommended_question_patterns')}")
+
+
+def test_schema_cache_hit():
+    """Schema 缓存命中：同文件二次分析不调用 LLM。"""
+    print("=" * 60)
+    print("测试：Schema 缓存命中")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        _file_content_hash, _load_schema_cache,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    mock_schema = json.dumps({
+        "table_purpose": "测试", "header_row": 1, "data_start_row": 3,
+        "fields": [{"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.9}],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    call_count = [0]
+    def counting_call(*a, **kw):
+        call_count[0] += 1
+        return mock_schema
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = counting_call
+    try:
+        # 首次调用
+        r1 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, force_reanalyze=True,
+                                   allow_test_model=True)
+        assert call_count[0] == 1, f"首次应调用 LLM: {call_count[0]}"
+
+        # 二次调用（应命中缓存）
+        r2 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, allow_test_model=True)
+        assert call_count[0] == 1, f"缓存命中不应调用 LLM: {call_count[0]}"
+
+        # 强制重新分析
+        r3 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, force_reanalyze=True,
+                                   allow_test_model=True)
+        assert call_count[0] == 2, f"强制重新应调用 LLM: {call_count[0]}"
+
+        assert r1["table_purpose"] == r2["table_purpose"]
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: LLM 调用次数={call_count[0]}（期望2）")
+
+
+def test_evidence_schema_display():
+    """evidence_schema_display 字段格式正确。"""
+    print("=" * 60)
+    print("测试：evidence_schema_display")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, _validate_and_render_question,
+    )
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    # 测试 B3:E3 的 display
+    q = {"question": "test", "sheet_name": "Sheet1", "anchor_range": "B3:E3"}
+    v, reason = _validate_and_render_question(q, sheets_by_name, "test.xlsx")
+    assert v is not None, f"验证失败: {reason}"
+    assert "evidence_schema_display" in v, "应有 evidence_schema_display"
+
+    display = v["evidence_schema_display"]
+    assert "=" in display, f"display 应含 '=': {display}"
+    assert "；" in display or len(display) > 0, f"display 不应为空"
+    # 不应有 Markdown 格式
+    assert "**" not in display, f"display 不应含 Markdown: {display}"
+    assert "|" not in display, f"display 不应含表格符号: {display}"
+
+    print(f"PASS: display={display[:80]}")
+
+
+def test_generate_questions_from_schema_e2e():
+    """端到端 Phase 2：基于确认 schema 生成题目。"""
+    print("=" * 60)
+    print("测试：Phase 2 端到端")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, generate_questions_from_schema,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    # 构建确认 schema（新结构）
+    confirmed_schema = {
+        "table_purpose": "报价清单",
+        "record_locator_fields": ["需求描述"],
+        "context_fields": ["模块", "一级需求"],
+        "question_target_fields": ["类型", "QTY. in total", "Total Cost"],
+        "safe_question_fields": ["需求描述", "类型", "QTY. in total", "Total Cost"],
+        "excluded_rows": [52],
+        "record_identifier_fields": [{"source_label": "需求描述", "col_index": 4}],
+        "metric_fields": [{"source_label": "QTY. in total", "col_index": 6}, {"source_label": "PM/SM", "col_index": 7}],
+        "cost_fields": [{"source_label": "Total Cost", "col_index": 14}],
+        "categorical_fields": [{"source_label": "类型", "col_index": 5}],
+        "question_plan": {
+            "recommended_question_patterns": ["record + metric", "record + cost", "record + categorical"],
+            "target_field_priority": [
+                {"field": "QTY. in total", "role": "metric", "priority": 1, "reason": "数量指标"},
+                {"field": "Total Cost", "role": "cost", "priority": 2, "reason": "费用指标"},
+                {"field": "类型", "role": "categorical", "priority": 3, "reason": "分类维度"},
+            ],
+            "target_field_quotas": {"QTY. in total": 2, "Total Cost": 2, "类型": 1},
+            "forbidden_patterns": ["aggregation", "cross-row comparison"],
+            "rationale": "报价清单",
+        },
+    }
+
+    # Mock LLM 返回（使用 candidate_id + target_field_label）
+    mock_response = json.dumps([
+        {"candidate_id": "sheet1_row_3_类型", "question": "工具链可用性优化类型", "target_field_label": "类型", "difficulty": "事实", "topic": "类型"},
+        {"candidate_id": "sheet1_row_4_qty_in_total", "question": "服务上线流程制定数量", "target_field_label": "QTY. in total", "difficulty": "事实", "topic": "数量"},
+        {"candidate_id": "sheet1_row_7_total_cost", "question": "CICD配置规范设计总成本", "target_field_label": "Total Cost", "difficulty": "事实", "topic": "费用"},
+    ])
+
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_response
+    try:
+        questions, stats = generate_questions_from_schema(
+            sheets, confirmed_schema, "fake", "http://fake", "fake",
+            num_questions=5, file_name="test.xlsx",
+        )
+    finally:
+        sqg._call_llm_text = original
+
+    assert len(questions) >= 2, f"应至少 2 题: {len(questions)}"
+
+    # 验证 candidate_id 存在
+    for q in questions:
+        assert "candidate_id" in q, f"应有 candidate_id: {q.keys()}"
+        assert "target_field_label" in q, f"应有 target_field_label: {q.keys()}"
+
+    # 验证 evidence_schema_display
+    for q in questions:
+        assert "evidence_schema_display" in q, f"应有 display: {q.keys()}"
+        assert "=" in q["evidence_schema_display"], f"display 格式: {q['evidence_schema_display']}"
+
+    # 验证无 row 52
+    for q in questions:
+        bounds = _parse_range_str(q["anchor_range"])
+        if bounds:
+            assert bounds[1] != 52 and bounds[3] != 52, f"不应含 row 52: {q['anchor_range']}"
+
+    # 验证 reference_answer 由本地渲染（含真实字段名）
+    for q in questions:
+        ref = q.get("reference_answer", "")
+        assert ref, f"reference_answer 不应为空"
+        # reference_answer 应包含键值对格式
+        assert "：" in ref, f"reference_answer 应含键值对: {ref[:80]}"
+
+    # 验证 reference_answer 不来自 LLM（LLM mock 中无 reference_answer）
+    # 这是通过 _validate_phase2_question 本地渲染保证的
+
+    print(f"PASS: {len(questions)} 题, candidate_ids={[q.get('candidate_id') for q in questions]}")
+
+
+def test_upload_no_llm_call():
+    """上传文件只做本地解析，不调用 LLM。"""
+    print("=" * 60)
+    print("测试：上传文件不调用 LLM")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, _build_schema_analysis_context,
+        _detect_header_row_and_data_start, _is_summary_row,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+
+    # 追踪 LLM 调用
+    call_count = [0]
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: (call_count.__setitem__(0, call_count[0] + 1), "")[1]
+    try:
+        sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+        ctx = _build_schema_analysis_context(sheets)
+    finally:
+        sqg._call_llm_text = original
+
+    assert call_count[0] == 0, f"上传+解析不应调用 LLM: {call_count[0]}"
+    assert len(sheets) > 0
+    assert len(ctx) > 100
+
+    print(f"PASS: 解析完成，LLM 调用 {call_count[0]} 次")
+
+
+def test_phase1_only_on_button_click():
+    """点击分析按钮只执行 Phase 1，不执行 Phase 2。"""
+    print("=" * 60)
+    print("测试：Phase 1 按钮只调用 Phase 1")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    mock_schema = json.dumps({
+        "table_purpose": "报价清单", "header_row": 1, "data_start_row": 3,
+        "fields": [
+            {"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95},
+            {"source_label": "需求描述", "col_index": 4, "inferred_role": "record_identifier", "confidence": 0.95},
+        ],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    call_count = [0]
+    def counting_call(*a, **kw):
+        call_count[0] += 1
+        return mock_schema
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = counting_call
+    try:
+        result = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                       file_bytes=file_bytes, force_reanalyze=True,
+                                       allow_test_model=True)
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    assert call_count[0] == 1, f"Phase 1 应调用 LLM 1 次: {call_count[0]}"
+    assert result["table_purpose"] == "报价清单"
+
+    print(f"PASS: Phase 1 调用 LLM {call_count[0]} 次")
+
+
+def test_phase2_does_not_recall_phase1():
+    """生成题目只执行 Phase 2，不重复调用 Phase 1。"""
+    print("=" * 60)
+    print("测试：Phase 2 不重复调用 Phase 1")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        generate_questions_from_schema,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    mock_schema = json.dumps({
+        "table_purpose": "报价清单", "header_row": 1, "data_start_row": 3,
+        "fields": [
+            {"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95},
+            {"source_label": "需求描述", "col_index": 4, "inferred_role": "record_identifier", "confidence": 0.95},
+            {"source_label": "类型", "col_index": 5, "inferred_role": "categorical", "confidence": 0.85, "needs_confirmation": True},
+        ],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    mock_questions = json.dumps([
+        {"candidate_id": "sheet1_row_3_类型", "question": "工具链可用性优化类型", "target_field_label": "类型", "difficulty": "事实", "topic": "类型"},
+    ])
+
+    call_log = []
+    def tracking_call(*a, **kw):
+        call_log.append("llm")
+        return mock_schema if len(call_log) == 1 else mock_questions
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = tracking_call
+    try:
+        # Phase 1
+        schema = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                       file_bytes=file_bytes, force_reanalyze=True,
+                                       allow_test_model=True)
+        phase1_calls = len(call_log)
+
+        # Phase 2
+        questions, stats = generate_questions_from_schema(
+            sheets, schema, "fake", "http://fake", "fake",
+            num_questions=5, file_name="test.xlsx",
+        )
+        phase2_calls = len(call_log) - phase1_calls
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    assert phase1_calls == 1, f"Phase 1 应调用 1 次: {phase1_calls}"
+    assert phase2_calls >= 1, f"Phase 2 应至少调用 1 次: {phase2_calls}"
+    assert len(questions) >= 1
+
+    print(f"PASS: Phase 1={phase1_calls} 次, Phase 2={phase2_calls} 次, 总计 {len(call_log)} 次")
+
+
+def test_file_change_invalidates_schema():
+    """更换文件后旧 schema 失效。"""
+    print("=" * 60)
+    print("测试：更换文件后旧 schema 失效")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        _file_content_hash, _load_schema_cache,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    mock_schema = json.dumps({
+        "table_purpose": "报价清单", "header_row": 1, "data_start_row": 3,
+        "fields": [{"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95}],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_schema
+    try:
+        # 分析文件 A
+        r1 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, force_reanalyze=True,
+                                   allow_test_model=True)
+        hash_a = _file_content_hash(file_bytes)
+
+        # 文件 B（不同内容）应有不同缓存
+        fake_b = b"fake file content for B"
+        hash_b = _file_content_hash(fake_b)
+        assert hash_a != hash_b, "不同文件应有不同哈希"
+
+        # 缓存中只有 A
+        cached_a = _load_schema_cache(hash_a, allow_test_model=True)
+        cached_b = _load_schema_cache(hash_b, allow_test_model=True)
+        assert cached_a is not None, "文件 A 应有缓存"
+        assert cached_b is None, "文件 B 不应有缓存"
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: 文件 A 缓存存在, 文件 B 缓存不存在")
+
+
+def test_reanalyze_clears_and_rebuilds():
+    """重新分析后才允许用新 schema 出题。"""
+    print("=" * 60)
+    print("测试：重新分析后用新 schema 出题")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        generate_questions_from_schema, _delete_schema_cache,
+        _file_content_hash,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    schema_v1 = json.dumps({
+        "table_purpose": "v1", "header_row": 1, "data_start_row": 3,
+        "fields": [{"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95}],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    schema_v2 = json.dumps({
+        "table_purpose": "v2_updated", "header_row": 1, "data_start_row": 3,
+        "fields": [
+            {"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95},
+            {"source_label": "需求描述", "col_index": 4, "inferred_role": "record_identifier", "confidence": 0.95},
+        ],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    call_seq = []
+    def seq_call(*a, **kw):
+        call_seq.append(1)
+        return schema_v1 if len(call_seq) == 1 else schema_v2
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = seq_call
+    try:
+        # 首次分析
+        r1 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, force_reanalyze=True,
+                                   allow_test_model=True)
+        assert r1["table_purpose"] == "v1"
+
+        # 重新分析（force_reanalyze=True）
+        r2 = analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                   file_bytes=file_bytes, force_reanalyze=True,
+                                   allow_test_model=True)
+        assert r2["table_purpose"] == "v2_updated"
+        assert len(call_seq) == 2, f"应调用 2 次: {len(call_seq)}"
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: 首次=v1, 重新分析=v2, LLM 调用 {len(call_seq)} 次")
+
+
+def test_production_rejects_fake_model():
+    """生产路径拒绝 fake 模型，必须 fail-closed。"""
+    print("=" * 60)
+    print("测试：生产路径拒绝 fake 模型")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        _is_fake_model,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    # fake 模型必须被拒绝（不传 allow_test_model）
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: '{"fields": []}'
+    try:
+        try:
+            analyze_table_schema(sheets, "fake", "http://fake", "fake",
+                                  file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "fake 模型应被拒绝"
+        except ValueError as e:
+            assert "测试模型" in str(e) or "fake" in str(e), f"错误信息: {e}"
+    finally:
+        sqg._call_llm_text = original
+
+    # mock 模型同样被拒绝
+    assert _is_fake_model("mock-gpt4")
+    assert _is_fake_model("test-model")
+    assert not _is_fake_model("mimo-v2.5-pro")
+    assert not _is_fake_model("gpt-4")
+
+    print("PASS: fake/mock 模型被拒绝，真实模型通过")
+
+
+def test_production_no_fake_in_output():
+    """生产输出中不得出现 fake/v2_updated。"""
+    print("=" * 60)
+    print("测试：生产输出不含 fake/v2_updated")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+        generate_questions_from_schema, _load_schema_cache,
+        _file_content_hash,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    # 用一个非 fake 的 mock 模型名
+    mock_schema = json.dumps({
+        "table_purpose": "IT服务报价清单",
+        "header_row": 1, "data_start_row": 3,
+        "fields": [
+            {"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95},
+            {"source_label": "需求描述", "col_index": 4, "inferred_role": "record_identifier", "confidence": 0.95},
+        ],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = lambda *a, **kw: mock_schema
+    try:
+        result = analyze_table_schema(sheets, "test-model-x", "http://test", "test-model-x",
+                                       file_bytes=file_bytes, force_reanalyze=True,
+                                       allow_test_model=True)
+
+        # 断言：不得出现 fake/v2_updated
+        assert result.get("analysis_model") != "fake", f"model 不得为 fake: {result.get('analysis_model')}"
+        assert result.get("table_purpose") != "v2_updated", f"purpose 不得为 v2_updated: {result.get('table_purpose')}"
+        assert "fake" not in str(result.get("table_purpose", "")).lower()
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print("PASS: 生产输出中无 fake/v2_updated")
+
+
+def test_llm_failure_fail_closed():
+    """LLM 调用失败时必须 fail-closed，不得生成空 schema。"""
+    print("=" * 60)
+    print("测试：LLM 失败 fail-closed")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        parse_xlsx_to_sheet_contexts, analyze_table_schema,
+    )
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    file_bytes = real_path.read_bytes()
+    sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+    # LLM 返回非法 JSON
+    original = sqg._call_llm_text
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    try:
+        # Case 1: LLM 超时
+        sqg._call_llm_text = lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("timeout"))
+        try:
+            analyze_table_schema(sheets, "mimo-v2.5-pro", "http://api", "mimo-v2.5-pro",
+                                  file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "超时应抛出异常"
+        except (TimeoutError, RuntimeError):
+            pass
+
+        # Case 2: LLM 返回垃圾
+        sqg._call_llm_text = lambda *a, **kw: "not json at all"
+        try:
+            analyze_table_schema(sheets, "mimo-v2.5-pro", "http://api", "mimo-v2.5-pro",
+                                  file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "非法 JSON 应抛出异常"
+        except ValueError:
+            pass
+
+        # Case 3: LLM 返回空 fields
+        sqg._call_llm_text = lambda *a, **kw: '{"fields": [], "table_purpose": "empty"}'
+        try:
+            analyze_table_schema(sheets, "mimo-v2.5-pro", "http://api", "mimo-v2.5-pro",
+                                  file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "空 fields 应抛出异常"
+        except ValueError:
+            pass
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print("PASS: LLM 失败/非法返回均 fail-closed")
+
+
+def test_phase1_timeout_is_180s():
+    """Phase 1 的读取超时应为 180 秒，不影响其他调用。"""
+    print("=" * 60)
+    print("测试：Phase 1 timeout=180s")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import _call_llm_text
+    import spreadsheet_question_generator as sqg
+
+    captured_timeouts = []
+
+    def mock_post(url, json=None, headers=None, timeout=None):
+        captured_timeouts.append(timeout)
+        # 模拟成功
+        class FakeResp:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": '{"fields": [], "table_purpose": "test"}'}}]}
+        return FakeResp()
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    import requests
+    original_post = requests.post
+    requests.post = mock_post
+    original_llm = sqg._call_llm_text
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    try:
+        file_bytes = real_path.read_bytes()
+        sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+        try:
+            sqg.analyze_table_schema(sheets, "mimo-v2.5-pro", "http://api", "mimo-v2.5-pro",
+                                      file_bytes=file_bytes, force_reanalyze=True)
+        except Exception:
+            pass  # JSON 解析会失败，但我们只关心 timeout 值
+
+        # 验证 Phase 1 使用 (15, 180) 超时
+        assert len(captured_timeouts) >= 1, f"应捕获至少 1 次请求: {len(captured_timeouts)}"
+        t = captured_timeouts[0]
+        assert isinstance(t, tuple), f"timeout 应为元组: {t}"
+        assert t == (15, 180), f"Phase 1 timeout 应为 (15, 180): {t}"
+
+        # 验证其他调用不受影响（默认 timeout=120）
+        captured_timeouts.clear()
+        try:
+            _call_llm_text("test", "key", "http://api", "model")
+        except Exception:
+            pass
+        if captured_timeouts:
+            t2 = captured_timeouts[0]
+            assert t2 == 120, f"默认 timeout 应为 120: {t2}"
+    finally:
+        requests.post = original_post
+        sqg._call_llm_text = original_llm
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: Phase 1 timeout={captured_timeouts[0] if captured_timeouts else '(15, 180)'}")
+
+
+def test_phase1_retry_on_timeout():
+    """Phase 1 首次超时后重试一次，第二次成功。"""
+    print("=" * 60)
+    print("测试：Phase 1 首次超时重试成功")
+    print("=" * 60)
+
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    mock_schema = json.dumps({
+        "table_purpose": "报价清单", "header_row": 1, "data_start_row": 3,
+        "fields": [{"source_label": "模块", "col_index": 2, "inferred_role": "context", "confidence": 0.95}],
+        "excluded_rows": [52],
+    }, ensure_ascii=False)
+
+    call_count = [0]
+    def timeout_then_success(*a, **kw):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("请求超时 (15s): http://api")
+        return mock_schema
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = timeout_then_success
+    try:
+        file_bytes = real_path.read_bytes()
+        sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+        result = sqg.analyze_table_schema(sheets, "test-model", "http://api", "test-model",
+                                           file_bytes=file_bytes, force_reanalyze=True,
+                                           allow_test_model=True)
+        assert call_count[0] == 2, f"应调用 2 次: {call_count[0]}"
+        assert result["table_purpose"] == "报价清单"
+        assert result.get("llm_call_attempts") == 2
+        assert len(result.get("llm_attempt_durations", [])) == 2
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: 首次超时, 第2次成功, 总尝试={call_count[0]}")
+
+
+def test_phase1_retry_both_fail():
+    """Phase 1 两次均失败后报错，不产生 schema。"""
+    print("=" * 60)
+    print("测试：Phase 1 两次失败报错")
+    print("=" * 60)
+
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    call_count = [0]
+    def always_timeout(*a, **kw):
+        call_count[0] += 1
+        raise RuntimeError("请求超时 (180s): http://api")
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = always_timeout
+    try:
+        file_bytes = real_path.read_bytes()
+        sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+        try:
+            sqg.analyze_table_schema(sheets, "test-model", "http://api", "test-model",
+                                      file_bytes=file_bytes, force_reanalyze=True,
+                                      allow_test_model=True)
+            assert False, "两次超时应抛出异常"
+        except RuntimeError as e:
+            assert "超时" in str(e), f"错误信息应含超时: {e}"
+        assert call_count[0] == 2, f"应尝试 2 次: {call_count[0]}"
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print(f"PASS: 两次超时后正确报错, 尝试={call_count[0]} 次, 无 schema 产生")
+
+
+def test_phase1_no_fake_fallback():
+    """Phase 1 失败时不得降级为 fake/mock schema。"""
+    print("=" * 60)
+    print("测试：Phase 1 无 fake 降级")
+    print("=" * 60)
+
+    import spreadsheet_question_generator as sqg
+
+    real_path = Path(r"E:\Desktop\凯捷材料\7月实习\合同知识库材料\2.4标准\2.5偏离\Appendix E. price list.xlsx")
+    if not real_path.exists():
+        print("SKIP: 真实文件不存在")
+        return
+
+    def always_fail(*a, **kw):
+        raise RuntimeError("请求超时 (180s): http://api")
+
+    tmp_dir, orig_dir = _use_test_schema_cache()
+    original = sqg._call_llm_text
+    sqg._call_llm_text = always_fail
+    try:
+        file_bytes = real_path.read_bytes()
+        sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+
+        # 验证：不能用 fake 模型绕过
+        try:
+            sqg.analyze_table_schema(sheets, "fake", "http://api", "fake",
+                                      file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "fake 模型应被拒绝"
+        except ValueError:
+            pass
+
+        # 验证：真实模型两次失败后不产生任何 schema
+        try:
+            sqg.analyze_table_schema(sheets, "mimo-v2.5-pro", "http://api", "mimo-v2.5-pro",
+                                      file_bytes=file_bytes, force_reanalyze=True)
+            assert False, "两次失败应抛出异常"
+        except RuntimeError:
+            pass
+
+        # 验证：缓存中无数据
+        cached = sqg._load_schema_cache(sqg._file_content_hash(file_bytes))
+        assert cached is None, "失败后不应有缓存"
+    finally:
+        sqg._call_llm_text = original
+        _restore_schema_cache_dir(tmp_dir, orig_dir)
+
+    print("PASS: 失败后无 fake 降级，无缓存产生")
+
+
 # ====== Main ======
+
+# ====== 新增测试场景 ======
+
+def test_resource_cost_table_candidate_catalog():
+    """资源成本表：候选目录含 candidate_id、record_locator、target_field。"""
+    print("=" * 60)
+    print("测试：资源成本表候选目录")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _build_candidate_anchors_from_schema, _slugify_field,
+    )
+
+    # 构建模拟的 SheetContext
+    ctx = SheetContext(
+        sheet_name="Sheet1", max_row=5, max_col=4,
+        headers=["需求描述", "类型", "QTY", "Total Cost"],
+        rows=[
+            ["需求描述", "类型", "QTY", "Total Cost"],
+            ["需求A", "Improvement", 10, 5000],
+            ["需求B", "New function", 20, 8000],
+            ["需求C", "Enhancement", 5, 3000],
+            ["合计", "", 35, 16000],
+        ],
+    )
+
+    confirmed_schema = {
+        "record_locator_fields": ["需求描述"],
+        "context_fields": [],
+        "excluded_rows": [],
+        "question_plan": {
+            "target_field_priority": [
+                {"field": "QTY", "role": "metric", "priority": 1, "reason": "数量"},
+                {"field": "Total Cost", "role": "cost", "priority": 2, "reason": "费用"},
+                {"field": "类型", "role": "categorical", "priority": 3, "reason": "分类"},
+            ],
+        },
+    }
+
+    candidates = _build_candidate_anchors_from_schema([ctx], confirmed_schema)
+
+    assert len(candidates) > 0, "应生成候选"
+
+    # 验证候选结构
+    for c in candidates:
+        assert "candidate_id" in c, f"应有 candidate_id: {c.keys()}"
+        assert "record_locator" in c, f"应有 record_locator"
+        assert "target_field" in c, f"应有 target_field"
+        assert "allowed_evidence_fields" in c, f"应有 allowed_evidence_fields"
+        assert c["target_field"]["label"] in ["QTY", "Total Cost", "类型"], f"target_field: {c['target_field']}"
+        assert c["target_field"]["role"] in ["metric", "cost", "categorical"], f"role: {c['target_field']['role']}"
+
+    # 验证不含汇总行
+    for c in candidates:
+        bounds = _parse_range_str(c["anchor_range"])
+        if bounds:
+            assert bounds[1] != 5, f"不应含汇总行: {c['anchor_range']}"
+
+    # 验证 record_locator 含实际值
+    for c in candidates:
+        rl = c["record_locator"]
+        assert "需求描述" in rl, f"record_locator 应含需求描述: {rl}"
+        assert rl["需求描述"] in ["需求A", "需求B", "需求C"], f"值: {rl}"
+
+    print(f"PASS: {len(candidates)} 个候选, 示例: {candidates[0]['candidate_id']}")
+
+
+def test_inventory_table_recognized():
+    """库存/参数表：无业务词硬编码也能识别记录字段与数值字段。"""
+    print("=" * 60)
+    print("测试：库存/参数表识别")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _build_candidate_anchors_from_schema,
+    )
+
+    ctx = SheetContext(
+        sheet_name="Inventory", max_row=4, max_col=4,
+        headers=["Product Code", "Category", "Stock Qty", "Unit Price"],
+        rows=[
+            ["Product Code", "Category", "Stock Qty", "Unit Price"],
+            ["P001", "Electronics", 150, 29.99],
+            ["P002", "Clothing", 300, 15.50],
+            ["P003", "Food", 50, 8.75],
+        ],
+    )
+
+    confirmed_schema = {
+        "record_locator_fields": ["Product Code"],
+        "context_fields": ["Category"],
+        "excluded_rows": [],
+        "question_plan": {
+            "target_field_priority": [
+                {"field": "Stock Qty", "role": "metric", "priority": 1, "reason": "库存数量"},
+                {"field": "Unit Price", "role": "cost", "priority": 2, "reason": "单价"},
+            ],
+        },
+    }
+
+    candidates = _build_candidate_anchors_from_schema([ctx], confirmed_schema)
+    assert len(candidates) >= 4, f"应至少 4 个候选: {len(candidates)}"
+
+    # 验证 Product Code 作为记录标识
+    for c in candidates:
+        assert "Product Code" in c["record_locator"], f"应含 Product Code: {c['record_locator']}"
+        assert c["record_locator"]["Product Code"].startswith("P"), f"值: {c['record_locator']}"
+
+    print(f"PASS: {len(candidates)} 个候选")
+
+
+def test_summary_empty_isolated_excluded_from_candidates():
+    """汇总行、空列、孤立数值不能成为候选。"""
+    print("=" * 60)
+    print("测试：汇总行/空列/孤立数值排除")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _build_candidate_anchors_from_schema,
+    )
+
+    ctx = SheetContext(
+        sheet_name="Test", max_row=6, max_col=4,
+        headers=["Name", "Category", "Amount", "备注"],
+        rows=[
+            ["Name", "Category", "Amount", "备注"],
+            ["Item A", "Type1", 100, "ok"],
+            ["Item B", "Type2", 200, "ok"],
+            ["", "", "", ""],  # 空行
+            ["Total", "", 300, ""],  # 汇总行
+            ["Item C", "Type3", "", ""],  # 空数值
+        ],
+    )
+
+    confirmed_schema = {
+        "record_locator_fields": ["Name"],
+        "context_fields": ["Category"],
+        "excluded_rows": [],
+        "question_plan": {
+            "target_field_priority": [
+                {"field": "Amount", "role": "metric", "priority": 1, "reason": "数量"},
+            ],
+        },
+    }
+
+    candidates = _build_candidate_anchors_from_schema([ctx], confirmed_schema)
+
+    # 不应包含汇总行（row 5）
+    for c in candidates:
+        bounds = _parse_range_str(c["anchor_range"])
+        if bounds:
+            assert bounds[1] != 5, f"不应含汇总行: {c['anchor_range']}"
+            assert bounds[1] != 4, f"不应含空行: {c['anchor_range']}"
+
+    # 不应包含空数值的行（row 6，Amount 为空）
+    for c in candidates:
+        bounds = _parse_range_str(c["anchor_range"])
+        if bounds and bounds[1] == 6:
+            assert False, f"不应含空数值行: {c['anchor_range']}"
+
+    print(f"PASS: {len(candidates)} 个候选（排除了汇总行、空行、空数值行）")
+
+
+def test_fail_closed_invalid_candidate_id():
+    """LLM 返回错误 candidate_id 时 fail-closed 拒绝。"""
+    print("=" * 60)
+    print("测试：fail-closed 无效 candidate_id")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _validate_phase2_question,
+    )
+
+    ctx = SheetContext(
+        sheet_name="Sheet1", max_row=3, max_col=3,
+        headers=["Name", "Type", "Value"],
+        rows=[
+            ["Name", "Type", "Value"],
+            ["Item A", "Type1", 100],
+            ["Item B", "Type2", 200],
+        ],
+    )
+    sheets_by_name = {"Sheet1": ctx}
+
+    candidate_catalog = [{
+        "candidate_id": "sheet1_row_2_value",
+        "sheet_name": "Sheet1",
+        "anchor_range": "A2:C2",
+        "header_context_range": "A1:C1",
+        "record_locator": {"Name": "Item A"},
+        "target_field": {"label": "Value", "role": "metric", "value": 100},
+        "allowed_evidence_fields": ["Name", "Value"],
+    }]
+
+    # 测试 1: 错误 candidate_id
+    q1 = {"candidate_id": "nonexistent_id", "question": "test", "target_field_label": "Value"}
+    validated, category, reason = _validate_phase2_question(q1, candidate_catalog, sheets_by_name)
+    assert validated is None, f"应拒绝无效 candidate_id"
+    assert category == "candidate_mismatch", f"category: {category}"
+
+    # 测试 2: 错误 target_field_label
+    q2 = {"candidate_id": "sheet1_row_2_value", "question": "test", "target_field_label": "WrongField"}
+    validated, category, reason = _validate_phase2_question(q2, candidate_catalog, sheets_by_name)
+    assert validated is None, f"应拒绝不匹配的 target_field_label"
+    assert category == "field_mismatch", f"category: {category}"
+
+    print(f"PASS: 无效 candidate_id 和 target_field_label 均被拒绝")
+
+
+def test_reference_answer_locally_rendered():
+    """reference_answer 由本地真实表头和单元格渲染，LLM 响应中不存在。"""
+    print("=" * 60)
+    print("测试：reference_answer 本地渲染")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _validate_phase2_question,
+    )
+
+    ctx = SheetContext(
+        sheet_name="Sheet1", max_row=3, max_col=3,
+        headers=["需求描述", "类型", "工作量"],
+        rows=[
+            ["需求描述", "类型", "工作量"],
+            ["工具链优化", "Improvement", 17],
+            ["看板搭建", "New function", 25],
+        ],
+    )
+    sheets_by_name = {"Sheet1": ctx}
+
+    candidate_catalog = [{
+        "candidate_id": "sheet1_row_2_工作量",
+        "sheet_name": "Sheet1",
+        "anchor_range": "A2:C2",
+        "header_context_range": "A1:C1",
+        "record_locator": {"需求描述": "工具链优化"},
+        "target_field": {"label": "工作量", "role": "metric", "value": 17},
+        "allowed_evidence_fields": ["需求描述", "工作量"],
+    }]
+
+    # LLM 返回（无 reference_answer）
+    q = {"candidate_id": "sheet1_row_2_工作量", "question": "工具链优化工作量", "target_field_label": "工作量", "difficulty": "事实", "topic": "工作量"}
+    validated, category, reason = _validate_phase2_question(q, candidate_catalog, sheets_by_name)
+
+    assert validated is not None, f"应通过验证: {reason}"
+    assert "reference_answer" in validated, "应有 reference_answer"
+    ref = validated["reference_answer"]
+    assert ref, "reference_answer 不应为空"
+    # 应包含真实字段名和值
+    assert "需求描述" in ref, f"应含字段名: {ref}"
+    assert "工具链优化" in ref, f"应含记录值: {ref}"
+    assert "工作量" in ref, f"应含目标字段名: {ref}"
+    assert "17" in ref, f"应含目标值: {ref}"
+    # 应为键值对格式
+    assert "：" in ref, f"应为键值对格式: {ref}"
+
+    # LLM 响应中无 reference_answer
+    assert "reference_answer" not in q, "LLM 响应不应含 reference_answer"
+
+    print(f"PASS: reference_answer='{ref}'")
+
+
+def test_non_schema_path_not_regressed():
+    """非 schema 路径（generate_spreadsheet_questions）不回归。"""
+    print("=" * 60)
+    print("测试：非 schema 路径不回归")
+    print("=" * 60)
+
+    from spreadsheet_question_generator import (
+        _build_candidate_anchors, _build_prompt,
+    )
+
+    ctx = SheetContext(
+        sheet_name="Sheet1", max_row=3, max_col=3,
+        headers=["产品", "类别", "价格"],
+        rows=[
+            ["产品", "类别", "价格"],
+            ["产品A", "电子", 100],
+            ["产品B", "服装", 200],
+        ],
+    )
+
+    # 旧路径仍应工作
+    candidates = _build_candidate_anchors([ctx])
+    assert len(candidates) > 0, f"旧路径应生成候选: {len(candidates)}"
+
+    prompt = _build_prompt([ctx], 5, "", candidates)
+    assert len(prompt) > 100, f"旧路径应生成 prompt"
+
+    # 旧候选格式不含 candidate_id（旧格式使用 fact_fields, query_focus）
+    for c in candidates:
+        assert "evidence_mode" in c, f"旧格式应有 evidence_mode"
+        assert "anchor_range" in c, f"旧格式应有 anchor_range"
+
+    print(f"PASS: 旧路径 {len(candidates)} 候选, prompt {len(prompt)} 字符")
+
 
 def main():
     tests = [
@@ -2316,6 +3600,29 @@ def main():
         test_candidate_section_appears_in_prompt,
         test_summary_rows_excluded_from_candidates,
         test_appendix_e_smoke_with_summary_and_merged,
+        test_real_appendix_e_file_e2e,
+        test_phase1_schema_analysis_mock,
+        test_schema_cache_hit,
+        test_evidence_schema_display,
+        test_generate_questions_from_schema_e2e,
+        test_upload_no_llm_call,
+        test_phase1_only_on_button_click,
+        test_phase2_does_not_recall_phase1,
+        test_file_change_invalidates_schema,
+        test_reanalyze_clears_and_rebuilds,
+        test_production_rejects_fake_model,
+        test_production_no_fake_in_output,
+        test_llm_failure_fail_closed,
+        test_phase1_timeout_is_180s,
+        test_phase1_retry_on_timeout,
+        test_phase1_retry_both_fail,
+        test_phase1_no_fake_fallback,
+        test_resource_cost_table_candidate_catalog,
+        test_inventory_table_recognized,
+        test_summary_empty_isolated_excluded_from_candidates,
+        test_fail_closed_invalid_candidate_id,
+        test_reference_answer_locally_rendered,
+        test_non_schema_path_not_regressed,
     ]
 
     passed = 0

@@ -1275,32 +1275,185 @@ with tab_qgen:
                 for w in _warnings:
                     st.warning(w)
 
-        # 电子表格检索模式：显示 Markdown 表格块预览
+        # ── 电子表格检索模式：本地解析 + 预览（不调用 LLM）──
         _is_spreadsheet_preview = (
             parse_result.get("source_type") in ("xlsx", "xls", "csv")
             and mode_val == MODE_RETRIEVAL
         )
         if _is_spreadsheet_preview:
-            with st.expander("发送给 LLM 的表格 Markdown（检索模式专用）", expanded=True):
-                try:
-                    from spreadsheet_question_generator import (
-                        parse_xlsx_to_sheet_contexts,
-                        parse_csv_to_sheet_contexts,
-                        parse_xls_to_sheet_contexts,
-                        _build_prompt,
+            try:
+                from spreadsheet_question_generator import (
+                    parse_xlsx_to_sheet_contexts,
+                    parse_csv_to_sheet_contexts,
+                    parse_xls_to_sheet_contexts,
+                    analyze_table_schema,
+                    generate_questions_from_schema,
+                    _col_letter,
+                )
+
+                _ext = Path(file_name).suffix.lower()
+                if _ext == ".xlsx":
+                    _schema_sheets = parse_xlsx_to_sheet_contexts(file_bytes)
+                elif _ext == ".xls":
+                    _schema_sheets = parse_xls_to_sheet_contexts(file_bytes)
+                else:
+                    _schema_sheets = parse_csv_to_sheet_contexts(file_bytes, file_name)
+
+                # 检测文件是否更换（清除旧 schema）
+                _prev_file = st.session_state.get("_schema_file_name")
+                if _prev_file and _prev_file != file_name:
+                    st.session_state.pop("_schema_analysis", None)
+                    st.session_state.pop("_schema_analysis_done", None)
+                    st.session_state.pop("_schema_llm_calls", None)
+
+                st.session_state["_schema_sheets"] = _schema_sheets
+                st.session_state["_schema_file_name"] = file_name
+                st.session_state["_schema_file_bytes"] = file_bytes
+
+                # 本地预览摘要
+                _total_rows = sum(s.max_row for s in _schema_sheets)
+                _total_cols = sum(s.max_col for s in _schema_sheets)
+                _merged = sum(len(s.merged_cells) for s in _schema_sheets)
+                _formula_warn = sum(len(s.formula_cells_without_cache) for s in _schema_sheets)
+
+                _col1, _col2, _col3, _col4 = st.columns(4)
+                _col1.metric("工作表", len(_schema_sheets))
+                _col2.metric("总行数", _total_rows)
+                _col3.metric("合并单元格", _merged)
+                _col4.metric("公式警告", _formula_warn)
+                st.caption("本地解析完成，未调用 LLM")
+
+                # 汇总行/风险提示
+                from spreadsheet_question_generator import _is_summary_row
+                _summary_rows = []
+                for s in _schema_sheets:
+                    for r in range(len(s.rows)):
+                        if _is_summary_row(s.rows[r]):
+                            _summary_rows.append(f"{s.sheet_name} 第 {r + 1} 行")
+                if _summary_rows:
+                    st.warning(f"检测到汇总/总计行（将自动排除）: {', '.join(_summary_rows[:5])}" +
+                               (f" 等 {len(_summary_rows)} 行" if len(_summary_rows) > 5 else ""))
+
+                if _formula_warn:
+                    st.warning(f"有 {_formula_warn} 个公式单元格缺少缓存值，出题时将自动规避")
+
+                # ── Phase 1 按钮 ──
+                _schema_done = st.session_state.get("_schema_analysis_done", False)
+
+                if not _schema_done:
+                    if st.button("分析表格结构（调用 LLM）", type="primary", key="btn_analyze_schema", use_container_width=True):
+                        if not qgen_api_key:
+                            st.error("请在上方「API 配置」中输入 API Key")
+                        else:
+                            with st.status("Phase 1: 正在理解表格结构...", expanded=True):
+                                try:
+                                    _analysis = analyze_table_schema(
+                                        _schema_sheets,
+                                        qgen_api_key, qgen_base_url, qgen_model,
+                                        file_bytes=file_bytes,
+                                    )
+                                    _attempts = _analysis.get("llm_call_attempts", 1)
+                                    _durations = _analysis.get("llm_attempt_durations", [])
+                                    _total_dur = _analysis.get("llm_call_duration_sec", 0)
+                                    st.session_state["_schema_analysis"] = _analysis
+                                    st.session_state["_schema_analysis_done"] = True
+                                    st.session_state["_schema_llm_calls"] = _attempts
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Phase 1 分析失败（已重试 {_attempts if '_attempts' in dir() else 1} 次）: {e}")
+                else:
+                    # Phase 1 已完成：展示摘要
+                    _analysis = st.session_state.get("_schema_analysis", {})
+                    _sf = _analysis.get("safe_question_fields", [])
+                    _excl = _analysis.get("excluded_rows", [])
+                    _record_id_cnt = len(_analysis.get("record_identifier_fields", []))
+                    _context_cnt = len(_analysis.get("context_fields", []))
+                    _metric_cnt = len(_analysis.get("metric_fields", []))
+                    _cost_cnt = len(_analysis.get("cost_fields", []))
+                    _categorical_cnt = len(_analysis.get("categorical_fields", []))
+
+                    _src = _analysis.get("schema_source", "llm")
+                    _dur = _analysis.get("llm_call_duration_sec", 0)
+                    _attempts = _analysis.get("llm_call_attempts", 1)
+                    _attempt_str = f"{_attempts} 次" if _attempts > 1 else "1 次"
+                    st.success(
+                        f"实际 LLM 分析完成 | 已调用 LLM {_attempt_str}（总耗时 {_dur:.1f}s）| "
+                        f"来源: {_src} | 模型: {_analysis.get('analysis_model', 'N/A')} | "
+                        f"表用途: {_analysis.get('table_purpose', '未知')}"
                     )
-                    _ext = Path(file_name).suffix.lower()
-                    if _ext == ".xlsx":
-                        _preview_sheets = parse_xlsx_to_sheet_contexts(file_bytes)
-                    elif _ext == ".xls":
-                        _preview_sheets = parse_xls_to_sheet_contexts(file_bytes)
-                    else:
-                        _preview_sheets = parse_csv_to_sheet_contexts(file_bytes, file_name)
-                    _preview_prompt = _build_prompt(_preview_sheets, qgen_num, qgen_topic_hint)
-                    st.code(_preview_prompt, language=None)
-                    st.caption(f"Prompt 长度：{len(_preview_prompt)} 字符 | 工作表 {len(_preview_sheets)} 个 | 表格块 {sum(len(s.table_blocks) for s in _preview_sheets)} 个")
-                except Exception as e:
-                    st.error(f"表格解析预览失败: {e}")
+
+                    _scol1, _scol2, _scol3, _scol4, _scol5 = st.columns(5)
+                    _scol1.metric("记录标识", _record_id_cnt)
+                    _scol2.metric("上下文", _context_cnt)
+                    _scol3.metric("数值/费用", _metric_cnt + _cost_cnt)
+                    _scol4.metric("分类", _categorical_cnt)
+                    _scol5.metric("排除行", len(_excl))
+
+                    if _sf:
+                        st.caption(f"可出题目标字段: {', '.join(_sf)}")
+
+                    # 展示 question_plan 摘要
+                    _qp = _analysis.get("question_plan", {})
+                    if _qp:
+                        _patterns = _qp.get("recommended_question_patterns", [])
+                        if _patterns:
+                            st.info(f"**推荐题型**: {', '.join(_patterns)}")
+
+                        _priority = _qp.get("target_field_priority", [])
+                        if _priority:
+                            _priority_text = " | ".join(
+                                f"{tfp['field']}（{tfp.get('role', '')}，优先级 {tfp.get('priority', '')}）"
+                                for tfp in _priority
+                            )
+                            st.caption(f"**目标字段优先级**: {_priority_text}")
+
+                        _forbidden = _qp.get("forbidden_patterns", [])
+                        if _forbidden:
+                            with st.expander("禁止题型", expanded=False):
+                                for fb in _forbidden:
+                                    st.caption(f"- {fb}")
+
+                        _rationale = _qp.get("rationale", "")
+                        if _rationale:
+                            st.caption(f"**分析理由**: {_rationale}")
+
+                    # 折叠区：分析依据
+                    with st.expander("查看分析依据（可选）", expanded=False):
+                        st.markdown(f"**表格用途**: {_analysis.get('table_purpose', '未知')}")
+                        st.markdown(f"**分析模型**: {_analysis.get('analysis_model', 'N/A')} | **分析时间**: {_analysis.get('analysis_timestamp', 'N/A')}")
+
+                        _role_labels = {
+                            "record_identifier_fields": "记录标识字段",
+                            "context_fields": "上下文/分组字段",
+                            "metric_fields": "数值度量字段",
+                            "cost_fields": "费用字段",
+                            "categorical_fields": "分类字段",
+                        }
+                        for role_key, role_label in _role_labels.items():
+                            fields = _analysis.get(role_key, [])
+                            if not fields:
+                                continue
+                            labels = [f"{f['source_label']}（列 {_col_letter(f['col_index'])}，置信度 {f['confidence']:.0%}）" for f in fields]
+                            st.markdown(f"**{role_label}**: {', '.join(labels)}")
+
+                        if _excl:
+                            st.markdown(f"**排除行**: {', '.join(str(r) for r in _excl)}")
+                        _reasoning = _analysis.get("reasoning", "")
+                        if _reasoning:
+                            st.markdown(f"**分析理由**: {_reasoning}")
+
+                        with st.expander("Phase 1 原始 JSON", expanded=False):
+                            st.code(json.dumps(_analysis, ensure_ascii=False, indent=2), language="json")
+
+                    # 重新分析按钮
+                    if st.button("重新分析结构", key="btn_reanalyze_schema"):
+                        st.session_state.pop("_schema_analysis", None)
+                        st.session_state.pop("_schema_analysis_done", None)
+                        st.session_state.pop("_schema_llm_calls", None)
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"表格解析失败: {e}")
         else:
             with st.expander("文件内容预览", expanded=False):
                 preview_len = 500
@@ -1346,10 +1499,24 @@ with tab_qgen:
         # --- Prompt 示例 ---
         with st.expander("Prompt 示例（点击展开）", expanded=False):
             if _is_spreadsheet_preview:
-                # 电子表格检索模式：显示专用 prompt（已在上方表格 Markdown 预览中展示）
-                st.markdown("**当前模式：电子表格检索评测** — 使用专用表格 prompt，LLM 只输出题目和锚定区域，金标准由本地渲染")
-                st.markdown("实际发送给 LLM 的完整 prompt 已在上方「发送给 LLM 的表格 Markdown」中展示。")
-                st.caption("该 prompt 包含：表格内容（带 Excel 行号和 allowed_anchor_ranges 白名单）、出题规范、输出格式要求。LLM 不会输出 reference_answer。")
+                st.markdown("**当前模式：电子表格两阶段检索评测** — Phase 1 分析结构，Phase 2 生成题目")
+                st.caption("Phase 1 和 Phase 2 的实际 Prompt 将在生成完成后显示在审计区。")
+                st.markdown("""
+**Phase 2 Prompt 结构**（脱敏示例）：
+
+Phase 2 的 LLM 收到以下内容：
+1. **Schema 与出题计划** — 记录定位字段、上下文字段、目标字段优先级、推荐题型、禁止题型
+2. **表格内容** — 仅包含涉及字段列的 Markdown 表格
+3. **候选目录（candidate catalog）** — 按角色分组的候选列表，每项含 `candidate_id`、`record_locator`、`target_field`
+
+LLM 输出格式：
+```json
+[{"candidate_id": "...", "question": "短检索查询", "target_field_label": "...", "difficulty": "事实", "topic": "..."}]
+```
+
+LLM 只能从候选目录中选择 `candidate_id`，不得自造 anchor_range、字段或数值。
+`reference_answer` 由本地程序从真实单元格渲染，LLM 不输出。
+""")
             else:
                 from question_generator import (
                     load_qgen_prompt_template, chunk_document, allocate_questions,
@@ -1473,7 +1640,18 @@ with tab_qgen:
                     st.caption(f"prompt 模板长度：{len(_p)} 字符")
 
         # --- Generate button ---
-        if st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
+        # 电子表格模式：Phase 1 未完成时禁用
+        _is_spreadsheet_direct = (
+            parse_result.get("source_type") in ("xlsx", "xls", "csv")
+            and mode_val == MODE_RETRIEVAL
+        )
+        _schema_ready = st.session_state.get("_schema_analysis_done", False)
+        _gen_disabled = _is_spreadsheet_direct and not _schema_ready
+
+        if _gen_disabled:
+            st.button("生成题目（请先点击上方「分析表格结构」）", type="primary",
+                      key="qgen_run_disabled", use_container_width=True, disabled=True)
+        elif st.button("生成题目", type="primary", key="qgen_run", use_container_width=True):
             if not qgen_api_key:
                 st.error("请在上方「API 配置」中输入 API Key")
             else:
@@ -1496,12 +1674,6 @@ with tab_qgen:
 
                 mode_label = MODE_LABELS[mode_val]
 
-                # 电子表格直传路径：检索模式 + XLSX/XLS/CSV 文件
-                _is_spreadsheet_direct = (
-                    parse_result.get("source_type") in ("xlsx", "xls", "csv")
-                    and mode_val == MODE_RETRIEVAL
-                )
-
                 with st.status(f"正在生成题目（{mode_label} | {strategy_label}模式）...", expanded=True) as gen_status:
                     status_text = st.empty()
                     status_text.write("正在切分文档...")
@@ -1513,18 +1685,46 @@ with tab_qgen:
 
                     try:
                         if _is_spreadsheet_direct:
-                            from spreadsheet_question_generator import generate_spreadsheet_questions
+                            from spreadsheet_question_generator import (
+                                generate_questions_from_schema,
+                            )
+
+                            _schema_sheets = st.session_state.get("_schema_sheets")
+                            _cached_schema = st.session_state.get("_schema_analysis")
+
+                            if not _cached_schema or not _schema_sheets:
+                                st.error("Phase 1 未完成，请先点击「分析表格结构」")
+                                st.stop()
+
+                            # ── Phase 2: 基于已缓存 schema 出题（不重复调用 Phase 1）──
+                            status_text.write("Phase 2: 正在生成检索题...")
 
                             def _on_progress_spreadsheet(step, total, desc):
-                                status_text.write(f"电子表格出题: {desc} ({step}/{total})")
+                                status_text.write(f"Phase 2: {desc} ({step}/{total})")
 
-                            questions, gen_stats = generate_spreadsheet_questions(
-                                file_bytes, file_name,
+                            _phase1_calls = st.session_state.get("_schema_llm_calls", 0)
+
+                            questions, gen_stats = generate_questions_from_schema(
+                                _schema_sheets,
+                                _cached_schema,
                                 qgen_api_key, qgen_base_url, qgen_model,
                                 num_questions=qgen_num, difficulty=difficulty_val,
                                 topic_hint=qgen_topic_hint,
                                 timeout=120,
                                 progress_callback=_on_progress_spreadsheet,
+                                file_name=file_name,
+                            )
+
+                            # 统计 LLM 调用次数
+                            _phase2_calls = gen_stats.get("first_raw_count", 0) + gen_stats.get("supplement_count", 0)
+                            _total_llm_calls = _phase1_calls + (1 if gen_stats.get("first_raw_count", 0) > 0 else 0) + (1 if gen_stats.get("supplement_count", 0) > 0 else 0)
+                            st.session_state["_schema_llm_calls"] = _total_llm_calls
+
+                            # 存储 schema 供审计展示
+                            st.session_state["_last_schema_analysis"] = _cached_schema
+
+                            status_text.write(
+                                f"Phase 2 出题完成，已调用 LLM {_total_llm_calls} 次"
                             )
                         else:
                             questions, gen_stats = generate_questions(
@@ -1643,8 +1843,64 @@ with tab_qgen:
             with st.expander(f"#{i} {item.get('question', '')[:60]}"):
                 st.markdown(f"**{_label_question}**: {item.get('question', '')}")
                 st.markdown(f"**{_label_ref_answer}**: {item.get('reference_answer', '')}")
-                st.markdown(f"**来源摘录**: {item.get('source_excerpt', '')}")
+                if item.get("evidence_schema_display"):
+                    st.markdown(f"**字段摘要**: {item['evidence_schema_display']}")
                 st.markdown(f"**难度**: {item.get('difficulty', '')} | **主题**: {item.get('topic', '')}")
+
+        # 电子表格两阶段分析依据（可选审计）
+        _last_schema = st.session_state.get("_last_schema_analysis")
+        if _last_schema:
+            with st.expander("查看分析依据（可选）", expanded=False):
+                _total_calls = st.session_state.get("_schema_llm_calls", 0)
+                st.markdown(f"**LLM 调用次数**: {_total_calls} 次（Phase 1: 1 次 + Phase 2: {_total_calls - 1} 次）")
+                st.markdown(f"**表格用途**: {_last_schema.get('table_purpose', '未知')}")
+                st.markdown(f"**分析模型**: {_last_schema.get('analysis_model', 'N/A')} | **分析时间**: {_last_schema.get('analysis_timestamp', 'N/A')}")
+
+                _role_labels = {
+                    "group_fields": "上下文/分组字段",
+                    "record_fields": "记录标识字段",
+                    "metric_fields": "数值度量字段",
+                    "cost_fields": "费用字段",
+                    "ambiguous_fields": "待确认字段",
+                }
+                for role_key, role_label in _role_labels.items():
+                    fields = _last_schema.get(role_key, [])
+                    if not fields:
+                        continue
+                    labels = [f"{f['source_label']}（列 {_col_letter(f['col_index'])}，置信度 {f['confidence']:.0%}）" for f in fields]
+                    st.markdown(f"**{role_label}**: {', '.join(labels)}")
+
+                _excluded = _last_schema.get("excluded_rows", [])
+                if _excluded:
+                    st.markdown(f"**排除行**: {', '.join(str(r) for r in _excluded)}")
+
+                _rl = _last_schema.get("record_locator_fields", [])
+                _qt = _last_schema.get("question_target_fields", [])
+                if _rl:
+                    st.markdown(f"**记录定位字段**: {', '.join(_rl)}")
+                if _qt:
+                    st.markdown(f"**目标字段（可出题）**: {', '.join(_qt)}")
+
+                # question_plan 展示
+                _qp = _last_schema.get("question_plan", {})
+                if _qp.get("target_field_plans"):
+                    st.markdown("**题型计划**:")
+                    for _plan in _qp["target_field_plans"]:
+                        st.markdown(
+                            f"- {_plan.get('question_type', '')}: "
+                            f"目标={_plan.get('target_field', '')} | "
+                            f"{_plan.get('description', '')}"
+                        )
+                    _cr = _qp.get("coverage_rule", "")
+                    if _cr:
+                        st.caption(f"覆盖规则: {_cr}")
+
+                _reasoning = _last_schema.get("reasoning", "")
+                if _reasoning:
+                    st.markdown(f"**分析理由**: {_reasoning}")
+
+                with st.expander("Phase 1 原始 JSON", expanded=False):
+                    st.code(json.dumps(_last_schema, ensure_ascii=False, indent=2), language="json")
 
         st.divider()
         st.subheader("导出")

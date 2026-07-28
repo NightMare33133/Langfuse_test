@@ -14,10 +14,12 @@
 """
 
 import csv
+import hashlib
 import io
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -58,6 +60,119 @@ class TableBlock:
     allowed_anchor_ranges: list
     has_formula_warnings: bool
     header_context_range: str = None        # 表头上下文范围（如 B2:D2），用于价格题
+
+
+@dataclass
+class FieldSchema:
+    """Phase 1 单字段 schema 分析结果。"""
+    source_label: str           # 原始列标题文本
+    col_index: int              # 1-indexed 列号
+    inferred_role: str          # record_identifier | context | metric | cost | categorical | excluded
+    confidence: float           # 0.0-1.0
+    needs_confirmation: bool    # True = LLM 不确定或数值字段
+    alias: str = ""             # 用户别名（UI 审核时填写）
+    user_confirmed: bool = False
+    user_action: str = "context_only"  # ask_question | context_only | exclude
+
+
+@dataclass
+class TableSchemaResult:
+    """Phase 1 完整 schema 分析结果。"""
+    table_purpose: str
+    header_row: int
+    data_start_row: int
+    record_identifier_fields: list = field(default_factory=list)
+    context_fields: list = field(default_factory=list)
+    metric_fields: list = field(default_factory=list)
+    cost_fields: list = field(default_factory=list)
+    categorical_fields: list = field(default_factory=list)
+    excluded_fields: list = field(default_factory=list)
+    excluded_rows: list = field(default_factory=list)
+    safe_question_fields: list = field(default_factory=list)
+    sheet_name: str = ""
+    analysis_model: str = ""
+    analysis_timestamp: str = ""
+
+
+# ─── Schema 缓存 ──────────────────────────────────────────────────────────────
+
+_SCHEMA_CACHE_DIR = Path(__file__).parent / "data" / "schema_cache"
+_SCHEMA_ANALYSIS_PROMPT_PATH = Path(__file__).parent / "prompts" / "qgen_schema_analysis_prompt.txt"
+
+# 测试/假模型标识，生产缓存中不允许出现
+_FAKE_MODEL_MARKERS = ("fake", "mock", "test", "dummy", "stub")
+
+
+def _file_content_hash(file_bytes):
+    """计算文件内容 SHA-256 哈希。"""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def _is_fake_model(model_name):
+    """判断模型名是否为测试/假模型。"""
+    if not model_name:
+        return True
+    lower = model_name.lower()
+    return any(lower == marker or lower.startswith(marker + "-") or lower.startswith(marker + "_")
+               for marker in _FAKE_MODEL_MARKERS)
+
+
+def _load_schema_cache(file_hash, expected_model=None, allow_test_model=False):
+    """按文件哈希加载 schema 缓存，miss 返回 None。
+
+    Args:
+        file_hash: 文件内容哈希
+        expected_model: 期望的模型名。如果缓存中的 analysis_model 不匹配，返回 None。
+        allow_test_model: 是否允许加载 test/mock 模型生成的缓存（仅测试使用）
+    """
+    cache_path = _SCHEMA_CACHE_DIR / f"{file_hash}.json"
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "fields" not in data:
+            return None
+        # 检测旧格式缓存（使用旧角色名），强制重分析
+        if "group_fields" in data and "record_identifier_fields" not in data:
+            print(f"  [WARN] 检测到旧格式 schema 缓存，强制重分析")
+            return None
+        # 拒绝 fake/mock 缓存（除非测试显式允许）
+        cached_model = data.get("analysis_model", "")
+        if _is_fake_model(cached_model) and not allow_test_model:
+            print(f"  [WARN] 拒绝 fake 缓存 (model={cached_model})")
+            return None
+        # 模型不匹配时拒绝（允许 expected_model 为空则跳过检查）
+        if expected_model and cached_model and cached_model != expected_model:
+            print(f"  [WARN] 缓存模型不匹配: 缓存={cached_model}, 期望={expected_model}")
+            return None
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_schema_cache(file_hash, schema_data):
+    """保存 schema 分析结果到缓存。"""
+    _SCHEMA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _SCHEMA_CACHE_DIR / f"{file_hash}.json"
+    cache_path.write_text(json.dumps(schema_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _delete_schema_cache(file_hash):
+    """删除指定文件的 schema 缓存。"""
+    cache_path = _SCHEMA_CACHE_DIR / f"{file_hash}.json"
+    if cache_path.exists():
+        cache_path.unlink()
+
+
+def _set_schema_cache_dir(path):
+    """覆盖 schema 缓存目录（供测试隔离使用）。"""
+    global _SCHEMA_CACHE_DIR
+    _SCHEMA_CACHE_DIR = Path(path)
+
+
+def _get_schema_cache_dir():
+    """获取当前 schema 缓存目录。"""
+    return _SCHEMA_CACHE_DIR
 
 
 # ─── 列字母转换（独立于 openpyxl） ────────────────────────────────────────────
@@ -962,7 +1077,7 @@ def _validate_question_anchor_consistency(question, semantic_field_names, semant
 
 _SUMMARY_KEYWORDS = (
     "总计", "合计", "小计", "汇总", "总成本", "总费用", "总金额", "小合计",
-    "total", "subtotal", "grand total", "sum",
+    "total", "subtotal", "grand total", "sum", "Total",
 )
 
 
@@ -983,8 +1098,9 @@ def _is_summary_row(row_data):
             first_text = str(v).strip()
             break
     if first_text:
+        first_lower = first_text.lower()
         for kw in _SUMMARY_KEYWORDS:
-            if kw in first_text:
+            if kw.lower() in first_lower:
                 return True
 
     # 纯数值行无业务标识（如 M52:N22 区域的总计行）
@@ -999,17 +1115,221 @@ def _is_summary_row(row_data):
 
 
 def _range_overlaps_multicell_merge(min_row, min_col, max_row, max_col, merged_cells):
-    """检查范围是否与跨行合并单元格重叠。"""
+    """检查范围是否完全被跨行合并单元格覆盖。
+
+    只有当范围的所有列都在某个跨行合并区域内时才返回 True。
+    部分重叠（如 B3:C3 中 B 列合并但 C 列不合并）不拒绝。
+    """
     for mr_min, mc_min, mr_max, mc_max in merged_cells:
-        if mr_max > mr_min:  # 跨行合并
-            # 检查矩形重叠
-            if (min_row <= mr_max and max_row >= mr_min and
-                    min_col <= mc_max and max_col >= mc_min):
-                return True
+        if mr_max <= mr_min:
+            continue  # 非跨行合并
+        # 检查行重叠
+        if min_row > mr_max or max_row < mr_min:
+            continue
+        # 检查范围的所有列是否都在合并区域内
+        if min_col >= mc_min and max_col <= mc_max:
+            return True
     return False
 
 
 # ─── 候选锚点构建 ─────────────────────────────────────────────────────────────
+
+_MAX_TEXT_FACT_ANCHOR_COLS = 6  # text_fact 候选最大列数，防止 D23:N23 类宽范围
+
+
+def _detect_header_row_and_data_start(sheet):
+    """从 SheetContext 中识别表头行和业务数据起始行。
+
+    Returns:
+        (header_row_idx, data_start_row, rate_row_idx)
+        header_row_idx: 0-indexed 表头行索引（含最多文本值的行）
+        data_start_row: 1-indexed 业务数据起始行号
+        rate_row_idx: 0-indexed 费率行索引，无则 None
+    """
+    if not sheet.rows or len(sheet.rows) < 2:
+        return 0, 2, None
+
+    # 表头行 = 前两行中含更多独立文本值的行
+    # （Row 1 可能是通用列名如"列A"，Row 2 可能是真正字段名如"功能模块"）
+    # 过滤掉纯占位符（如"列A"、"列1"等单字前缀+数字/字母的模式）
+    _PLACEHOLDER_RE = re.compile(r'^[A-Za-z\u4e00-\u9fff]{1,2}[\dA-Za-z]+$')
+
+    def _meaningful_diversity(row):
+        texts = set()
+        for v in row:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s or _is_numeric_value(v):
+                continue
+            if _PLACEHOLDER_RE.match(s):
+                continue  # 跳过占位符
+            texts.add(s)
+        return len(texts)
+
+    row1_div = _meaningful_diversity(sheet.rows[0])
+    row2_div = _meaningful_diversity(sheet.rows[1]) if len(sheet.rows) >= 2 else 0
+    header_row_idx = 0 if row1_div >= row2_div else 1
+
+    header_row = sheet.rows[header_row_idx]
+    text_col_indices = [
+        c for c, v in enumerate(header_row)
+        if v is not None and str(v).strip() and not _is_numeric_value(v)
+    ]
+
+    if not text_col_indices:
+        return 0, 2, None
+
+    # 检查下一行是否为费率行：
+    # 条件 — 与表头行在文本列上有相同文本值，且有额外数值列
+    rate_row_idx = None
+    next_row_idx = header_row_idx + 1
+    if next_row_idx < len(sheet.rows):
+        row2 = sheet.rows[next_row_idx]
+        same_text_count = sum(
+            1 for c in text_col_indices
+            if c < len(row2) and row2[c] is not None
+            and str(row2[c]).strip() == str(header_row[c]).strip()
+        )
+        numeric_count = sum(
+            1 for c, v in enumerate(row2)
+            if v is not None and _is_numeric_value(v)
+        )
+        # 费率行条件：文本列大部分重复表头 + 有数值列
+        if same_text_count >= len(text_col_indices) * 0.5 and numeric_count >= 2:
+            rate_row_idx = next_row_idx
+            data_start_row = next_row_idx + 2  # 跳过表头 + 费率行
+        else:
+            data_start_row = next_row_idx + 1  # 无费率行，数据从表头下一行开始
+
+    return header_row_idx, data_start_row, rate_row_idx
+
+
+def _build_record_candidates_for_sheet(sheet, header_row_idx, data_start_row):
+    """为单个工作表生成 record_with_schema_context 候选。
+
+    直接扫描业务行，不依赖 block.header_context_range。
+    """
+    candidates = []
+    header_row = sheet.rows[header_row_idx]
+    header_excel_row = header_row_idx + 1
+
+    # 找出表头中的文本列（用于 header_context_range 和列范围）
+    text_col_indices = [
+        c for c, v in enumerate(header_row)
+        if v is not None and str(v).strip() and not _is_numeric_value(v)
+    ]
+    if not text_col_indices:
+        return candidates
+
+    h_min_col = min(text_col_indices) + 1  # 1-indexed
+    h_max_col = max(text_col_indices) + 1
+    header_context_range = f"{_col_letter(h_min_col)}{header_excel_row}:{_col_letter(h_max_col)}{header_excel_row}"
+
+    # 扫描业务行
+    for row_idx in range(data_start_row - 1, len(sheet.rows)):
+        excel_row = row_idx + 1
+        row_data = sheet.rows[row_idx]
+
+        # 跳过空行
+        non_empty = [v for v in row_data if v is not None and str(v).strip()]
+        if not non_empty:
+            continue
+
+        # 跳过汇总行
+        if _is_summary_row(row_data):
+            continue
+
+        # 跳过费率行和重复表头行：
+        # 统计该行在表头文本列中有多少列的值与表头完全相同
+        same_as_header = sum(
+            1 for c in text_col_indices
+            if c < len(row_data) and row_data[c] is not None
+            and str(row_data[c]).strip() == str(header_row[c]).strip()
+        )
+        # 检查是否为费率行：表头文本列中出现数值，且该行有与表头匹配的文本
+        # 费率行特征：部分文本列与表头相同 + 其他文本列有数值（如 1600, 2200）
+        numeric_in_text_cols = sum(
+            1 for c in text_col_indices
+            if c < len(row_data) and row_data[c] is not None
+            and _is_numeric_value(row_data[c])
+        )
+        if same_as_header >= 2 and numeric_in_text_cols >= 2:
+            continue  # 费率行（表头子集 + 文本列中的数值）
+
+        if same_as_header >= len(text_col_indices) * 0.7:
+            continue  # 重复表头行（≥70% 文本列与表头相同）
+
+        # 在表头文本列范围内，找连续文本列分组
+        text_col_groups = []
+        group_start = None
+        for c in range(h_min_col, h_max_col + 1):
+            v = row_data[c - 1] if c - 1 < len(row_data) else None
+            is_text = v is not None and str(v).strip() and not _is_numeric_value(v)
+            if is_text:
+                if group_start is None:
+                    group_start = c
+            else:
+                if group_start is not None:
+                    text_col_groups.append((group_start, c - 1))
+                    group_start = None
+        if group_start is not None:
+            text_col_groups.append((group_start, h_max_col))
+
+        if not text_col_groups:
+            continue  # 无文本列的行（纯数值行）不生成候选
+
+        # 为每个连续文本列分组生成子范围候选
+        sub_ranges = []
+        for g_start, g_end in text_col_groups:
+            sub_ranges.append((g_start, g_end))
+            # 扩展：包含紧随其后的第一个数值列
+            for c in range(g_end + 1, h_max_col + 1):
+                v = row_data[c - 1] if c - 1 < len(row_data) else None
+                if v is not None and _is_numeric_value(v):
+                    sub_ranges.append((g_start, c))
+                    break
+                else:
+                    break
+
+        # 去重并生成候选
+        seen = set()
+        for sr_start, sr_end in sub_ranges:
+            sr_key = (sr_start, sr_end)
+            if sr_key in seen:
+                continue
+            seen.add(sr_key)
+
+            if _range_overlaps_multicell_merge(
+                excel_row, sr_start, excel_row, sr_end, sheet.merged_cells
+            ):
+                continue
+
+            sub_anchor = f"{_col_letter(sr_start)}{excel_row}:{_col_letter(sr_end)}{excel_row}"
+            fact_fields = []
+            focus_parts = []
+            for c in range(sr_start, sr_end + 1):
+                h_val = header_row[c - 1] if c - 1 < len(header_row) else None
+                fname = str(h_val).strip() if h_val else ""
+                if not fname or _is_numeric_value(h_val):
+                    continue
+                fact_fields.append(fname)
+                v = row_data[c - 1] if c - 1 < len(row_data) else None
+                if v is not None and str(v).strip():
+                    focus_parts.append(str(v).strip())
+
+            if fact_fields and focus_parts:
+                candidates.append({
+                    "evidence_mode": "record_with_schema_context",
+                    "sheet_name": sheet.sheet_name,
+                    "anchor_range": sub_anchor,
+                    "header_context_range": header_context_range,
+                    "fact_fields": fact_fields,
+                    "query_focus": " | ".join(focus_parts[:4]),
+                })
+
+    return candidates
+
 
 def _build_candidate_anchors(sheets):
     """为 LLM 构建合法候选证据清单（统一格式）。
@@ -1021,6 +1341,12 @@ def _build_candidate_anchors(sheets):
     candidates = []
 
     for sheet in sheets:
+        # ── 通用 record_with_schema_context：自动检测表头行 ──
+        header_row_idx, data_start_row, _ = _detect_header_row_and_data_start(sheet)
+        record_cands = _build_record_candidates_for_sheet(sheet, header_row_idx, data_start_row)
+        candidates.extend(record_cands)
+
+        # ── 基于块的候选（field_value_pair, text_fact, 及已有 header_context_range 的块） ──
         for block in sheet.table_blocks:
             if block.block_index == 0:
                 continue  # 跳过标准块
@@ -1198,6 +1524,10 @@ def _build_candidate_anchors(sheets):
                     hdr = sheet.rows[0][c - 1] if c - 1 < len(sheet.rows[0]) else None
                     if hdr and str(hdr).strip():
                         header_names.append(str(hdr).strip())
+                # 跳过过宽的范围（防止 D23:N23 类候选）
+                anchor_col_span = max_col - min_col + 1
+                if anchor_col_span > _MAX_TEXT_FACT_ANCHOR_COLS:
+                    continue
                 if len(text_cols) >= 1 and non_empty_count >= 2:
                     candidates.append({
                         "evidence_mode": "text_fact",
@@ -1530,6 +1860,43 @@ def _render_dual_source_reference(anchor_range, header_context_range, sheet_ctx)
 
 # ─── 题目验证与渲染 ───────────────────────────────────────────────────────────
 
+def _build_evidence_schema_display(anchor_range, header_context_range, sheet_ctx):
+    """构建供人阅读的字段=值 显示（不参与 Judge 匹配）。
+
+    示例: "模块=CICD；一级需求=持续优化；需求描述=工具链可用性优化；类型=Improvement"
+    """
+    bounds = _parse_range_str(anchor_range)
+    if bounds is None:
+        return ""
+
+    min_col, min_row, max_col, max_row = bounds
+
+    # 获取表头行
+    if header_context_range:
+        h_bounds = _parse_range_str(header_context_range)
+        if h_bounds:
+            _, h_row, _, _ = h_bounds
+            header_row_data = sheet_ctx.rows[h_row - 1] if h_row - 1 < len(sheet_ctx.rows) else []
+        else:
+            header_row_data = sheet_ctx.rows[0] if sheet_ctx.rows else []
+    else:
+        header_row_data = sheet_ctx.rows[0] if sheet_ctx.rows else []
+
+    # 获取业务行数据
+    data_row = sheet_ctx.rows[min_row - 1] if min_row - 1 < len(sheet_ctx.rows) else []
+
+    pairs = []
+    for c in range(min_col, max_col + 1):
+        h_val = header_row_data[c - 1] if c - 1 < len(header_row_data) else None
+        header_name = str(h_val).strip() if h_val else ""
+        d_val = data_row[c - 1] if c - 1 < len(data_row) else None
+        data_str = str(d_val).strip() if d_val is not None else ""
+        if header_name and data_str:
+            pairs.append(f"{header_name}={data_str}")
+
+    return "；".join(pairs)
+
+
 def _validate_and_render_question(raw_q, sheets_by_name, file_name):
     """验证 LLM 返回的单条题目，渲染金标准证据。
 
@@ -1618,6 +1985,11 @@ def _validate_and_render_question(raw_q, sheets_by_name, file_name):
     if header_context_range:
         validated["header_context_range"] = header_context_range
 
+    # 添加供人阅读的 evidence_schema_display
+    validated["evidence_schema_display"] = _build_evidence_schema_display(
+        anchor_range, header_context_range, sheet,
+    )
+
     return validated, ""
 
 
@@ -1636,7 +2008,11 @@ def _detect_format(file_name):
 # ─── LLM 调用 ─────────────────────────────────────────────────────────────────
 
 def _call_llm_text(prompt, api_key, base_url, model, timeout=120):
-    """标准 OpenAI 兼容 chat completion 请求（纯文本，无文件附件）。"""
+    """标准 OpenAI 兼容 chat completion 请求（纯文本，无文件附件）。
+
+    Args:
+        timeout: 超时秒数，或 (connect_timeout, read_timeout) 元组。
+    """
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1698,8 +2074,35 @@ def _categorize_rejection(reason):
 
 
 def _validate_single_question(q, sheets_by_name, file_name,
-                               semantic_field_names, semantic_anchors):
+                               semantic_field_names, semantic_anchors,
+                               candidate_anchors=None):
     """验证单条题目，返回 (validated_dict_or_None, rejection_category, reason)。"""
+    # 候选集合校验：anchor 必须匹配某个候选或为其子范围
+    if candidate_anchors is not None:
+        q_anchor = (q.get("anchor_range") or "").strip()
+        q_sheet = (q.get("sheet_name") or "").strip()
+        if q_anchor and q_sheet:
+            ab = _parse_range_str(q_anchor)
+            matched = False
+            for cand in candidate_anchors:
+                if cand["sheet_name"] != q_sheet:
+                    continue
+                if cand["anchor_range"] == q_anchor:
+                    matched = True
+                    break
+                cb = _parse_range_str(cand["anchor_range"])
+                if ab and cb:
+                    a_mc, a_mr, a_xc, a_xr = ab
+                    c_mc, c_mr, c_xc, c_xr = cb
+                    if (a_mc >= c_mc and a_xc <= c_xc and
+                            a_mr >= c_mr and a_xr <= c_xr):
+                        matched = True
+                        break
+            if not matched:
+                return None, "candidate_mismatch", (
+                    f"anchor '{q_anchor}' 不在合法候选集合中"
+                )
+
     validated, reason = _validate_and_render_question(q, sheets_by_name, file_name)
     if not validated:
         return None, _categorize_rejection(reason), reason
@@ -1712,6 +2115,1039 @@ def _validate_single_question(q, sheets_by_name, file_name,
 
     validated["question_mode"] = MODE_RETRIEVAL
     return validated, None, None
+
+
+# ─── Phase 1: Schema 分析 ────────────────────────────────────────────────────
+
+def _build_schema_analysis_context(sheets):
+    """构建紧凑的结构摘要供 schema 分析 LLM 调用。
+
+    不发送原始二进制文件，只发送：表名、尺寸、合并单元格、表头候选行、
+    抽样业务行、列名（带列号）、数值模式、总计/小计候选、公式警告。
+    """
+    parts = []
+    for sheet in sheets:
+        section = []
+        section.append(f"=== Sheet: {sheet.sheet_name} ({sheet.max_row} rows x {sheet.max_col} cols) ===")
+
+        # 合并单元格
+        if sheet.merged_cells:
+            merge_descs = []
+            for mr, mc, mxr, mxc in sheet.merged_cells:
+                tl = sheet.rows[mr - 1][mc - 1] if mr - 1 < len(sheet.rows) and mc - 1 < len(sheet.rows[mr - 1]) else None
+                val = str(tl).strip()[:30] if tl else ""
+                merge_descs.append(f"{_col_letter(mc)}{mr}:{_col_letter(mxc)}{mxr}" + (f" ({val})" if val else ""))
+            section.append(f"Merged cells: {', '.join(merge_descs)}")
+
+        # 检测表头行和数据起始行
+        header_idx, data_start, rate_idx = _detect_header_row_and_data_start(sheet)
+        section.append(f"Detected header_row={header_idx + 1}, data_start_row={data_start}")
+
+        # 表头行（带列号标注）
+        header_row = sheet.rows[header_idx] if header_idx < len(sheet.rows) else []
+        col_labels = []
+        for c in range(sheet.max_col):
+            v = header_row[c] if c < len(header_row) else None
+            label = str(v).strip()[:30] if v else ""
+            col_labels.append(f"{_col_letter(c + 1)}={label}" if label else f"{_col_letter(c + 1)}=(empty)")
+        section.append(f"Columns ({sheet.max_col}): {', '.join(col_labels)}")
+
+        # 第 2 行（可能是费率行/副表头）
+        if len(sheet.rows) > 1:
+            row2 = sheet.rows[1]
+            cells2 = []
+            for c in range(sheet.max_col):
+                v = row2[c] if c < len(row2) else None
+                s = str(v).strip()[:25] if v is not None else ""
+                cells2.append(s)
+            section.append(f"Row 2 (possible rate/header): {' | '.join(cells2)}")
+
+        # 抽样业务行（前 5 行数据，带行号）
+        sample_count = 0
+        for r in range(data_start - 1, min(len(sheet.rows), data_start + 30)):
+            if sample_count >= 5:
+                break
+            row_data = sheet.rows[r]
+            if _is_summary_row(row_data):
+                section.append(f"Row {r + 1}: [SUMMARY ROW - exclude]")
+                continue
+            non_empty = sum(1 for v in row_data if v is not None and str(v).strip())
+            if non_empty == 0:
+                continue
+            cells = []
+            for c in range(sheet.max_col):
+                v = row_data[c] if c < len(row_data) else None
+                s = str(v).strip()[:25] if v is not None else ""
+                cells.append(s)
+            section.append(f"Row {r + 1}: {' | '.join(cells)}")
+            sample_count += 1
+
+        # 检测汇总行
+        summary_rows = []
+        for r in range(len(sheet.rows)):
+            if _is_summary_row(sheet.rows[r]):
+                summary_rows.append(r + 1)
+        if summary_rows:
+            section.append(f"Summary rows (MUST exclude): {summary_rows}")
+
+        # 公式警告
+        if sheet.formula_cells_without_cache:
+            section.append(f"Formula warnings: {len(sheet.formula_cells_without_cache)} cells without cached values")
+
+        # 数值模式统计（前 data_start+30 行内）
+        numeric_cols = set()
+        for r in range(data_start - 1, min(len(sheet.rows), data_start + 30)):
+            for c in range(sheet.max_col):
+                v = sheet.rows[r][c] if c < len(sheet.rows[r]) else None
+                if v is not None and _is_numeric_value(v):
+                    numeric_cols.add(c)
+        if numeric_cols:
+            num_labels = [_col_letter(c + 1) for c in sorted(numeric_cols)]
+            section.append(f"Columns with numeric values: {', '.join(num_labels)}")
+
+        parts.append("\n".join(section))
+
+    return "\n\n".join(parts)
+
+
+def _parse_schema_analysis_response(text):
+    """解析 LLM 返回的 schema 分析 JSON。
+
+    处理 markdown 代码块、部分 JSON 等。返回 dict。
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        json_lines = []
+        in_block = False
+        for line in lines:
+            if line.strip().startswith("```") and not in_block:
+                in_block = True
+                continue
+            elif line.strip() == "```" and in_block:
+                break
+            elif in_block:
+                json_lines.append(line)
+        text = "\n".join(json_lines).strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # 尝试提取第一个 { 到最后一个 }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                raise ValueError("无法解析 schema 分析 LLM 返回的 JSON")
+        else:
+            raise ValueError("schema 分析 LLM 返回中未找到 JSON")
+
+    # 验证和默认值
+    if "fields" not in data or not isinstance(data["fields"], list):
+        raise ValueError("schema 分析结果缺少 fields 数组")
+
+    for f in data["fields"]:
+        if "source_label" not in f or "col_index" not in f:
+            raise ValueError(f"field 缺少 source_label 或 col_index: {f}")
+        f.setdefault("inferred_role", "categorical")
+        f.setdefault("confidence", 0.5)
+        # 数值字段和分类字段默认 needs_confirmation=true
+        if f["inferred_role"] in ("metric", "cost", "categorical"):
+            f.setdefault("needs_confirmation", True)
+        else:
+            f.setdefault("needs_confirmation", False)
+
+    data.setdefault("table_purpose", "")
+    data.setdefault("header_row", 1)
+    data.setdefault("data_start_row", 2)
+    data.setdefault("excluded_rows", [])
+    data.setdefault("reasoning", "")
+
+    return data
+
+
+def analyze_table_schema(sheets, api_key, base_url, model, timeout=60,
+                         file_bytes=None, force_reanalyze=False,
+                         allow_test_model=False):
+    """Phase 1: 通过 LLM 分析表格结构。
+
+    Args:
+        sheets: SheetContext 列表
+        api_key, base_url, model: LLM 配置
+        timeout: LLM 超时秒数
+        file_bytes: 文件原始字节（用于缓存）
+        force_reanalyze: 强制重新分析（忽略缓存）
+        allow_test_model: 允许测试模型名（仅测试使用，不写入生产缓存）
+
+    Returns:
+        dict: schema 分析结果，含 table_purpose, fields, excluded_rows, safe_question_fields 等
+    """
+    # 缓存检查
+    if file_bytes:
+        file_hash = _file_content_hash(file_bytes)
+        if force_reanalyze:
+            _delete_schema_cache(file_hash)
+        else:
+            cached = _load_schema_cache(file_hash, expected_model=model,
+                                         allow_test_model=allow_test_model)
+            if cached is not None:
+                print(f"  [CACHE] Schema 缓存命中: {file_hash[:12]}... (model={cached.get('analysis_model')})")
+                return cached
+
+    # 拒绝 fake 模型进入生产分析（除非测试显式允许）
+    if _is_fake_model(model) and not allow_test_model:
+        raise ValueError(f"拒绝使用测试模型 '{model}' 进行 schema 分析")
+
+    # 构建结构摘要
+    context_text = _build_schema_analysis_context(sheets)
+
+    # 加载 prompt 模板
+    template = _SCHEMA_ANALYSIS_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    prompt = template.replace("{structure_summary}", context_text)
+
+    # Phase 1 专用超时：连接 15s，读取 180s（结构分析 prompt 较长）
+    _phase1_timeout = (15, 180)
+    _max_attempts = 2
+
+    import time as _time
+
+    print(f"  [Schema] 分析: prompt={len(prompt)} chars, timeout=({_phase1_timeout[0]}s connect, {_phase1_timeout[1]}s read)")
+
+    # LLM 调用（带重试）
+    response_text = None
+    _total_t0 = _time.time()
+    _attempt_durations = []
+    for _attempt in range(1, _max_attempts + 1):
+        _t0 = _time.time()
+        try:
+            response_text = _call_llm_text(prompt, api_key, base_url, model, timeout=_phase1_timeout)
+            _t1 = _time.time()
+            _attempt_durations.append(round(_t1 - _t0, 1))
+            print(f"  [Schema] 第 {_attempt} 次请求成功: 耗时={_t1 - _t0:.1f}s")
+            break
+        except (RuntimeError, TimeoutError) as e:
+            _t1 = _time.time()
+            _attempt_durations.append(round(_t1 - _t0, 1))
+            _err_str = str(e)
+            _is_retryable = "超时" in _err_str or "连接" in _err_str or "timeout" in _err_str.lower()
+            if _attempt < _max_attempts and _is_retryable:
+                print(f"  [Schema] 第 {_attempt} 次请求失败: {_err_str}，正在重试（{_attempt + 1}/{_max_attempts}）")
+                continue
+            else:
+                raise
+
+    _total_t1 = _time.time()
+    _total_duration = round(_total_t1 - _total_t0, 1)
+    print(f"  [Schema] 分析完成: 尝试={len(_attempt_durations)} 次, 总耗时={_total_duration}s")
+
+    # 解析响应
+    schema_data = _parse_schema_analysis_response(response_text)
+
+    # ── 本地严格校验 LLM 返回 ──
+    sheet = sheets[0] if sheets else None
+    if sheet is None:
+        raise ValueError("无工作表数据")
+
+    # 校验字段：col_index 和 source_label 必须在真实表头中存在
+    valid_fields = []
+    actual_headers = {}
+    if sheet.rows:
+        for c in range(sheet.max_col):
+            v = sheet.rows[0][c] if c < len(sheet.rows[0]) else None
+            if v is not None and str(v).strip():
+                actual_headers[c + 1] = str(v).strip()  # 1-indexed
+
+    for f in schema_data["fields"]:
+        col_idx = f.get("col_index", 0)
+        label = f.get("source_label", "")
+        # 校验列号在范围内
+        if col_idx < 1 or col_idx > sheet.max_col:
+            print(f"  [WARN] 丢弃非法字段: col_index={col_idx} 超出范围 (1-{sheet.max_col})")
+            continue
+        # 校验列号对应的表头与 source_label 匹配（允许部分匹配）
+        actual = actual_headers.get(col_idx, "")
+        if actual and label and actual != label:
+            # 降级为 categorical
+            if f.get("inferred_role") in ("context", "record_identifier"):
+                print(f"  [WARN] 字段 '{label}' 在列 {col_idx} 实际为 '{actual}'，降为 categorical")
+                f["inferred_role"] = "ambiguous"
+                f["confidence"] = min(f.get("confidence", 0.5), 0.5)
+        valid_fields.append(f)
+
+    if not valid_fields:
+        raise ValueError("Phase 1 未返回任何有效字段")
+
+    schema_data["fields"] = valid_fields
+
+    # 校验 excluded_rows
+    valid_excluded = []
+    for r in schema_data.get("excluded_rows", []):
+        if isinstance(r, int) and 1 <= r <= sheet.max_row:
+            valid_excluded.append(r)
+    schema_data["excluded_rows"] = valid_excluded
+
+    # 按角色分组字段（新角色体系）
+    role_groups = {"record_identifier": [], "context": [], "metric": [], "cost": [], "categorical": [], "excluded": []}
+    for f in schema_data["fields"]:
+        role = f.get("inferred_role", "categorical")
+        # 兼容旧角色名映射
+        if role == "group":
+            role = "context"
+        elif role == "record":
+            role = "record_identifier"
+        elif role == "ambiguous":
+            role = "categorical"
+        if role not in role_groups:
+            role = "categorical"
+        role_groups[role].append(f)
+
+    schema_data["record_identifier_fields"] = role_groups["record_identifier"]
+    schema_data["context_fields"] = role_groups["context"]
+    schema_data["metric_fields"] = role_groups["metric"]
+    schema_data["cost_fields"] = role_groups["cost"]
+    schema_data["categorical_fields"] = role_groups["categorical"]
+    schema_data["excluded_fields"] = role_groups["excluded"]
+
+    # 兼容旧接口
+    schema_data["group_fields"] = role_groups["context"]
+    schema_data["record_fields"] = role_groups["record_identifier"]
+    schema_data["ambiguous_fields"] = role_groups["categorical"]
+
+    # 计算 record_locator_fields 和 question_target_fields
+    record_locators = [f["source_label"] for f in role_groups["record_identifier"]]
+    question_targets = [f["source_label"] for f in role_groups["metric"] + role_groups["cost"] + role_groups["categorical"]]
+    # 如果没有 record_identifier 字段，用 context 字段兜底
+    if not record_locators:
+        record_locators = [f["source_label"] for f in role_groups["context"]]
+    # 如果没有目标字段，把 record 中非主标识的字段也作为目标
+    if not question_targets and len(record_locators) > 1:
+        question_targets = record_locators[1:]
+
+    schema_data["record_locator_fields"] = record_locators
+    schema_data["question_target_fields"] = question_targets
+
+    # 兼容旧接口
+    schema_data["safe_question_fields"] = record_locators + question_targets
+
+    # 提取或生成 question_plan（新结构）
+    qp = schema_data.get("question_plan", {})
+    if not qp.get("target_field_priority"):
+        # LLM 未返回新结构的 question_plan，自动生成
+        target_field_priority = []
+        target_field_quotas = {}
+        patterns = set()
+        priority = 1
+
+        for f in role_groups["metric"]:
+            target_field_priority.append({
+                "field": f["source_label"],
+                "role": "metric",
+                "priority": priority,
+                "reason": "数值度量字段",
+            })
+            patterns.add("record + metric")
+            priority += 1
+
+        for f in role_groups["cost"]:
+            target_field_priority.append({
+                "field": f["source_label"],
+                "role": "cost",
+                "priority": priority,
+                "reason": "费用/金额字段",
+            })
+            patterns.add("record + cost")
+            priority += 1
+
+        for f in role_groups["categorical"]:
+            target_field_priority.append({
+                "field": f["source_label"],
+                "role": "categorical",
+                "priority": priority,
+                "reason": "分类/状态字段",
+            })
+            patterns.add("record + categorical")
+            priority += 1
+
+        # 均分目标题数到各字段
+        if target_field_priority:
+            per_field = max(1, 5 // len(target_field_priority))
+            for tfp in target_field_priority:
+                target_field_quotas[tfp["field"]] = per_field
+
+        qp = {
+            "recommended_question_patterns": sorted(patterns),
+            "target_field_priority": target_field_priority,
+            "target_field_quotas": target_field_quotas,
+            "forbidden_patterns": [
+                "aggregation (sum, count, average, total across rows)",
+                "cross-row comparison (higher than, lower than, difference between)",
+                "totals (using summary/total rows as data)",
+                "null values (questions about empty cells)",
+                "formula without cached value",
+                "isolated numeric (numeric without field label context)",
+            ],
+            "rationale": (
+                f"表格含 {len(record_locators)} 个记录标识字段、"
+                f"{len(role_groups['metric'])} 个数值字段、"
+                f"{len(role_groups['cost'])} 个费用字段、"
+                f"{len(role_groups['categorical'])} 个分类字段，"
+                f"适合生成单记录检索查询"
+            ),
+        }
+    schema_data["question_plan"] = qp
+
+    # 元数据
+    schema_data["sheet_name"] = sheets[0].sheet_name if sheets else ""
+    schema_data["analysis_model"] = model
+    schema_data["analysis_timestamp"] = datetime.now().isoformat()
+    schema_data["schema_source"] = "test_mock" if _is_fake_model(model) else "llm"
+    schema_data["llm_call_duration_sec"] = _total_duration
+    schema_data["llm_call_attempts"] = len(_attempt_durations)
+    schema_data["llm_attempt_durations"] = _attempt_durations
+
+    print(f"  [OK] Phase 1 校验通过: {len(valid_fields)} 字段, "
+          f"记录定位={len(record_locators)}, 目标字段={len(question_targets)}, "
+          f"推荐题型={len(qp.get('recommended_question_patterns', []))} 种")
+
+    # 缓存保存
+    if file_bytes:
+        _save_schema_cache(_file_content_hash(file_bytes), schema_data)
+
+    return schema_data
+
+
+def _slugify_field(name):
+    """将字段名转为安全的 slug（用于 candidate_id）。"""
+    return re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', '_', str(name)).strip('_').lower()
+
+
+def _build_candidate_anchors_from_schema(sheets, confirmed_schema):
+    """基于 schema 的 question_plan 构建候选目录（candidate catalog）。
+
+    每个候选 = 一条业务记录 + 一个目标字段。
+    输出新格式：含 candidate_id, record_locator, target_field, allowed_evidence_fields。
+    """
+    candidates = []
+    excluded_rows = set(confirmed_schema.get("excluded_rows", []))
+    qp = confirmed_schema.get("question_plan", {})
+    target_priority = qp.get("target_field_priority", [])
+    record_fields = confirmed_schema.get("record_locator_fields", [])
+    context_fields = confirmed_schema.get("context_fields", [])
+
+    if not record_fields or not target_priority:
+        return candidates
+
+    # 确保 context_fields 是字符串列表（兼容字段对象列表）
+    if context_fields and isinstance(context_fields[0], dict):
+        context_fields = [f.get("source_label", "") for f in context_fields]
+    context_fields = [f for f in context_fields if f]
+
+    # 构建 target_field role 映射
+    target_role_map = {}
+    for tfp in target_priority:
+        target_role_map[tfp.get("field", "")] = tfp.get("role", "metric")
+
+    for sheet in sheets:
+        header_row = sheet.rows[0] if sheet.rows else []
+
+        # 构建字段名→列索引映射
+        field_to_col = {}
+        for c, h in enumerate(header_row):
+            if h is not None and str(h).strip():
+                field_to_col[str(h).strip()] = c  # 0-indexed
+
+        # record 字段列索引
+        record_col_indices = []
+        for fname in record_fields:
+            if fname in field_to_col:
+                record_col_indices.append(field_to_col[fname])
+        if not record_col_indices:
+            continue
+
+        # context 字段列索引
+        context_col_indices = {}
+        for fname in context_fields:
+            if fname in field_to_col:
+                context_col_indices[fname] = field_to_col[fname]
+
+        # 检测表头行和数据起始行
+        _, data_start, _ = _detect_header_row_and_data_start(sheet)
+
+        # 扫描业务行
+        for row_idx in range(data_start - 1, len(sheet.rows)):
+            excel_row = row_idx + 1
+            if excel_row in excluded_rows:
+                continue
+            row_data = sheet.rows[row_idx]
+            if not any(v is not None and str(v).strip() for v in row_data):
+                continue
+            if _is_summary_row(row_data):
+                continue
+
+            # 构建 record_locator（记录标识字段的实际值）
+            record_locator = {}
+            for fname in record_fields:
+                if fname in field_to_col:
+                    c = field_to_col[fname]
+                    v = row_data[c] if c < len(row_data) else None
+                    if v is not None and str(v).strip():
+                        record_locator[fname] = str(v).strip()
+
+            if not record_locator:
+                continue
+
+            # 构建 available_context_fields
+            available_context = {}
+            for fname, c in context_col_indices.items():
+                v = row_data[c] if c < len(row_data) else None
+                if v is not None and str(v).strip():
+                    available_context[fname] = str(v).strip()
+
+            # 为每个 target_field 生成一个候选
+            for tfp in target_priority:
+                target_field = tfp.get("field", "")
+                target_role = tfp.get("role", "metric")
+                if target_field not in field_to_col:
+                    continue
+                target_col = field_to_col[target_field]  # 0-indexed
+
+                # 读取目标字段的实际值
+                target_val = row_data[target_col] if target_col < len(row_data) else None
+                if target_val is None or not str(target_val).strip():
+                    continue
+                if str(target_val).strip() == "[公式未计算]":
+                    continue
+
+                # anchor 覆盖范围 = record列 到 target列（连续）
+                all_cols = sorted(set(record_col_indices + [target_col]))
+                anchor_start = min(all_cols) + 1  # 1-indexed
+                anchor_end = max(all_cols) + 1
+
+                # 跳过合并单元格
+                if _range_overlaps_multicell_merge(excel_row, anchor_start, excel_row, anchor_end, sheet.merged_cells):
+                    continue
+
+                # 跳过孤立数值（anchor 只覆盖数值列）
+                anchor_has_text = False
+                for c in range(anchor_start - 1, anchor_end):
+                    v = row_data[c] if c < len(row_data) else None
+                    if v is not None and str(v).strip() and not _is_numeric_value(v):
+                        anchor_has_text = True
+                        break
+                if not anchor_has_text:
+                    continue
+
+                anchor_range = f"{_col_letter(anchor_start)}{excel_row}:{_col_letter(anchor_end)}{excel_row}"
+
+                # 构建 header_context_range
+                h_start = min(all_cols) + 1
+                h_end = max(all_cols) + 1
+                header_context_range = f"{_col_letter(h_start)}1:{_col_letter(h_end)}1"
+
+                # 构建 allowed_evidence_fields
+                allowed_fields = list(record_locator.keys()) + [target_field]
+
+                # 生成 candidate_id
+                sheet_slug = _slugify_field(sheet.sheet_name)
+                field_slug = _slugify_field(target_field)
+                candidate_id = f"{sheet_slug}_row_{excel_row}_{field_slug}"
+
+                candidates.append({
+                    "candidate_id": candidate_id,
+                    "evidence_mode": "record_with_schema_context",
+                    "sheet_name": sheet.sheet_name,
+                    "anchor_range": anchor_range,
+                    "header_context_range": header_context_range,
+                    "record_locator": record_locator,
+                    "target_field": {
+                        "label": target_field,
+                        "role": target_role,
+                        "value": target_val,
+                    },
+                    "available_context_fields": available_context,
+                    "allowed_evidence_fields": allowed_fields,
+                })
+
+    return candidates
+
+
+def _build_phase2_prompt(sheets, confirmed_schema, num_questions, topic_hint, candidate_anchors):
+    """构建 Phase 2 prompt：注入 schema、question_plan、候选目录（candidate catalog）。"""
+    template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
+
+    topic_hint_section = ""
+    if topic_hint:
+        topic_hint_section = f"- 主题方向：{topic_hint}"
+
+    # 提取 schema 信息
+    qp = confirmed_schema.get("question_plan", {})
+    record_fields = confirmed_schema.get("record_locator_fields", [])
+    target_fields = confirmed_schema.get("question_target_fields", [])
+    excluded_rows = confirmed_schema.get("excluded_rows", [])
+    context_fields = confirmed_schema.get("context_fields", [])
+
+    # 确保 context_fields 是字符串列表（兼容字段对象列表）
+    if context_fields and isinstance(context_fields[0], dict):
+        context_fields = [f.get("source_label", "") for f in context_fields]
+    context_fields = [f for f in context_fields if f]
+
+    # 构建 schema + question_plan 摘要
+    schema_section = "## Schema 与出题计划\n\n"
+    schema_section += f"- **记录定位字段**: {', '.join(record_fields)}\n"
+    schema_section += f"- **上下文字段**: {', '.join(context_fields)}\n"
+    schema_section += f"- **可出题目标字段**: {', '.join(target_fields)}\n"
+    if excluded_rows:
+        schema_section += f"- **已排除行**: {', '.join(str(r) for r in excluded_rows)}\n"
+
+    # 注入 question_plan（新结构）
+    if qp:
+        patterns = qp.get("recommended_question_patterns", [])
+        if patterns:
+            schema_section += f"\n**推荐题型**: {', '.join(patterns)}\n"
+
+        priority_list = qp.get("target_field_priority", [])
+        if priority_list:
+            schema_section += "\n### 目标字段优先级\n\n"
+            schema_section += "| 字段 | 角色 | 优先级 | 理由 |\n|---|---|---|---|\n"
+            for tfp in priority_list:
+                schema_section += (
+                    f"| {tfp.get('field', '')} | {tfp.get('role', '')} | "
+                    f"{tfp.get('priority', '')} | {tfp.get('reason', '')} |\n"
+                )
+
+        quotas = qp.get("target_field_quotas", {})
+        if quotas:
+            schema_section += "\n**建议题数分配**:\n"
+            for field_name, count in quotas.items():
+                schema_section += f"- {field_name}: {count} 题\n"
+
+        forbidden = qp.get("forbidden_patterns", [])
+        if forbidden:
+            schema_section += "\n**禁止题型**:\n"
+            for fb in forbidden:
+                schema_section += f"- {fb}\n"
+
+        rationale = qp.get("rationale", "")
+        if rationale:
+            schema_section += f"\n**分析理由**: {rationale}\n"
+
+    schema_section += (
+        "\n**核心约束**: 每题 = 一条业务记录的 record_locator + 一个 target_field 值。"
+        "你只能从候选目录中选择 candidate_id，不得自造 anchor_range、字段或数值。"
+        "reference_answer 由本地渲染，你不输出。\n"
+    )
+
+    # 收集所有涉及列（用于渲染表格）
+    all_fields = set(record_fields + context_fields + target_fields)
+
+    # 渲染表格块（只包含涉及字段列）
+    block_texts = []
+    for sheet in sheets:
+        header_row = sheet.rows[0] if sheet.rows else []
+        col_indices = []
+        for c, h in enumerate(header_row):
+            if h is not None and str(h).strip() in all_fields:
+                col_indices.append(c)
+        if not col_indices:
+            continue
+
+        lines = []
+        header_cells = [str(header_row[c]).strip() if c < len(header_row) and header_row[c] else "" for c in col_indices]
+        lines.append("| 行号 | " + " | ".join(header_cells) + " |")
+        lines.append("|---:|" + "|".join(["---"] * len(header_cells)) + "|")
+
+        for r in range(len(sheet.rows)):
+            excel_row = r + 1
+            if excel_row in excluded_rows:
+                continue
+            if _is_summary_row(sheet.rows[r]):
+                continue
+            row_data = sheet.rows[r]
+            cells = []
+            for c in col_indices:
+                v = row_data[c] if c < len(row_data) else None
+                cells.append(str(v).strip() if v is not None else "")
+            if all(not c for c in cells):
+                continue
+            lines.append(f"| {excel_row} | " + " | ".join(cells) + " |")
+
+        block_text = f"### 工作表: {sheet.sheet_name}\n\n" + "\n".join(lines)
+        block_texts.append(block_text)
+
+    table_blocks_text = "\n\n---\n\n".join(block_texts)
+
+    # 构建候选目录（candidate catalog）
+    candidate_text = ""
+    if candidate_anchors:
+        # 按 target_field.role 分组
+        role_groups = {}
+        for a in candidate_anchors:
+            role = a.get("target_field", {}).get("role", "metric")
+            if role not in role_groups:
+                role_groups[role] = []
+            role_groups[role].append(a)
+
+        _ROLE_LABELS = {
+            "metric": "数值度量题候选",
+            "cost": "费用/金额题候选",
+            "categorical": "分类/状态题候选",
+        }
+
+        parts = []
+        for role in ("metric", "cost", "categorical"):
+            items = role_groups.get(role, [])
+            if not items:
+                continue
+            label = _ROLE_LABELS.get(role, role)
+            lines = [f"**{label}**（{len(items)} 个候选）："]
+            for a in items[:20]:
+                rl = a.get("record_locator", {})
+                rl_str = ", ".join(f"{k}={v}" for k, v in list(rl.items())[:2])
+                tf = a.get("target_field", {})
+                item_parts = [
+                    f"**candidate_id**: `{a['candidate_id']}`",
+                    f"**record_locator**: {{{rl_str}}}",
+                    f"**target_field**: {tf.get('label', '')}（{tf.get('role', '')}）= {tf.get('value', '')}",
+                ]
+                line = "- " + " | ".join(item_parts)
+                lines.append(line)
+            parts.append("\n".join(lines))
+
+        if parts:
+            candidate_text = "\n\n---\n\n## 合法候选目录（candidate catalog）\n\n" + "\n\n".join(parts)
+
+    prompt = template.replace("{table_blocks_text}", table_blocks_text)
+    prompt = prompt.replace("{num_questions}", str(num_questions))
+    prompt = prompt.replace("{topic_hint_section}", topic_hint_section)
+    prompt = prompt.replace("{candidate_anchors_section}", candidate_text)
+    prompt = schema_section + "\n---\n\n" + prompt
+    return prompt
+
+
+# ─── Phase 2 新验证与渲染 ─────────────────────────────────────────────────────
+
+def _render_phase2_reference_answer(candidate, sheet_ctx):
+    """从候选目录项本地渲染 reference_answer。
+
+    只渲染 allowed_evidence_fields 中的字段为键值对。
+    格式：需求描述：工具链可用性优化；QTY. in total：17
+
+    MUST NOT 使用 LLM 输出的任何值。只读取 sheet_ctx.rows。
+    """
+    anchor_range = candidate.get("anchor_range", "")
+    header_context_range = candidate.get("header_context_range", "")
+    allowed_fields = set(candidate.get("allowed_evidence_fields", []))
+
+    if not anchor_range:
+        return "", True
+
+    # 解析 anchor range
+    bounds = _parse_range_str(anchor_range)
+    if bounds is None:
+        return "", True
+    b_min_col, b_min_row, b_max_col, b_max_row = bounds
+
+    # 获取表头行（从 header_context_range 或 row 1）
+    if header_context_range:
+        h_bounds = _parse_range_str(header_context_range)
+        if h_bounds:
+            _, h_row, _, _ = h_bounds
+            header_row_data = sheet_ctx.rows[h_row - 1] if h_row - 1 < len(sheet_ctx.rows) else []
+        else:
+            header_row_data = sheet_ctx.rows[0] if sheet_ctx.rows else []
+    else:
+        header_row_data = sheet_ctx.rows[0] if sheet_ctx.rows else []
+
+    # 获取业务行数据
+    data_row = sheet_ctx.rows[b_min_row - 1] if b_min_row - 1 < len(sheet_ctx.rows) else []
+
+    has_formula_issue = False
+    parts = []
+
+    for c in range(b_min_col, b_max_col + 1):
+        # 读取表头字段名
+        h_val = header_row_data[c - 1] if c - 1 < len(header_row_data) else None
+        field_name = str(h_val).strip() if h_val else ""
+
+        # 只渲染 allowed_evidence_fields 中的字段
+        if field_name not in allowed_fields:
+            continue
+
+        # 读取业务行值
+        val = data_row[c - 1] if c - 1 < len(data_row) else None
+        if (b_min_row, c) in sheet_ctx.formula_cells_without_cache:
+            has_formula_issue = True
+            continue
+        if isinstance(val, str) and val == "[公式未计算]":
+            has_formula_issue = True
+            continue
+        if val is None or not str(val).strip():
+            continue
+
+        parts.append(f"{field_name}：{str(val).strip()}")
+
+    if not parts:
+        return "", has_formula_issue
+
+    return "；".join(parts), has_formula_issue
+
+
+def _validate_phase2_question(q, candidate_catalog, sheets_by_name):
+    """验证 Phase 2 LLM 输出，按 candidate_id 查找并本地渲染 reference_answer。
+
+    Returns (validated_dict_or_None, rejection_category, reason).
+    """
+    candidate_id = (q.get("candidate_id") or "").strip()
+    target_field_label = (q.get("target_field_label") or "").strip()
+    question_text = (q.get("question") or "").strip()
+
+    if not candidate_id:
+        return None, "missing_field", "candidate_id 为空"
+    if not target_field_label:
+        return None, "missing_field", "target_field_label 为空"
+    if not question_text:
+        return None, "missing_field", "question 为空"
+
+    # 查找 candidate_id
+    candidate = None
+    for c in candidate_catalog:
+        if c["candidate_id"] == candidate_id:
+            candidate = c
+            break
+    if candidate is None:
+        return None, "candidate_mismatch", f"candidate_id '{candidate_id}' 不在候选目录中"
+
+    # 校验 target_field_label
+    expected_label = candidate.get("target_field", {}).get("label", "")
+    if target_field_label != expected_label:
+        return None, "field_mismatch", (
+            f"target_field_label '{target_field_label}' 与候选目录不匹配，"
+            f"期望 '{expected_label}'"
+        )
+
+    # 查找工作表
+    sheet_name = candidate.get("sheet_name", "")
+    sheet = sheets_by_name.get(sheet_name)
+    if sheet is None:
+        return None, "sheet_missing", f"工作表 '{sheet_name}' 不存在"
+
+    # 本地渲染 reference_answer
+    rendered, has_formula_issue = _render_phase2_reference_answer(candidate, sheet)
+    if not rendered:
+        return None, "empty_evidence", "证据范围为空"
+    if has_formula_issue:
+        return None, "formula", "证据范围包含公式单元格（无缓存计算值）"
+
+    # 汇总行保护
+    anchor_range = candidate.get("anchor_range", "")
+    bounds = _parse_range_str(anchor_range)
+    if bounds:
+        _, b_min_row, _, _ = bounds
+        data_row = sheet.rows[b_min_row - 1] if b_min_row - 1 < len(sheet.rows) else []
+        if _is_summary_row(data_row):
+            return None, "summary_row", "候选指向汇总行"
+
+    # 组装验证后的题目
+    validated = {
+        "question": question_text,
+        "reference_answer": rendered,
+        "source_excerpt": rendered,
+        "candidate_id": candidate_id,
+        "target_field_label": target_field_label,
+        "sheet_name": sheet_name,
+        "anchor_range": anchor_range,
+        "evidence_sheet": sheet_name,
+        "evidence_range": anchor_range,
+        "source_format": _detect_format(""),
+        "difficulty": q.get("difficulty", "事实"),
+        "topic": q.get("topic", ""),
+        "record_locator": candidate.get("record_locator", {}),
+        "question_mode": MODE_RETRIEVAL,
+    }
+
+    # 添加 evidence_schema_display
+    hcr = candidate.get("header_context_range")
+    if hcr:
+        validated["header_context_range"] = hcr
+    validated["evidence_schema_display"] = _build_evidence_schema_display(
+        anchor_range, hcr, sheet,
+    )
+
+    return validated, None, None
+
+
+def _dedup_by_record_and_field(questions):
+    """按 (record_locator, target_field_label) 去重。"""
+    seen = set()
+    unique = []
+    for q in questions:
+        rl = q.get("record_locator", {})
+        key = (json.dumps(rl, sort_keys=True, ensure_ascii=False),
+               q.get("target_field_label", ""))
+        if key not in seen:
+            seen.add(key)
+            unique.append(q)
+    return unique
+
+
+def generate_questions_from_schema(sheets, confirmed_schema, api_key, base_url, model,
+                                   num_questions=5, difficulty="混合", topic_hint="",
+                                   timeout=120, progress_callback=None, mode="retrieval",
+                                   file_name=""):
+    """Phase 2: 基于确认的 schema 生成检索题。
+
+    使用候选目录（candidate catalog），LLM 通过 candidate_id 选择题目。
+    reference_answer 完全本地渲染。
+
+    Args:
+        sheets: SheetContext 列表
+        confirmed_schema: 用户确认的 schema dict
+        api_key, base_url, model: LLM 配置
+        num_questions: 目标题数
+        difficulty: 难度偏好
+        topic_hint: 主题方向
+        timeout: LLM 超时秒数
+        progress_callback: 进度回调
+        mode: "retrieval" 或 "qa"
+        file_name: 原始文件名
+
+    Returns:
+        tuple: (questions_list, stats_dict)
+    """
+    if progress_callback:
+        progress_callback(0, 5, "解析表格文件")
+
+    sheets_by_name = {s.sheet_name: s for s in sheets}
+
+    if progress_callback:
+        progress_callback(1, 5, "构建候选目录（基于确认 schema）")
+
+    # 基于确认 schema 构建候选目录
+    candidate_anchors = _build_candidate_anchors_from_schema(sheets, confirmed_schema)
+
+    if not candidate_anchors:
+        raise ValueError(
+            "基于确认的 schema 未生成任何合法候选。"
+            "请检查 safe_question_fields 是否包含可出题的文本字段。"
+        )
+
+    # 构建 candidate_id 索引
+    candidate_by_id = {c["candidate_id"]: c for c in candidate_anchors}
+
+    actual_target = min(num_questions, len(candidate_anchors))
+    if actual_target < num_questions:
+        print(f"  [INFO] 仅有 {len(candidate_anchors)} 个合法候选，最多生成 {actual_target} 题")
+
+    # 构建 Phase 2 prompt
+    prompt = _build_phase2_prompt(sheets, confirmed_schema, actual_target, topic_hint, candidate_anchors)
+    effective_timeout = (15, timeout)
+
+    print(f"  [PROMPT] Phase 2 Prompt: {len(prompt)} chars, 候选={len(candidate_anchors)}")
+
+    if progress_callback:
+        progress_callback(2, 5, "调用 LLM 生成检索查询")
+
+    # LLM 调用
+    import time as _time
+    _t0 = _time.time()
+    response_text = _call_llm_text(prompt, api_key, base_url, model, timeout=effective_timeout)
+    _t1 = _time.time()
+    raw_questions = _parse_llm_response(response_text)
+    first_raw_count = len(raw_questions)
+    print(f"  [LLM] 首次调用: prompt={len(prompt)} chars, 耗时={_t1 - _t0:.1f}s, 返回 {first_raw_count} 条")
+
+    if progress_callback:
+        progress_callback(3, 5, "验证并渲染金标准")
+
+    # 验证（使用新的 _validate_phase2_question）
+    rejection_stats = {}
+    valid_questions = []
+    used_candidate_ids = set()
+
+    for q in raw_questions:
+        validated, category, reason = _validate_phase2_question(
+            q, candidate_anchors, sheets_by_name,
+        )
+        if validated:
+            valid_questions.append(validated)
+            used_candidate_ids.add(validated.get("candidate_id", ""))
+        else:
+            rejection_stats[category] = rejection_stats.get(category, 0) + 1
+
+    # 先按 (record_locator, target_field_label) 去重，再按文本去重
+    deduped = _dedup_by_record_and_field(valid_questions)
+    unique_questions = deduplicate_questions(deduped)
+    first_valid_count = len(unique_questions)
+
+    # 补充调用
+    supplement_count = 0
+    supplement_valid = 0
+    if len(unique_questions) < num_questions:
+        remaining = num_questions - len(unique_questions)
+        unused_candidates = [a for a in candidate_anchors if a["candidate_id"] not in used_candidate_ids]
+
+        if unused_candidates and remaining > 0:
+            if progress_callback:
+                progress_callback(4, 5, f"补充调用（还需 {remaining} 条）")
+
+            used_ids_str = ", ".join(f"`{cid}`" for cid in sorted(used_candidate_ids))
+            unused_str = "\n".join(
+                f"- `{a['candidate_id']}` → {a.get('record_locator', {})} | {a.get('target_field', {}).get('label', '')}"
+                for a in unused_candidates[:remaining * 2]
+            )
+            supplement_prompt = (
+                f"已生成的题目使用了以下 candidate_id，不得重复：\n{used_ids_str}\n\n"
+                f"还需生成 {remaining} 条不重复的检索查询。"
+                f"以下候选尚未使用，请从中选择：\n{unused_str}\n\n"
+                f"请严格输出 JSON 数组，每个元素包含 candidate_id, question, target_field_label, difficulty, topic。"
+            )
+
+            try:
+                _t0 = _time.time()
+                supp_response = _call_llm_text(supplement_prompt, api_key, base_url, model, timeout=effective_timeout)
+                _t1 = _time.time()
+                supp_raw = _parse_llm_response(supp_response)
+                supplement_count = len(supp_raw)
+                print(f"  [LLM] 补充调用: 耗时={_t1 - _t0:.1f}s, 返回 {supplement_count} 条")
+
+                for q in supp_raw:
+                    if len(unique_questions) >= num_questions:
+                        break
+                    validated, category, reason = _validate_phase2_question(
+                        q, candidate_anchors, sheets_by_name,
+                    )
+                    if validated and validated.get("candidate_id", "") not in used_candidate_ids:
+                        unique_questions.append(validated)
+                        used_candidate_ids.add(validated["candidate_id"])
+                        supplement_valid += 1
+                    elif not validated:
+                        rejection_stats[category] = rejection_stats.get(category, 0) + 1
+            except Exception as e:
+                print(f"  [WARN] 补充调用失败: {e}")
+
+    if len(unique_questions) > num_questions:
+        unique_questions = unique_questions[:num_questions]
+
+    if not unique_questions:
+        raise ValueError("出题失败：所有查询均未通过校验")
+
+    stats = {
+        "target": num_questions,
+        "first_raw_count": first_raw_count,
+        "first_valid_count": first_valid_count,
+        "rejection_stats": rejection_stats,
+        "supplement_count": supplement_count,
+        "supplement_valid": supplement_valid,
+        "final_count": len(unique_questions),
+        "sheet_count": len(sheets),
+        "block_count": sum(len(s.table_blocks) for s in sheets),
+        "formula_warnings": sum(len(s.formula_cells_without_cache) for s in sheets),
+        "format_warnings": [],
+        "candidate_count": len(candidate_anchors),
+    }
+    return unique_questions, stats
 
 
 def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, model,
@@ -1772,16 +3208,30 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
             "可能原因：所有数据行均为汇总/合计行，或表格结构不支持生成检索题。"
         )
 
-    # 3. 构建 prompt（含候选锚点）
-    prompt = _build_prompt(sheets, num_questions, topic_hint, candidate_anchors)
+    # 3. 候选不足时调整目标
+    actual_target = min(num_questions, len(candidate_anchors))
+    if actual_target < num_questions:
+        print(f"  [INFO] 仅有 {len(candidate_anchors)} 个合法候选，最多生成 {actual_target} 题（目标 {num_questions}）")
+
+    # 4. 构建 prompt（含候选锚点）
+    prompt = _build_prompt(sheets, actual_target, topic_hint, candidate_anchors)
+    print(f"  [PROMPT] Prompt 字符数: {len(prompt)}，候选总数: {len(candidate_anchors)}")
+
+    # Keep connection failures responsive, but allow the caller-configured
+    # read timeout for slower model providers and queued requests.
+    effective_timeout = (15, timeout)
 
     if progress_callback:
         progress_callback(2, 5, "调用 LLM 生成检索查询")
 
-    # 4. 首次 LLM 调用
-    response_text = _call_llm_text(prompt, api_key, base_url, model, timeout=timeout)
+    # 5. 首次 LLM 调用
+    import time as _time
+    _t0 = _time.time()
+    response_text = _call_llm_text(prompt, api_key, base_url, model, timeout=effective_timeout)
+    _t1 = _time.time()
     raw_questions = _parse_llm_response(response_text)
     first_raw_count = len(raw_questions)
+    print(f"  [LLM] 首次调用: prompt={len(prompt)} chars, 候选={len(candidate_anchors)}, 耗时={_t1-_t0:.1f}s, 返回 {first_raw_count} 条")
 
     if progress_callback:
         progress_callback(3, 5, "验证并渲染金标准")
@@ -1794,6 +3244,7 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
     for q in raw_questions:
         validated, category, reason = _validate_single_question(
             q, sheets_by_name, file_name, semantic_field_names, semantic_anchors,
+            candidate_anchors=candidate_anchors,
         )
         if validated:
             valid_questions.append(validated)
@@ -1834,15 +3285,19 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
             )
 
             try:
-                supp_response = _call_llm_text(supplement_prompt, api_key, base_url, model, timeout=timeout)
+                _t0 = _time.time()
+                supp_response = _call_llm_text(supplement_prompt, api_key, base_url, model, timeout=effective_timeout)
+                _t1 = _time.time()
                 supp_raw = _parse_llm_response(supp_response)
                 supplement_count = len(supp_raw)
+                print(f"  [LLM] 补充调用: prompt={len(supplement_prompt)} chars, 耗时={_t1-_t0:.1f}s, 返回 {supplement_count} 条")
 
                 for q in supp_raw:
                     if len(unique_questions) >= num_questions:
                         break
                     validated, category, reason = _validate_single_question(
                         q, sheets_by_name, file_name, semantic_field_names, semantic_anchors,
+                        candidate_anchors=candidate_anchors,
                     )
                     if validated and validated.get("anchor_range", "") not in used_anchors:
                         unique_questions.append(validated)
@@ -1851,7 +3306,7 @@ def generate_spreadsheet_questions(file_bytes, file_name, api_key, base_url, mod
                     elif not validated:
                         rejection_stats[category] = rejection_stats.get(category, 0) + 1
             except Exception as e:
-                print(f"  ⚠️ 补充调用失败: {e}")
+                print(f"  [WARN] 补充调用失败: {e}")
 
     # 8. 最终裁剪
     if len(unique_questions) > num_questions:

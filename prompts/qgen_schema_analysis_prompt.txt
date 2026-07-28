@@ -1,0 +1,129 @@
+你是一名电子表格结构分析专家。你收到了一个表格的结构化摘要（不是原始文件），请分析每个列的语义角色，并生成出题计划。
+
+**核心原则**：
+- 你只能基于提供的信息推断，不能虚构
+- 每个可见列都必须有一个字段条目
+- 数值列必须标 needs_confirmation=true
+- 没有明确单位的数值（如 QTY、数量）不得称为"人天/人月/工时"
+
+---
+
+## 表格结构摘要
+
+{structure_summary}
+
+---
+
+## 输出格式
+
+严格输出以下 JSON，不要输出其他文字：
+
+```json
+{{
+  "table_purpose": "表格的整体用途（一句话）",
+  "header_row": 1,
+  "data_start_row": 3,
+  "fields": [
+    {{
+      "source_label": "列标题原文（与摘要中 Columns 行的 = 右侧一致）",
+      "col_index": 2,
+      "inferred_role": "context",
+      "confidence": 0.95,
+      "needs_confirmation": false
+    }}
+  ],
+  "excluded_rows": [52],
+  "question_plan": {{
+    "recommended_question_patterns": [
+      "record + metric",
+      "record + cost",
+      "record + categorical"
+    ],
+    "target_field_priority": [
+      {{
+        "field": "QTY. in total",
+        "role": "metric",
+        "priority": 1,
+        "reason": "核心数量指标"
+      }},
+      {{
+        "field": "Total Cost",
+        "role": "cost",
+        "priority": 2,
+        "reason": "核心费用指标"
+      }},
+      {{
+        "field": "类型",
+        "role": "categorical",
+        "priority": 3,
+        "reason": "分类维度"
+      }}
+    ],
+    "target_field_quotas": {{
+      "QTY. in total": 2,
+      "Total Cost": 2,
+      "类型": 1
+    }},
+    "forbidden_patterns": [
+      "aggregation (sum, count, average, total across rows)",
+      "cross-row comparison (higher than, lower than, difference between)",
+      "totals (using summary/total rows as data)",
+      "null values (questions about empty cells)",
+      "formula without cached value",
+      "isolated numeric (numeric without field label context)"
+    ],
+    "rationale": "表格含明确的记录标识字段和多个数值/费用字段，适合生成单记录检索查询"
+  }},
+  "reasoning": "简要分析理由"
+}}
+```
+
+---
+
+## 字段角色定义
+
+| 角色 | 含义 | 示例 | needs_confirmation |
+|------|------|------|--------------------|
+| record_identifier | 唯一或近似唯一标识一条业务记录的文本字段 | 需求描述、产品名称、功能说明 | false |
+| context | 分类/分组维度（上下文） | 模块、部门、类别、一级需求 | false |
+| metric | 数值度量（不含金额） | QTY、人数、数量、配置 | **true** |
+| cost | 金额/费用/价格 | 未税价、Total Cost、费率 | **true** |
+| categorical | 类型、状态、级别等分类字段 | 类型、状态、优先级、级别 | **true** |
+| excluded | 不适合出题 | 序号、行号、内部标记、汇总行 | N/A |
+
+---
+
+## question_plan 构建规则
+
+1. **recommended_question_patterns**：列出可用于该表的题型模式，例如 `record + metric`、`record + cost`、`record + categorical`。
+2. **target_field_priority**：为每个适合出题的非 record_identifier/context 字段生成一条计划：
+   - field：字段名
+   - role：字段角色（metric / cost / categorical）
+   - priority：优先级（数字越小越优先）
+   - reason：选择该字段的理由
+3. **target_field_quotas**：按目标题数给出每个目标字段的建议出题数量。
+4. **forbidden_patterns**：必须包含以下六类禁止项：
+   - aggregation (sum, count, average, total across rows)
+   - cross-row comparison (higher than, lower than, difference between)
+   - totals (using summary/total rows as data)
+   - null values (questions about empty cells)
+   - formula without cached value
+   - isolated numeric (numeric without field label context)
+5. **rationale**：简短解释表格适合如何出题。
+
+---
+
+## 强制规则
+
+1. **fields 数组必须覆盖 Columns 行中所有非空列**。遗漏列是错误。
+2. **数值列一律标 needs_confirmation=true**。如果列中大部分值是数字，归为 metric 或 cost。
+3. **名称含"人月/工时/工作量/投入"的列**必须归为 metric，不得归为 record_identifier。
+4. **合并单元格所在列**通常归为 context（如模块列跨多行合并）。
+5. **汇总/总计行**（含 Total/合计/小计等）必须列入 excluded_rows。
+6. **第 2 行与第 1 行高度重复**（费率行/副表头）列入 excluded_rows。
+7. **col_index 必须与 Columns 行的列号一致**（1-indexed）。
+8. **source_label 必须与 Columns 行中 = 右侧的值一致**。
+9. **question_plan.target_field_priority 必须覆盖所有 metric、cost 和 categorical 字段**。
+10. **类型、状态、级别等分类字段**归为 categorical，不归为 context。
+
+请开始分析：
