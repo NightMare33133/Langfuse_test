@@ -2582,8 +2582,14 @@ PISP和AISP的区别?
             with opt_col2:
                 dify_delay = st.number_input(
                     "请求间隔（秒）", min_value=0.0, max_value=10.0, value=1.0, step=0.5, key="batch_delay",
-                    help="每次请求之间的等待时间，避免过快调用"
+                    help="串行模式下每次请求之间的等待时间。并发模式下此设置不生效。"
                 )
+
+            dify_concurrency = st.number_input(
+                "并发数", min_value=1, max_value=8, value=3, step=1, key="batch_concurrency",
+                help='同时发起的 Dify 请求数。设为 1 即传统串行模式（受「请求间隔」控制）；'
+                     '大于 1 时忽略请求间隔，多题同时提问以缩短总耗时。'
+            )
 
             # 保存为命名配置
             _save_as_profile = st.checkbox("保存为命名连接配置", key="dify_save_as_profile")
@@ -2805,8 +2811,10 @@ PISP和AISP的区别?
                 st.info(f"运行已创建: `{_run_id}` | 题集: {q_set_name or q_set_id or '未知'}")
 
                 _batch_results = []
+                _completed = [0]  # 用列表包装以在闭包中修改
                 _progress = st.progress(0, text=f"{label}准备开始...")
                 _status = st.container()
+                _concurrency = st.session_state.get("batch_concurrency", 3)
 
                 for idx, total, result in run_batch_query(
                     questions, dify_api_key, dify_base_url,
@@ -2814,10 +2822,12 @@ PISP和AISP的区别?
                     run_id=_run_id,
                     config_id=_config_id,
                     question_ids=question_ids,
+                    max_workers=_concurrency,
                 ):
+                    _completed[0] += 1
                     _progress.progress(
-                        (idx + 1) / total,
-                        text=f"{label}正在提问第 {idx + 1} / {total} 条",
+                        _completed[0] / total,
+                        text=f"{label}已完成 {_completed[0]} / {total}（第 {idx + 1} 题）",
                     )
                     _batch_results.append(result)
 
@@ -2827,6 +2837,10 @@ PISP和AISP的区别?
                             st.success(f"✅ [{idx + 1}/{total}] {result['question'][:40]}... → {answer_preview}")
                         else:
                             st.error(f"❌ [{idx + 1}/{total}] {result['question'][:40]}... → {result['error'][:80]}")
+
+                # 并发模式下结果按完成顺序收集，保存前按原始索引稳定排序
+                if _concurrency > 1:
+                    _batch_results.sort(key=lambda r: r.get("_original_index", 0))
 
                 _progress.progress(1.0, text=f"{label}提问完成！")
 

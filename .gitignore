@@ -25,3 +25,7 @@ data/reports/*_ai_analysis_*.md
 
 # AI 优化分析报告，兼容旧版与新版文件命名
 data/reports/*ai_analysis*.md
+
+.env
+.credentials
+data/dify_connections/.credentials

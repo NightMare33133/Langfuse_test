@@ -12,6 +12,7 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -203,8 +204,9 @@ def query_to_sample(question, dify_result, index, timestamp,
 
 
 def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
-                    run_id="", config_id="", question_ids=None):
-    """批量提问生成器。逐条调用 Dify API，yield 进度和结果。
+                    run_id="", config_id="", question_ids=None,
+                    max_workers=1):
+    """批量提问生成器。逐条或并发调用 Dify API，yield 进度和结果。
 
     输入契约：questions 为 list[dict]，每个 dict 至少包含 "question": str。
     也向后兼容 list[str]，内部通过 normalize_questions() 统一处理。
@@ -214,13 +216,16 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
         api_key: Dify API Key
         base_url: Dify API Base URL (e.g. http://localhost/v1)
         timeout: 单次请求超时秒数
-        delay: 每次请求之间的间隔秒数
+        delay: 每次请求之间的间隔秒数（仅 max_workers==1 时生效）
         run_id: 运行ID（可选，用于 Langfuse 关联）
         config_id: 配置方案ID（可选）
         question_ids: 问题ID列表（可选，与 questions 一一对应）
+        max_workers: 最大并发数。1 表示串行（默认），>1 使用线程池并发
 
     Yields:
         (index, total, result_dict)
+        index: 原始题目索引（并发模式下按完成顺序 yield，非顺序递增）
+        total: 总题数
         result_dict 包含:
           - success: bool
           - question: str
@@ -233,16 +238,68 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
     total = len(items)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for i, item in enumerate(items):
+    # ---------- 串行模式（max_workers <= 1）：保持原有行为 ----------
+    if max_workers <= 1:
+        for i, item in enumerate(items):
+            question = item["question"]
+            reference_answer = item.get("reference_answer", "")
+            source_excerpt = item.get("source_excerpt", "")
+            question_mode = item.get("question_mode", "")
+            question_id = item.get("question_id") or (question_ids[i] if question_ids and i < len(question_ids) else "")
+            question_set_id = item.get("question_set_id", "")
+            question_set_name = item.get("question_set_name", "")
+
+            # 构建 Dify user 字段
+            if run_id and question_id:
+                dify_user = f"rag_eval:{run_id}:{question_id}"
+            else:
+                dify_user = "batch-query"
+
+            try:
+                dify_result = call_dify_query(question, api_key, base_url, timeout=timeout, user=dify_user)
+                sample = query_to_sample(
+                    question, dify_result, i, timestamp,
+                    reference_answer=reference_answer,
+                    source_excerpt=source_excerpt,
+                    question_mode=question_mode,
+                    question_id=question_id,
+                    run_id=run_id,
+                    config_id=config_id,
+                    dify_user=dify_user,
+                    question_set_id=question_set_id,
+                    question_set_name=question_set_name,
+                )
+                yield i, total, {
+                    "success": True,
+                    "question": question,
+                    "sample": sample,
+                    "raw_response": dify_result.get("raw_response"),
+                    "_original_index": i,
+                }
+            except Exception as e:
+                yield i, total, {
+                    "success": False,
+                    "question": question,
+                    "error": str(e),
+                    "_original_index": i,
+                }
+
+            # 请求间隔（最后一条不等待）
+            if i < total - 1 and delay > 0:
+                time.sleep(delay)
+        return
+
+    # ---------- 并发模式（max_workers > 1）：ThreadPoolExecutor ----------
+    def _submit_one(idx, item):
+        """提交单题查询，返回 (idx, result_dict)。"""
         question = item["question"]
         reference_answer = item.get("reference_answer", "")
         source_excerpt = item.get("source_excerpt", "")
         question_mode = item.get("question_mode", "")
-        question_id = item.get("question_id") or (question_ids[i] if question_ids and i < len(question_ids) else "")
+        question_id = item.get("question_id") or (question_ids[idx] if question_ids and idx < len(question_ids) else "")
         question_set_id = item.get("question_set_id", "")
         question_set_name = item.get("question_set_name", "")
 
-        # 构建 Dify user 字段
         if run_id and question_id:
             dify_user = f"rag_eval:{run_id}:{question_id}"
         else:
@@ -251,7 +308,7 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
         try:
             dify_result = call_dify_query(question, api_key, base_url, timeout=timeout, user=dify_user)
             sample = query_to_sample(
-                question, dify_result, i, timestamp,
+                question, dify_result, idx, timestamp,
                 reference_answer=reference_answer,
                 source_excerpt=source_excerpt,
                 question_mode=question_mode,
@@ -262,22 +319,31 @@ def run_batch_query(questions, api_key, base_url, timeout=60, delay=1.0,
                 question_set_id=question_set_id,
                 question_set_name=question_set_name,
             )
-            yield i, total, {
+            return idx, {
                 "success": True,
                 "question": question,
                 "sample": sample,
                 "raw_response": dify_result.get("raw_response"),
+                "_original_index": idx,
             }
         except Exception as e:
-            yield i, total, {
+            return idx, {
                 "success": False,
                 "question": question,
                 "error": str(e),
+                "_original_index": idx,
             }
 
-        # 请求间隔（最后一条不等待）
-        if i < total - 1 and delay > 0:
-            time.sleep(delay)
+    pool_size = max(1, min(max_workers, 8))
+    futures = {}
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
+        for i, item in enumerate(items):
+            fut = executor.submit(_submit_one, i, item)
+            futures[fut] = i
+
+        for fut in as_completed(futures):
+            orig_idx, result = fut.result()
+            yield orig_idx, total, result
 
 
 def save_batch_results(results, filename=None):
