@@ -991,6 +991,7 @@ st.sidebar.markdown(
 )
 st.sidebar.divider()
 st.sidebar.markdown("**运行看板** — 按配置方案查看累计结果、运行历史和单次运行详情")
+st.sidebar.markdown("**知识库探索** — 浏览 Dify 知识库、文档和分块内容，检测重复分块")
 st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有独立配置面板和详细说明。")
 
 # --- 内存用量显示 ---
@@ -1024,7 +1025,7 @@ if "_rss_init" not in st.session_state:
     st.session_state["_rss_init"] = True
 
 # --- Tabs ---
-tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板"])
+tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment, tab_kb = st.tabs(["题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板", "知识库探索"])
 
 # ========== Tab: 题目生成 ==========
 with tab_qgen:
@@ -2415,8 +2416,8 @@ PISP和AISP的区别?
             get_connection_api_key, has_connection_api_key, mask_api_key,
         )
 
-        _env_api_key = os.getenv("DIFY_API_KEY", "")
-        _env_base_url = os.getenv("DIFY_API_BASE", "http://localhost/v1")
+        _env_api_key = os.getenv("DIFY_APP_API_KEY", "") or os.getenv("DIFY_API_KEY", "")
+        _env_base_url = os.getenv("DIFY_APP_API_BASE", "") or os.getenv("DIFY_API_BASE", "http://localhost/v1")
 
         # 连接配置来源选择
         dify_conn_source = st.radio(
@@ -2566,7 +2567,7 @@ PISP和AISP的区别?
                     "Dify API Key", type="password",
                     value=_env_api_key,
                     key="batch_dify_key",
-                    help="来自 .env 的默认值" if _env_api_key else "",
+                    help="来自 .env 的默认值（DIFY_APP_API_KEY）" if _env_api_key else "",
                 )
             with tm_col2:
                 dify_base_url = st.text_input(
@@ -2609,7 +2610,7 @@ PISP和AISP的区别?
 
         # 环境变量提示
         if not dify_api_key and _env_api_key:
-            st.caption("将使用 .env 中的 `DIFY_API_KEY` 作为默认密钥。")
+            st.caption("将使用 .env 中的 `DIFY_APP_API_KEY` 作为默认密钥。")
             dify_api_key = _env_api_key
 
     # --- Run batch query ---
@@ -6787,3 +6788,493 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                     )
                     st.caption("检索指标变化趋势")
                     st.plotly_chart(fig_trend, use_container_width=True, key="history_trend")
+
+# ========== Tab: 知识库探索 ==========
+with tab_kb:
+    st.subheader("知识库探索")
+    st.caption("浏览 Dify 知识库、文档和分块内容，检测重复分块，导出 chunk catalog snapshot")
+
+    with st.expander("知识库探索模块说明（点击展开）", expanded=False):
+        st.markdown("""
+**一句话总览：** 连接 Dify 知识库 API，浏览数据集 → 文档 → 分块的层级结构，对分块内容计算 SHA-256 哈希以检测重复，并导出可复现的 chunk catalog snapshot。
+
+---
+
+**功能说明**
+
+| 功能 | 说明 |
+|------|------|
+| 列出知识库 | 调用 `GET /datasets` 获取所有数据集 |
+| 列出文档 | 调用 `GET /datasets/{id}/documents` 分页展示文档列表 |
+| 分块浏览 | 调用 `GET /datasets/{id}/documents/{id}/segments`，支持 status 过滤和分页 |
+| 重复检测 | 对分块内容做规范化 SHA-256 哈希，标记内容完全相同的分块 |
+| 导出 | JSON 和 CSV 格式导出 chunk catalog（含 content_hash） |
+
+**安全说明**
+- 本模块仅使用 GET 请求，**不会**上传、删除、编辑、启用或禁用任何文档或分块
+- API Key 仅从本地环境变量或连接配置的安全存储读取，不写入任何导出文件、日志或 Git
+
+**分页参数**
+- `page`：页码（从 1 开始）
+- `limit`：每页数量，最大 100
+""")
+
+    # ── 连接配置（仅知识库 API Key） ──────────────────────────
+    from dify_kb_connection import (
+        list_kb_profiles, load_kb_profile, create_kb_profile,
+        update_kb_profile, delete_kb_profile,
+        get_kb_api_key, has_kb_api_key,
+        mask_api_key as kb_mask_api_key,
+        validate_dataset_key,
+    )
+    from dify_knowledge import (
+        list_datasets, list_documents, list_segments,
+        build_chunk_catalog, detect_duplicates,
+        export_catalog_json, export_catalog_csv,
+        check_connection,
+    )
+
+    _kb_env_api_key = os.getenv("DIFY_DATASET_API_KEY", "")
+    _kb_env_base_url = os.getenv("DIFY_DATASET_API_BASE", "") or "http://localhost/v1"
+
+    with st.expander("知识库 API 连接配置", expanded=True):
+        st.caption("本页仅使用 **知识库 API Key**（`dataset-` 开头），与批量提问的 App Key（`app-` 开头）完全独立。")
+
+        # 列出已保存的配置
+        kb_profiles = list_kb_profiles()
+        kb_api_key = ""
+        kb_base_url = _kb_env_base_url
+
+        if kb_profiles:
+            kb_profile_options = []
+            for p in kb_profiles:
+                pid = p.get("profile_id", "")
+                pname = p.get("profile_name", "未命名")
+                purl = p.get("base_url", "")
+                pmasked = p.get("key_masked", "")
+                label = f"{pname} · {purl}"
+                if pmasked:
+                    label += f" · Key: {pmasked}"
+                kb_profile_options.append((pid, label))
+
+            kb_selected_pid = st.selectbox(
+                "选择知识库连接配置",
+                options=[""] + [c[0] for c in kb_profile_options],
+                format_func=lambda x: (
+                    "（请选择）" if not x
+                    else next((c[1] for c in kb_profile_options if c[0] == x), x)
+                ),
+                key="kb_selected_profile",
+            )
+
+            if kb_selected_pid:
+                kb_sel_meta = load_kb_profile(kb_selected_pid)
+                if kb_sel_meta:
+                    kb_base_url = kb_sel_meta.get("base_url", _kb_env_base_url)
+                    kb_saved_key = get_kb_api_key(kb_selected_pid)
+                    if kb_saved_key:
+                        kb_api_key = kb_saved_key
+                        st.caption(f"知识库 Key: `{kb_mask_api_key(kb_saved_key)}`（已从安全存储读取）")
+                    else:
+                        st.warning("该配置未保存 Key，请重新创建或手动输入。")
+
+            # 管理操作
+            mgmt_c1, mgmt_c2, mgmt_c3 = st.columns(3)
+            with mgmt_c1:
+                if st.button("➕ 新建配置", key="kb_new_profile_btn"):
+                    st.session_state["kb_show_new_form"] = True
+            with mgmt_c2:
+                if st.button("✏️ 编辑配置", key="kb_edit_profile_btn",
+                             disabled=not kb_selected_pid):
+                    st.session_state["kb_show_edit_form"] = True
+            with mgmt_c3:
+                if st.button("🗑️ 删除配置", key="kb_delete_profile_btn",
+                             disabled=not kb_selected_pid):
+                    st.session_state["kb_show_delete_confirm"] = True
+
+            # ── 新建配置表单 ──
+            if st.session_state.get("kb_show_new_form"):
+                with st.form("kb_new_profile_form"):
+                    st.markdown("**新建知识库连接配置**")
+                    np_name = st.text_input("配置名称 *", placeholder="例如：产品知识库", key="kb_np_name")
+                    np_url = st.text_input("Base URL *", value=_kb_env_base_url, key="kb_np_url")
+                    np_key = st.text_input(
+                        "Dataset API Key *",
+                        type="password",
+                        key="kb_np_key",
+                        placeholder="dataset-...",
+                    )
+                    np_submit = st.form_submit_button("保存")
+                if np_submit and np_name and np_url and np_key:
+                    ok, err = validate_dataset_key(np_key)
+                    if not ok:
+                        st.error(f"Key 校验失败: {err}")
+                    else:
+                        try:
+                            create_kb_profile(np_name, np_url, np_key)
+                            st.success(f"知识库连接配置「{np_name}」已保存")
+                            st.session_state["kb_show_new_form"] = False
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(f"保存失败: {exc}")
+
+            # ── 编辑配置表单 ──
+            if st.session_state.get("kb_show_edit_form") and kb_selected_pid:
+                _edit_meta = load_kb_profile(kb_selected_pid)
+                if _edit_meta:
+                    with st.form("kb_edit_profile_form"):
+                        st.markdown(f"**编辑: {_edit_meta.get('profile_name', '')}**")
+                        ep_name = st.text_input("配置名称", value=_edit_meta.get("profile_name", ""), key="kb_ep_name")
+                        ep_url = st.text_input("Base URL", value=_edit_meta.get("base_url", ""), key="kb_ep_url")
+                        ep_key = st.text_input(
+                            "新 Dataset API Key（留空则保留现有）",
+                            type="password",
+                            key="kb_ep_key",
+                            placeholder="dataset-...",
+                        )
+                        ep_submit = st.form_submit_button("保存")
+                    if ep_submit:
+                        try:
+                            update_kb_profile(
+                                kb_selected_pid,
+                                {"profile_name": ep_name, "base_url": ep_url},
+                                api_key=ep_key if ep_key else None,
+                            )
+                            st.success("配置已更新")
+                            st.session_state["kb_show_edit_form"] = False
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(f"更新失败: {exc}")
+
+            # ── 删除确认 ──
+            if st.session_state.get("kb_show_delete_confirm") and kb_selected_pid:
+                _del_meta = load_kb_profile(kb_selected_pid)
+                _del_name = _del_meta.get("profile_name", "") if _del_meta else ""
+                st.warning(f"确认删除配置「{_del_name}」？此操作不可撤销。")
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    if st.button("确认删除", key="kb_confirm_delete"):
+                        delete_kb_profile(kb_selected_pid)
+                        st.success(f"已删除「{_del_name}」")
+                        st.session_state["kb_show_delete_confirm"] = False
+                        st.rerun()
+                with dc2:
+                    if st.button("取消", key="kb_cancel_delete"):
+                        st.session_state["kb_show_delete_confirm"] = False
+                        st.rerun()
+
+        else:
+            # 无已保存配置：提供环境变量读取或手动输入
+            st.info("暂无已保存的知识库连接配置。请从环境变量读取或手动输入。")
+
+            if _kb_env_api_key:
+                _env_ok, _env_err = validate_dataset_key(_kb_env_api_key)
+                if _env_ok:
+                    kb_api_key = _kb_env_api_key
+                    st.caption(f"已从环境变量 `DIFY_DATASET_API_KEY` 读取: `{kb_mask_api_key(_kb_env_api_key)}`")
+                else:
+                    st.warning(f"环境变量 `DIFY_DATASET_API_KEY` 无效: {_env_err}")
+
+        # 手动输入（覆盖或补充，或无配置时的主入口）
+        if not kb_api_key:
+            st.markdown("**手动输入知识库 API 连接信息**")
+            _kb_manual_key = st.text_input(
+                "Dataset API Key（dataset-...）",
+                type="password",
+                key="kb_manual_key",
+                value="",
+                help="必须是 dataset- 开头的知识库专用 API Key，不可使用 app- 开头的应用 Key",
+            )
+            if _kb_manual_key:
+                _manual_ok, _manual_err = validate_dataset_key(_kb_manual_key)
+                if _manual_ok:
+                    kb_api_key = _kb_manual_key
+                else:
+                    st.error(f"Key 校验失败: {_manual_err}")
+
+            kb_base_url = st.text_input(
+                "知识库 API Base URL",
+                value=kb_base_url,
+                key="kb_base_url_input",
+                help="默认从 DIFY_DATASET_API_BASE 读取",
+            )
+
+        if not kb_api_key:
+            st.warning(
+                "请配置知识库 API Key（`dataset-` 开头）以使用知识库探索功能。\n\n"
+                "**获取方式：** Dify 后台 → 知识库 → 选择知识库 → API 访问 → 复制 Dataset API Key\n\n"
+                "**配置方式：** 在 .env 中设置 `DIFY_DATASET_API_KEY=dataset-xxx`，"
+                "或点击「➕ 新建配置」保存，或在下方手动输入。"
+            )
+            st.stop()
+
+        # 连接测试
+        if st.button("🔗 测试知识库连接", key="kb_test_conn"):
+            ok, msg = check_connection(kb_api_key, kb_base_url)
+            if ok:
+                st.success(f"连接成功: {msg}")
+            else:
+                st.error(f"连接失败: {msg}")
+
+        st.caption(f"Base URL: `{kb_base_url}`")
+
+    # ── 知识库选择 ────────────────────────────────────────────
+    st.markdown("### 知识库列表")
+
+    try:
+        with st.spinner("正在加载知识库列表..."):
+            datasets = list_datasets(kb_api_key, kb_base_url)
+    except RuntimeError as exc:
+        st.error(f"获取知识库列表失败: {exc}")
+        datasets = []
+
+    if not datasets:
+        st.info("未找到任何知识库。请检查连接配置和 API Key 权限。")
+        st.stop()
+
+    # 构建选择列表
+    ds_options = []
+    for ds in datasets:
+        ds_id = ds.get("id", "")
+        ds_name = ds.get("name", "未命名")
+        ds_doc_count = ds.get("document_count", 0)
+        ds_word_count = ds.get("word_count", 0)
+        label = f"{ds_name}（{ds_doc_count} 篇文档，{ds_word_count:,} 词）"
+        ds_options.append((ds_id, label))
+
+    selected_ds_id = st.selectbox(
+        "选择知识库",
+        options=[c[0] for c in ds_options],
+        format_func=lambda x: next(
+            (c[1] for c in ds_options if c[0] == x), x
+        ),
+        key="kb_selected_dataset",
+    )
+
+    if not selected_ds_id:
+        st.stop()
+
+    # ── 文档列表 ──────────────────────────────────────────────
+    st.markdown("### 文档列表")
+
+    doc_page = st.session_state.get("kb_doc_page", 1)
+    doc_limit = 20
+
+    try:
+        with st.spinner("正在加载文档列表..."):
+            doc_result = list_documents(
+                kb_api_key, kb_base_url, selected_ds_id,
+                page=doc_page, limit=doc_limit,
+            )
+    except RuntimeError as exc:
+        st.error(f"获取文档列表失败: {exc}")
+        doc_result = {"data": [], "has_more": False, "total": 0}
+
+    documents = doc_result.get("data", [])
+    doc_total = doc_result.get("total", 0)
+    doc_has_more = doc_result.get("has_more", False)
+
+    if not documents:
+        st.info("该知识库中没有文档。")
+        st.stop()
+
+    # 文档分页控件
+    if doc_total > doc_limit or doc_has_more:
+        doc_page_col1, doc_page_col2, doc_page_col3 = st.columns([1, 2, 3])
+        with doc_page_col1:
+            if st.button("⬅ 上一页", key="kb_doc_prev", disabled=(doc_page <= 1)):
+                st.session_state["kb_doc_page"] = max(1, doc_page - 1)
+                st.rerun()
+        with doc_page_col2:
+            st.caption(f"第 {doc_page} 页（共 {doc_total} 篇文档）")
+        with doc_page_col3:
+            if st.button("下一页 ➡", key="kb_doc_next",
+                         disabled=(not doc_has_more)):
+                st.session_state["kb_doc_page"] = doc_page + 1
+                st.rerun()
+
+    # 文档表格
+    doc_rows = []
+    for doc in documents:
+        doc_rows.append({
+            "文档ID": doc.get("id", ""),
+            "文档名称": doc.get("name", ""),
+            "词数": doc.get("word_count", 0),
+            "状态": doc.get("status", ""),
+            "创建时间": doc.get("created_at", ""),
+        })
+    st.dataframe(doc_rows, use_container_width=True, key="kb_doc_table")
+
+    # ── 文档选择与分块浏览 ────────────────────────────────────
+    st.markdown("### 分块浏览")
+
+    doc_id_options = []
+    for doc in documents:
+        doc_id = doc.get("id", "")
+        doc_name = doc.get("name", "未命名")
+        doc_id_options.append((doc_id, f"{doc_name}（{doc_id[:8]}...）"))
+
+    selected_doc_id = st.selectbox(
+        "选择文档",
+        options=[c[0] for c in doc_id_options],
+        format_func=lambda x: next(
+            (c[1] for c in doc_id_options if c[0] == x), x
+        ),
+        key="kb_selected_document",
+    )
+
+    if not selected_doc_id:
+        st.stop()
+
+    # 状态过滤与分页设置
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        seg_status = st.radio(
+            "状态过滤",
+            ["completed", "indexing", "error", "全部"],
+            horizontal=True,
+            key="kb_seg_status",
+            help="默认仅显示已完成的分块",
+        )
+        status_filter = "" if seg_status == "全部" else seg_status
+
+    with filter_col2:
+        seg_limit = st.number_input(
+            "每页数量",
+            min_value=1,
+            max_value=100,
+            value=20,
+            step=5,
+            key="kb_seg_limit",
+            help="最大 100",
+        )
+
+    seg_page = st.session_state.get("kb_seg_page", 1)
+
+    try:
+        with st.spinner("正在加载分块列表..."):
+            seg_result = list_segments(
+                kb_api_key, kb_base_url, selected_ds_id, selected_doc_id,
+                page=seg_page, limit=seg_limit,
+                status_filter=status_filter,
+            )
+    except RuntimeError as exc:
+        st.error(f"获取分块列表失败: {exc}")
+        seg_result = {"data": [], "has_more": False, "total": 0}
+
+    segments = seg_result.get("data", [])
+    seg_total = seg_result.get("total", 0)
+    seg_has_more = seg_result.get("has_more", False)
+
+    if not segments:
+        st.info("未找到符合条件的分块。")
+        st.stop()
+
+    # 分块分页控件
+    if seg_total > seg_limit or seg_has_more:
+        seg_page_col1, seg_page_col2, seg_page_col3 = st.columns([1, 2, 3])
+        with seg_page_col1:
+            if st.button("⬅ 上一页", key="kb_seg_prev", disabled=(seg_page <= 1)):
+                st.session_state["kb_seg_page"] = max(1, seg_page - 1)
+                st.rerun()
+        with seg_page_col2:
+            st.caption(f"第 {seg_page} 页（共 {seg_total} 个分块）")
+        with seg_page_col3:
+            if st.button("下一页 ➡", key="kb_seg_next",
+                         disabled=(not seg_has_more)):
+                st.session_state["kb_seg_page"] = seg_page + 1
+                st.rerun()
+
+    # 构建 catalog
+    catalog = build_chunk_catalog(segments, selected_ds_id, selected_doc_id)
+
+    # 重复检测
+    duplicates = detect_duplicates(catalog)
+    if duplicates:
+        dup_count = sum(len(v) for v in duplicates.values())
+        dup_hash_count = len(duplicates)
+        st.warning(
+            f"检测到 {dup_hash_count} 组重复内容（共 {dup_count} 个分块）"
+        )
+        dup_hashes = set(duplicates.keys())
+    else:
+        dup_hashes = set()
+        st.success("当前页未检测到重复分块。")
+
+    # 分块表格
+    seg_rows = []
+    for entry in catalog:
+        content_preview = entry["content"][:100] + "..." if len(entry["content"]) > 100 else entry["content"]
+        is_dup = entry["content_hash"] in dup_hashes
+        seg_rows.append({
+            "重复": "⚠️ 是" if is_dup else "",
+            "segment_id": entry["segment_id"],
+            "position": entry["position"],
+            "document_id": entry["document_id"][:12] + "..." if len(str(entry["document_id"])) > 12 else entry["document_id"],
+            "content": content_preview,
+            "index_node_id": entry["index_node_id"][:12] + "..." if len(str(entry["index_node_id"])) > 12 else entry["index_node_id"],
+            "index_node_hash": entry["index_node_hash"][:12] + "..." if len(str(entry["index_node_hash"])) > 12 else entry["index_node_hash"],
+            "tokens": entry["tokens"],
+            "word_count": entry["word_count"],
+            "enabled": entry["enabled"],
+            "status": entry["status"],
+            "content_hash": entry["content_hash"][:16] + "..." if entry["content_hash"] else "",
+        })
+
+    st.dataframe(seg_rows, use_container_width=True, key="kb_seg_table")
+
+    # 展开查看完整内容
+    if catalog:
+        with st.expander("查看分块完整内容", expanded=False):
+            for entry in catalog:
+                is_dup = entry["content_hash"] in dup_hashes
+                title = f"**{entry['segment_id'][:12]}...**"
+                if is_dup:
+                    title += " ⚠️ 重复"
+                with st.expander(title, expanded=False):
+                    st.text_area(
+                        "内容",
+                        value=entry["content"],
+                        height=150,
+                        disabled=True,
+                        key=f"kb_seg_content_{entry['segment_id']}",
+                    )
+                    st.caption(
+                        f"tokens: {entry['tokens']} | "
+                        f"word_count: {entry['word_count']} | "
+                        f"status: {entry['status']} | "
+                        f"enabled: {entry['enabled']} | "
+                        f"content_hash: `{entry['content_hash'][:16]}...`"
+                    )
+
+    # ── 导出 ──────────────────────────────────────────────────
+    st.markdown("### 导出 Chunk Catalog")
+
+    export_col1, export_col2 = st.columns(2)
+
+    with export_col1:
+        json_bytes = export_catalog_json(catalog).encode("utf-8")
+        st.download_button(
+            label="📥 导出 JSON",
+            data=json_bytes,
+            file_name=f"chunk_catalog_{selected_doc_id[:8]}.json",
+            mime="application/json",
+            key="kb_export_json",
+        )
+
+    with export_col2:
+        csv_bytes = export_catalog_csv(catalog)
+        st.download_button(
+            label="📥 导出 CSV",
+            data=csv_bytes,
+            file_name=f"chunk_catalog_{selected_doc_id[:8]}.csv",
+            mime="text/csv",
+            key="kb_export_csv",
+        )
+
+    st.caption(
+        f"导出包含 {len(catalog)} 条分块记录，"
+        f"字段：segment_id, position, document_id, content, "
+        f"index_node_id, index_node_hash, tokens, word_count, "
+        f"enabled, status, content_hash"
+    )
