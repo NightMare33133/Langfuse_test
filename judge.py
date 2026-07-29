@@ -61,6 +61,7 @@ TRACK_RETRIEVAL = "retrieval"          # 检索评测：有金标准证据，可
 TRACK_STRICT_QA = "strict_qa"          # 严格问答：有 reference_answer，可评判回答正确性
 TRACK_GROUNDED_QA = "grounded_qa"      # 合理性问答：无参考答案，基于检索内容判断
 TRACK_NOT_EVALUABLE = "not_evaluable"  # 不可评测：检索评测题但缺少金标准证据
+TRACK_CHUNK_EXACT = "chunk_exact"      # 精确匹配：按 segment_id / content_hash 纯机器判定
 
 
 def classify_evaluation_track(sample):
@@ -73,7 +74,10 @@ def classify_evaluation_track(sample):
     has_source_excerpt = bool((sample.get("source_excerpt") or "").strip())
     has_reference_answer = bool((sample.get("reference_answer") or "").strip())
 
-    if question_mode == "retrieval":
+    if question_mode == "chunk_exact":
+        # 精确匹配题：纯机器判定，不需要金标准证据
+        return TRACK_CHUNK_EXACT
+    elif question_mode == "retrieval":
         # 检索评测题：优先用 source_excerpt，其次用 reference_answer
         if has_source_excerpt:
             return TRACK_RETRIEVAL
@@ -175,6 +179,22 @@ def build_result_status(result):
             "title": "缺少金标准证据",
             "status": "not_evaluable",
             "description": "无法可靠计算检索命中率",
+        }
+    elif track == TRACK_CHUNK_EXACT:
+        # 精确匹配：显示 TopK 命中状态（与 retrieval 相同格式）
+        parts = []
+        if t1 is not None:
+            parts.append(f"Top1 {'命中' if t1 else '未命中'}")
+        if t3 is not None:
+            parts.append(f"Top3 {'命中' if t3 else '未命中'}")
+        if t5 is not None:
+            parts.append(f"Top5 {'命中' if t5 else '未命中'}")
+        hit_summary = "｜".join(parts) if parts else "无检索结果"
+        return {
+            "icon": "🎯",
+            "title": hit_summary,
+            "status": "chunk_exact",
+            "description": "精确匹配评测（segment_id / content_hash）",
         }
     else:
         # 未知轨道
@@ -448,6 +468,68 @@ def _retry_call_llm(prompt, api_key, base_url, model, timeout=30,
             time.sleep(delay)
 
 
+def _content_hash_for_match(text):
+    """对内容做规范化 SHA-256（与 dify_knowledge.compute_content_hash 一致）。"""
+    if not text:
+        return ""
+    normalized = text.strip().replace("\r\n", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _judge_chunk_exact(sample):
+    """chunk_exact 轨道纯机器判定：按 segment_id / content_hash 匹配。
+
+    不调用 LLM，完全确定性判定。
+    """
+    expected_id = (sample.get("expected_segment_id") or "").strip()
+    expected_hash = (sample.get("expected_content_hash") or "").strip()
+    retrieval_results = sample.get("retrieval_results") or []
+
+    if not expected_id and not expected_hash:
+        return {
+            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+            "retrieval_top5_hit": 0, "hit_evidence_position": None,
+            "reason": "chunk_exact 题缺少 expected_segment_id 和 expected_content_hash",
+        }
+
+    if not retrieval_results:
+        return {
+            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
+            "retrieval_top5_hit": 0, "hit_evidence_position": None,
+            "reason": "无检索结果",
+        }
+
+    hit_position = None
+    for rank, r in enumerate(retrieval_results[:5]):
+        seg_id = (r.get("segment_id") or "").strip()
+        content = (r.get("content") or "").strip()
+        content_hash = _content_hash_for_match(content) if content else ""
+
+        # 按 segment_id 或 content_hash 匹配
+        if (expected_id and seg_id == expected_id) or \
+           (expected_hash and content_hash and content_hash == expected_hash):
+            hit_position = rank + 1
+            break
+
+    t1 = 1 if hit_position is not None and hit_position <= 1 else 0
+    t3 = 1 if hit_position is not None and hit_position <= 3 else 0
+    t5 = 1 if hit_position is not None and hit_position <= 5 else 0
+
+    reason = f"chunk_exact 匹配: {'命中 Top' + str(hit_position) if hit_position else '未命中'}"
+    if hit_position:
+        reason += f" (expected_id={expected_id[:12]}...)" if expected_id else ""
+        reason += f" (expected_hash={expected_hash[:12]}...)" if expected_hash and not expected_id else ""
+
+    return {
+        "retrieval_top1_hit": t1,
+        "retrieval_top3_hit": t3,
+        "retrieval_top5_hit": t5,
+        "hit_evidence_position": hit_position,
+        "reason": reason,
+        "_rule_name": "chunk_exact_match",
+    }
+
+
 def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout=60):
     """Judge a single sample. Returns a dict with scores or error info."""
     trace_id = sample.get("trace_id", "unknown")
@@ -478,6 +560,12 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
         result["answer_correct"] = 0
         result["not_evaluable_reason"] = "检索评测题缺少金标准证据（source_excerpt 和 reference_answer 均为空）"
         result["reason"] = "不可评测：缺少金标准证据，无法可靠计算检索命中率"
+        return result
+
+    # chunk_exact 轨道：纯机器判定，不调用 LLM
+    if evaluation_track == TRACK_CHUNK_EXACT:
+        chunk_exact_result = _judge_chunk_exact(sample)
+        result.update(chunk_exact_result)
         return result
 
     try:
@@ -529,7 +617,9 @@ def judge_all(samples, api_key, base_url, model, progress_callback=None,
 
     # 元数据字段列表（需要从 sample 透传到 result）
     META_KEYS = ("run_id", "config_id", "question_id", "question_set_id", "question_set_name",
-                 "source_file_name", "source_format")
+                 "source_file_name", "source_format",
+                 "expected_segment_id", "expected_content_hash",
+                 "dataset_id", "document_id", "snapshot_id", "target_label")
 
     _CACHE_EXCLUDE = {
         "trace_id", "question", "question_mode",
@@ -897,6 +987,10 @@ def pre_screen(sample):
                 "not_evaluable_reason": "检索评测题缺少金标准证据",
                 "reason": "不可评测：缺少金标准证据，无法可靠计算检索命中率"}
 
+    # chunk_exact 轨道：纯机器判定，直接返回
+    if evaluation_track == TRACK_CHUNK_EXACT:
+        return _judge_chunk_exact(sample)
+
     # 无问题 → 无法评测
     if not question:
         return {"retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
@@ -949,6 +1043,7 @@ def compute_metrics(results):
     strict_qa_tracks = [r for r in valid if r.get("evaluation_track") == TRACK_STRICT_QA]
     grounded_qa_tracks = [r for r in valid if r.get("evaluation_track") == TRACK_GROUNDED_QA]
     not_evaluable_tracks = [r for r in valid if r.get("evaluation_track") == TRACK_NOT_EVALUABLE]
+    chunk_exact_tracks = [r for r in valid if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
 
     # 检索评测指标（仅有金标准证据的）
     retrieval_evaluable = [r for r in retrieval_tracks if r.get("retrieval_evaluable", True)]
@@ -962,6 +1057,9 @@ def compute_metrics(results):
 
     # 不可评测样本数
     not_evaluable_n = len(not_evaluable_tracks)
+
+    # chunk_exact 精确匹配指标
+    chunk_exact_n = len(chunk_exact_tracks)
 
     # 兼容旧版指标（混合口径，仅供参考）
     valid_n = len(valid)
@@ -989,6 +1087,12 @@ def compute_metrics(results):
         # 合理性问答指标
         "grounded_qa_track_count": grounded_qa_n,
         "grounded_qa_answer_rate": sum(r.get("answer_correct", 0) for r in grounded_qa_tracks) / grounded_qa_n if grounded_qa_n else None,
+
+        # chunk_exact 精确匹配指标（单独统计，不混入口径）
+        "chunk_exact_track_count": chunk_exact_n,
+        "chunk_exact_top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
+        "chunk_exact_top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
+        "chunk_exact_top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
 
         # 兼容旧版（混合口径，仅供参考）
         "with_ref_count": with_ref_n,

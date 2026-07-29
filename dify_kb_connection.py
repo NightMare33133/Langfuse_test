@@ -104,6 +104,7 @@ def create_kb_profile(
         "profile_name": profile_name,
         "base_url": base_url,
         "key_masked": mask_api_key(api_key),
+        "key_source": "keyring",
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
     }
@@ -114,6 +115,53 @@ def create_kb_profile(
 
     # 保存 API Key 到 keyring
     _store_api_key(profile_id, api_key)
+
+    return metadata
+
+
+def create_kb_profile_from_env(
+    profile_name: str,
+    base_url: str,
+    env_var_name: str = "DIFY_DATASET_API_KEY",
+) -> dict:
+    """从环境变量创建知识库连接配置（不保存 Key 明文）。
+
+    元数据中记录 key_source="env:{env_var_name}"，
+    运行时从 os.getenv 读取 Key。
+
+    Args:
+        profile_name: 配置名称
+        base_url: Dify API Base URL
+        env_var_name: 环境变量名
+
+    Returns:
+        dict: 配置元数据
+    """
+    import os
+    api_key = os.getenv(env_var_name, "")
+    if not api_key:
+        raise ValueError(f"环境变量 {env_var_name} 未设置")
+
+    ok, err = validate_dataset_key(api_key)
+    if not ok:
+        raise ValueError(f"环境变量 {env_var_name} 无效: {err}")
+
+    CONNECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    profile_id = _generate_profile_id(profile_name)
+
+    metadata = {
+        "profile_id": profile_id,
+        "profile_name": profile_name,
+        "base_url": base_url,
+        "key_masked": mask_api_key(api_key),
+        "key_source": f"env:{env_var_name}",
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    # 仅保存元数据，不保存 Key 到 keyring（从环境变量读取）
+    meta_path = CONNECTIONS_DIR / f"{profile_id}.json"
+    meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return metadata
 
@@ -206,7 +254,19 @@ def delete_kb_profile(profile_id: str) -> bool:
 
 
 def get_kb_api_key(profile_id: str) -> str:
-    """从安全存储读取 API Key。仅在内存中使用，不序列化。"""
+    """从安全存储读取 API Key。仅在内存中使用，不序列化。
+
+    支持两种来源：
+    - keyring 存储的 Key（key_source="keyring" 或无 key_source）
+    - 环境变量引用（key_source="env:VAR_NAME"）
+    """
+    import os
+    metadata = load_kb_profile(profile_id)
+    if metadata:
+        key_source = metadata.get("key_source", "")
+        if key_source.startswith("env:"):
+            env_var = key_source[4:]
+            return os.getenv(env_var, "")
     return _read_api_key(profile_id)
 
 

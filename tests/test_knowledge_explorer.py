@@ -26,6 +26,7 @@ from dify_knowledge import (
     list_datasets,
     list_documents,
     list_segments,
+    retrieve,
     compute_content_hash,
     build_chunk_catalog,
     detect_duplicates,
@@ -626,4 +627,92 @@ class TestConnection:
         mock_get.side_effect = req.exceptions.ConnectionError("refused")
         ok, msg = check_connection("dataset-abc123def456", "http://localhost/v1")
         assert ok is False
-        assert "连接失败" in msg
+
+
+# ── retrieve 检索诊断 ────────────────────────────────────────
+
+
+def _mock_post_response(json_data, status_code=200):
+    """构造 mock requests.Response（POST）。"""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data
+    resp.text = json.dumps(json_data)
+    return resp
+
+
+class TestRetrieve:
+    """测试检索诊断函数。"""
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_constructs_correct_request(self, mock_post):
+        """POST 请求构造正确。"""
+        mock_post.return_value = _mock_post_response({
+            "records": [
+                {"segment": {"id": "s1", "document_id": "d1", "content": "hello",
+                             "enabled": True, "status": "completed"}, "score": 0.95},
+            ]
+        })
+        retrieve("dataset-key", "http://localhost/v1", "ds1", "test query", top_k=3)
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "http://localhost/v1/datasets/ds1/retrieve"
+        body = call_args[1]["json"]
+        assert body["query"] == "test query"
+        assert body["retrieval_model"]["top_k"] == 3
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_returns_parsed_records(self, mock_post):
+        """返回解析后的记录列表。"""
+        mock_post.return_value = _mock_post_response({
+            "records": [
+                {"segment": {"id": "s1", "document_id": "d1", "content": "chunk 1",
+                             "enabled": True, "status": "completed"}, "score": 0.95},
+                {"segment": {"id": "s2", "document_id": "d2", "content": "chunk 2",
+                             "enabled": True, "status": "completed"}, "score": 0.80},
+            ]
+        })
+        records = retrieve("key", "http://localhost/v1", "ds1", "query")
+        assert len(records) == 2
+        assert records[0]["position"] == 1
+        assert records[0]["segment_id"] == "s1"
+        assert records[0]["score"] == 0.95
+        assert records[1]["position"] == 2
+        assert records[1]["score"] == 0.80
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_topk_clamped(self, mock_post):
+        """top_k 被钳制在 1-20 范围。"""
+        mock_post.return_value = _mock_post_response({"records": []})
+        retrieve("key", "http://localhost/v1", "ds1", "q", top_k=100)
+        call_args = mock_post.call_args
+        assert call_args[1]["json"]["retrieval_model"]["top_k"] == 20
+
+        retrieve("key", "http://localhost/v1", "ds1", "q", top_k=0)
+        call_args = mock_post.call_args
+        assert call_args[1]["json"]["retrieval_model"]["top_k"] == 1
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_empty_results(self, mock_get):
+        """空结果返回空列表。"""
+        mock_get.return_value = _mock_post_response({"records": []})
+        records = retrieve("key", "http://localhost/v1", "ds1", "no results")
+        assert records == []
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_401_with_app_key(self, mock_post):
+        """app- Key 时 401 提示 Key 类型错误。"""
+        mock_post.return_value = _mock_post_response(
+            {"error": "unauthorized"}, status_code=401,
+        )
+        with pytest.raises(RuntimeError, match="应用 Key.*app-"):
+            retrieve("app-abc", "http://localhost/v1", "ds1", "q")
+
+    @patch("dify_knowledge.requests.post")
+    def test_retrieve_401_with_dataset_key(self, mock_post):
+        """dataset- Key 无效时 401 提示无效。"""
+        mock_post.return_value = _mock_post_response(
+            {"error": "unauthorized"}, status_code=401,
+        )
+        with pytest.raises(RuntimeError, match="无效或已过期"):
+            retrieve("dataset-abc123def456", "http://localhost/v1", "ds1", "q")

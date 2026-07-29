@@ -5,6 +5,7 @@ Dify 知识库探索模块 — 只读 API 封装。
 - 列出知识库（datasets）
 - 列出文档（documents）
 - 列出分块（segments），支持 status 过滤和分页
+- 检索诊断（retrieve）：对知识库执行语义检索，查看排名和命中
 - 内容规范化 SHA-256 哈希（用于重复分块检测）
 - 生成 chunk catalog snapshot
 - 导出 JSON / CSV
@@ -98,6 +99,42 @@ def check_connection(api_key: str, base_url: str, timeout: int = 10) -> tuple[bo
         return False, str(exc)
 
 
+# ── HTTP POST ─────────────────────────────────────────────────
+
+
+def _post(api_key: str, base_url: str, path: str, body: dict = None,
+          timeout: int = 30) -> dict:
+    """发起 POST 请求并返回 JSON 响应（仅用于 retrieve 诊断）。"""
+    url = base_url.rstrip("/") + path
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body or {}, timeout=timeout)
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"请求超时 ({timeout}s): {path}")
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(f"连接失败: {path} — 请检查 Base URL 是否正确且服务可达") from exc
+
+    if resp.status_code != 200:
+        if resp.status_code == 401:
+            if not api_key:
+                raise RuntimeError("缺少知识库 API Key（DIFY_DATASET_API_KEY 未设置）")
+            if api_key.startswith("app-"):
+                raise RuntimeError(
+                    f"认证失败 (401): 当前使用的是应用 Key（app-...），"
+                    f"知识库 API 需要 dataset- 开头的知识库专用 Key。"
+                )
+            raise RuntimeError(f"认证失败 (401): 知识库 API Key 无效或已过期。")
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"JSON 解析失败: {resp.text[:200]}") from exc
+
+
 # ── 知识库 API ────────────────────────────────────────────────
 
 
@@ -166,6 +203,52 @@ def list_segments(api_key: str, base_url: str, dataset_id: str,
     has_more = data.get("has_more", False)
     total = data.get("total", 0)
     return {"data": segments, "has_more": has_more, "total": total}
+
+
+def retrieve(api_key: str, base_url: str, dataset_id: str, query: str,
+             top_k: int = 5, timeout: int = 30) -> list[dict]:
+    """检索诊断：对指定知识库执行语义检索，返回排序后的 chunk 列表。
+
+    调用 POST /datasets/{dataset_id}/retrieve。
+    仅用于诊断，结果不写入任何 run/judge 指标。
+
+    Args:
+        api_key: Dataset API Key（dataset- 开头）
+        base_url: API Base URL
+        dataset_id: 知识库 ID
+        query: 检索查询文本
+        top_k: 返回结果数量（1-20）
+        timeout: 超时秒数
+
+    Returns:
+        list[dict]: 每条包含 position, segment_id, document_id, score, content, enabled, status
+    """
+    top_k = max(1, min(top_k, 20))
+    body = {
+        "query": query,
+        "retrieval_model": {
+            "search_method": "semantic_search",
+            "top_k": top_k,
+        },
+    }
+    data = _post(api_key, base_url, f"/datasets/{dataset_id}/retrieve",
+                 body=body, timeout=timeout)
+
+    records = []
+    query_result = data.get("query", {})
+    results_list = data.get("records", []) or data.get("data", [])
+    for i, rec in enumerate(results_list):
+        seg = rec.get("segment", {}) if isinstance(rec.get("segment"), dict) else rec
+        records.append({
+            "position": i + 1,
+            "segment_id": seg.get("id", rec.get("id", "")),
+            "document_id": seg.get("document_id", rec.get("document_id", "")),
+            "score": rec.get("score", seg.get("score", 0)),
+            "content": seg.get("content", rec.get("content", "")),
+            "enabled": seg.get("enabled", rec.get("enabled", True)),
+            "status": seg.get("status", rec.get("status", "")),
+        })
+    return records
 
 
 # ── 内容哈希与重复检测 ────────────────────────────────────────

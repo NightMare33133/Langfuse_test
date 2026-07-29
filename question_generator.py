@@ -1057,7 +1057,7 @@ def generate_questions(content, api_key, base_url, model,
 
 def save_questions(questions, filename=None, question_set_id=None,
                    question_set_name=None, source_document_name=None,
-                   question_mode=None):
+                   question_mode=None, evaluation_type=None):
     """Save questions to JSONL file in data/questions/.
 
     Args:
@@ -1118,6 +1118,7 @@ def save_questions(questions, filename=None, question_set_id=None,
         "question_set_id": question_set_id,
         "question_set_name": question_set_name or "未命名题集",
         "question_mode": question_mode or "",
+        "evaluation_type": evaluation_type or "",
         "source_document_name": source_document_name or "",
         "question_count": len(questions),
         "created_at": datetime.now().isoformat(),
