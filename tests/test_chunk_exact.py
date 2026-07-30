@@ -13,6 +13,7 @@ chunk_exact 题集创建 + 评测测试。
 import json
 import sys
 import hashlib
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -26,10 +27,14 @@ from chunk_exact_questions import (
     generate_chunk_exact_questions,
     validate_chunk_exact_question,
     validate_chunk_exact_set,
+    sample_candidates_random,
+    get_candidates_by_documents,
+    generate_default_set_name,
 )
 from judge import (
     classify_evaluation_track, _judge_chunk_exact, compute_metrics,
-    TRACK_CHUNK_EXACT, TRACK_RETRIEVAL,
+    build_result_status,
+    TRACK_CHUNK_EXACT, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE,
 )
 
 
@@ -37,7 +42,7 @@ from judge import (
 
 
 def _make_catalog_entry(segment_id, content, status="completed", enabled=True,
-                        dataset_id="ds1", document_id="doc1"):
+                        dataset_id="ds1", document_id="doc1", document_name=""):
     """构造 catalog entry。"""
     return {
         "segment_id": segment_id,
@@ -209,6 +214,7 @@ class TestChunkExactJudge:
         sample = {
             "expected_segment_id": "s1",
             "expected_content_hash": "",
+            "trace_id": "real_trace_123",
             "retrieval_results": [
                 {"segment_id": "s1", "content": "内容"},
                 {"segment_id": "s2", "content": "其他"},
@@ -225,6 +231,7 @@ class TestChunkExactJudge:
         sample = {
             "expected_segment_id": "s3",
             "expected_content_hash": "",
+            "trace_id": "real_trace_123",
             "retrieval_results": [
                 {"segment_id": "s1", "content": "a"},
                 {"segment_id": "s2", "content": "b"},
@@ -238,10 +245,11 @@ class TestChunkExactJudge:
         assert result["hit_evidence_position"] == 3
 
     def test_no_hit(self):
-        """未命中时全部为 0。"""
+        """未命中时全部为 0（有检索结果但不匹配）。"""
         sample = {
             "expected_segment_id": "s999",
             "expected_content_hash": "",
+            "trace_id": "real_trace_123",
             "retrieval_results": [
                 {"segment_id": "s1", "content": "a"},
             ],
@@ -259,6 +267,7 @@ class TestChunkExactJudge:
         sample = {
             "expected_segment_id": "",
             "expected_content_hash": expected_hash,
+            "trace_id": "real_trace_123",
             "retrieval_results": [
                 {"segment_id": "other", "content": content},
             ],
@@ -267,27 +276,30 @@ class TestChunkExactJudge:
         assert result["retrieval_top1_hit"] == 1
         assert result["hit_evidence_position"] == 1
 
-    def test_empty_results(self):
-        """无检索结果时全部为 0。"""
+    def test_empty_results_fail_closed(self):
+        """无检索结果时 fail-closed，返回 None 而非 0。"""
         sample = {
             "expected_segment_id": "s1",
             "expected_content_hash": "",
+            "trace_id": "real_trace_123",
             "retrieval_results": [],
         }
         result = _judge_chunk_exact(sample)
-        assert result["retrieval_top1_hit"] == 0
-        assert "无检索结果" in result["reason"]
+        assert result["retrieval_top1_hit"] is None
+        assert result["chunk_exact_status"] == "no_retrieval"
+        assert result["retrieval_evaluable"] is False
 
-    def test_no_expected_id_or_hash(self):
-        """缺少 expected_id 和 expected_hash 时全部为 0。"""
+    def test_no_expected_id_or_hash_fail_closed(self):
+        """缺少 expected_id 和 expected_hash 时 fail-closed。"""
         sample = {
             "expected_segment_id": "",
             "expected_content_hash": "",
+            "trace_id": "real_trace_123",
             "retrieval_results": [{"segment_id": "s1", "content": "a"}],
         }
         result = _judge_chunk_exact(sample)
-        assert result["retrieval_top1_hit"] == 0
-        assert "缺少" in result["reason"]
+        assert result["retrieval_top1_hit"] is None
+        assert result["chunk_exact_status"] == "missing_binding"
 
 
 # ── classify_evaluation_track ────────────────────────────────
@@ -533,3 +545,220 @@ class TestQuestionFieldCompleteness:
         # 校验绑定完整性
         ok, errors = validate_chunk_exact_question(q)
         assert ok is True, f"绑定不完整: {errors}"
+
+
+# ── sample_candidates_random ─────────────────────────────────
+
+
+class TestRandomSampling:
+    """测试随机抽样逻辑。"""
+
+    def test_basic_sampling(self):
+        """基本随机抽样。"""
+        candidates = [
+            _make_catalog_entry(f"s{i}", f"内容{i}，足够长以通过过滤检查验证。")
+            for i in range(20)
+        ]
+        sampled, count, capped = sample_candidates_random(candidates, 5, seed=42)
+        assert count == 5
+        assert len(sampled) == 5
+        assert capped is False
+
+    def test_no_duplicates(self):
+        """抽样结果无重复。"""
+        candidates = [
+            _make_catalog_entry(f"s{i}", f"内容{i}，足够长以通过过滤检查验证。")
+            for i in range(10)
+        ]
+        sampled, count, capped = sample_candidates_random(candidates, 10, seed=42)
+        ids = [s["segment_id"] for s in sampled]
+        assert len(ids) == len(set(ids))
+
+    def test_capped_when_exceed(self):
+        """数量超过可用时截断。"""
+        candidates = [
+            _make_catalog_entry(f"s{i}", f"内容{i}，足够长以通过过滤检查验证。")
+            for i in range(3)
+        ]
+        sampled, count, capped = sample_candidates_random(candidates, 10, seed=42)
+        assert count == 3
+        assert capped is True
+        assert len(sampled) == 3
+
+    def test_filter_by_document_ids(self):
+        """按文档 ID 过滤后抽样。"""
+        candidates = [
+            _make_catalog_entry("s0", "内容0，足够长以通过过滤检查验证。", document_id="docA"),
+            _make_catalog_entry("s1", "内容1，足够长以通过过滤检查验证。", document_id="docA"),
+            _make_catalog_entry("s2", "内容2，足够长以通过过滤检查验证。", document_id="docB"),
+        ]
+        sampled, count, capped = sample_candidates_random(
+            candidates, 5, document_ids=["docA"], seed=42
+        )
+        assert count == 2
+        assert all(s["document_id"] == "docA" for s in sampled)
+
+    def test_seed_reproducibility(self):
+        """相同 seed 产生相同结果。"""
+        candidates = [
+            _make_catalog_entry(f"s{i}", f"内容{i}，足够长以通过过滤检查验证。")
+            for i in range(20)
+        ]
+        s1, _, _ = sample_candidates_random(candidates, 5, seed=123)
+        s2, _, _ = sample_candidates_random(candidates, 5, seed=123)
+        assert [s["segment_id"] for s in s1] == [s["segment_id"] for s in s2]
+
+    def test_empty_candidates(self):
+        """空候选返回空列表。"""
+        sampled, count, capped = sample_candidates_random([], 5)
+        assert sampled == []
+        assert count == 0
+
+    def test_get_candidates_by_documents(self):
+        """按文档 ID 过滤候选。"""
+        candidates = [
+            _make_catalog_entry("s0", "内容0，足够长。", document_id="docA"),
+            _make_catalog_entry("s1", "内容1，足够长。", document_id="docB"),
+            _make_catalog_entry("s2", "内容2，足够长。", document_id="docA"),
+        ]
+        filtered = get_candidates_by_documents(candidates, ["docA"])
+        assert len(filtered) == 2
+        assert all(c["document_id"] == "docA" for c in filtered)
+
+
+# ── generate_default_set_name ────────────────────────────────
+
+
+class TestDefaultSetName:
+    """测试默认题集名称生成。"""
+
+    def test_single_document_name(self):
+        """单文档：{原文件名去扩展名}-随机题集-{YYYYMMDD}。"""
+        name = generate_default_set_name(["产品手册.pdf"], mode="random")
+        assert name.startswith("产品手册-随机题集-")
+        assert name.endswith(datetime.now().strftime("%Y%m%d"))
+
+    def test_single_document_strip_extension(self):
+        """去掉常见扩展名。"""
+        for ext in [".txt", ".md", ".docx", ".xlsx", ".pdf", ".csv"]:
+            name = generate_default_set_name([f"文档{ext}"], mode="random")
+            assert ext not in name
+            assert "随机题集" in name
+
+    def test_multi_document_name(self):
+        """多文档：随机题集-{文档数量}份文档-{YYYYMMDD}。"""
+        name = generate_default_set_name(["doc1.txt", "doc2.txt", "doc3.txt"], mode="random")
+        assert "3份文档" in name
+        assert "随机题集" in name
+
+    def test_empty_document_names(self):
+        """空列表降级。"""
+        name = generate_default_set_name([], mode="random")
+        assert "随机题集" in name
+
+    def test_manual_mode(self):
+        """手动模式返回 chunk_exact_ 前缀。"""
+        name = generate_default_set_name(["任意"], mode="manual")
+        assert name.startswith("chunk_exact_")
+
+
+# ── chunk_exact fail-closed ──────────────────────────────────
+
+
+class TestChunkExactFailClosed:
+    """测试 chunk_exact 的 fail-closed 逻辑。"""
+
+    def test_no_binding_marks_not_evaluable(self):
+        """缺少 expected 标记为不可评测，不写入 miss。"""
+        sample = {"question_mode": "chunk_exact", "question": "q",
+                  "trace_id": "real_trace_123"}
+        result = _judge_chunk_exact(sample)
+        assert result["retrieval_top1_hit"] is None
+        assert result["retrieval_evaluable"] is False
+        assert result["chunk_exact_status"] == "missing_binding"
+
+    def test_no_trace_marks_not_evaluable(self):
+        """未关联真实 trace 标记为不可评测。"""
+        sample = {"question_mode": "chunk_exact", "question": "q",
+                  "expected_segment_id": "seg1", "expected_content_hash": "h1",
+                  "trace_id": "batch_qa_0_123"}
+        result = _judge_chunk_exact(sample)
+        assert result["retrieval_top1_hit"] is None
+        assert result["chunk_exact_status"] == "no_trace"
+
+    def test_no_retrieval_marks_not_evaluable(self):
+        """无检索结果标记为不可评测。"""
+        sample = {"question_mode": "chunk_exact", "question": "q",
+                  "expected_segment_id": "seg1", "expected_content_hash": "h1",
+                  "trace_id": "real_trace_123",
+                  "retrieval_results": []}
+        result = _judge_chunk_exact(sample)
+        assert result["retrieval_top1_hit"] is None
+        assert result["chunk_exact_status"] == "no_retrieval"
+
+    def test_with_retrieval_evaluates_normally(self):
+        """有检索结果时正常判定。"""
+        sample = {"question_mode": "chunk_exact", "question": "q",
+                  "expected_segment_id": "seg1", "expected_content_hash": "h1",
+                  "trace_id": "real_trace_123",
+                  "retrieval_results": [
+                      {"segment_id": "seg1", "content": "hello"},
+                      {"segment_id": "seg2", "content": "world"},
+                  ]}
+        result = _judge_chunk_exact(sample)
+        assert result["retrieval_top1_hit"] == 1
+        assert result["chunk_exact_status"] == ""
+
+
+# ── Mixed tracks regression ─────────────────────────────────
+
+
+class TestMixedTracksRegression:
+    """测试混合轨道统计不崩溃。"""
+
+    def test_mixed_tracks_no_key_error(self):
+        """混合 retrieval / chunk_exact / legacy 不触发 KeyError。"""
+        results = [
+            {"evaluation_track": TRACK_RETRIEVAL, "retrieval_top1_hit": 1,
+             "retrieval_top3_hit": 1, "retrieval_top5_hit": 1, "retrieval_evaluable": True},
+            {"evaluation_track": TRACK_CHUNK_EXACT, "retrieval_top1_hit": 1,
+             "retrieval_top3_hit": 1, "retrieval_top5_hit": 1},
+            {"evaluation_track": TRACK_STRICT_QA, "answer_correct": 1},
+            {"evaluation_track": TRACK_GROUNDED_QA, "answer_correct": 0},
+            {"evaluation_track": TRACK_NOT_EVALUABLE, "retrieval_top1_hit": 0,
+             "retrieval_top3_hit": 0, "retrieval_top5_hit": 0},
+        ]
+        metrics = compute_metrics(results)
+        assert metrics["total"] == 5
+        assert metrics["chunk_exact_track_count"] == 1
+        assert metrics["retrieval_track_count"] == 1
+
+    def test_chunk_exact_none_excluded_from_hit_rate(self):
+        """chunk_exact 中 None 值不影响命中率计算。"""
+        results = [
+            {"evaluation_track": TRACK_CHUNK_EXACT, "retrieval_top1_hit": 1,
+             "retrieval_top3_hit": 1, "retrieval_top5_hit": 1},
+            {"evaluation_track": TRACK_CHUNK_EXACT, "retrieval_top1_hit": None,
+             "retrieval_top3_hit": None, "retrieval_top5_hit": None,
+             "chunk_exact_status": "no_retrieval"},
+        ]
+        metrics = compute_metrics(results)
+        assert metrics["chunk_exact_track_count"] == 2
+        assert metrics["chunk_exact_evaluable_count"] == 1
+        assert metrics["chunk_exact_top1_hit_rate"] == 1.0  # only the evaluable one
+
+    def test_legacy_missing_evaluation_type(self):
+        """历史数据缺少 evaluation_type 按 legacy 兼容。"""
+        sample = {"question": "test", "question_mode": ""}
+        track = classify_evaluation_track(sample)
+        assert track in (TRACK_STRICT_QA, TRACK_GROUNDED_QA)  # falls through to legacy logic
+
+    def test_chunk_exact_build_result_status(self):
+        """chunk_exact 各状态的 build_result_status 不崩溃。"""
+        for ce_status in ["missing_binding", "no_trace", "no_retrieval", ""]:
+            result = {"evaluation_track": TRACK_CHUNK_EXACT,
+                      "chunk_exact_status": ce_status,
+                      "retrieval_top1_hit": 1, "retrieval_top3_hit": 1, "retrieval_top5_hit": 1}
+            status = build_result_status(result)
+            assert "icon" in status
+            assert "title" in status

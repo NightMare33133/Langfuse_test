@@ -268,17 +268,19 @@ def compute_content_hash(content: str) -> str:
 
 def build_chunk_catalog(segments: list[dict],
                         dataset_id: str = "",
-                        document_id: str = "") -> list[dict]:
+                        document_id: str = "",
+                        document_name: str = "") -> list[dict]:
     """将原始 segments 转为标准化 chunk catalog。
 
     每条记录包含：
-    segment_id, position, document_id, content, index_node_id,
+    segment_id, position, document_id, document_name, content, index_node_id,
     index_node_hash, tokens, word_count, enabled, status, content_hash
 
     Args:
         segments: Dify API 返回的 segment 列表
         dataset_id: 知识库 ID（可选，记入每条记录）
         document_id: 文档 ID（可选，记入每条记录）
+        document_name: 文档名称（可选，记入每条记录）
     """
     catalog = []
     for seg in segments:
@@ -293,6 +295,7 @@ def build_chunk_catalog(segments: list[dict],
             "segment_id": seg.get("id", ""),
             "position": position,
             "document_id": document_id or seg.get("document_id", ""),
+            "document_name": document_name or seg.get("document_name", ""),
             "dataset_id": dataset_id,
             "content": content,
             "index_node_id": seg.get("index_node_id", ""),

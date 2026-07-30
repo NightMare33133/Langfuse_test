@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -181,7 +182,17 @@ def build_result_status(result):
             "description": "无法可靠计算检索命中率",
         }
     elif track == TRACK_CHUNK_EXACT:
-        # 精确匹配：显示 TopK 命中状态（与 retrieval 相同格式）
+        # 精确匹配：显示 TopK 命中状态；fail-closed 时显示待修复
+        ce_status = result.get("chunk_exact_status", "")
+        if ce_status == "missing_binding":
+            return {"icon": "⚠️", "title": "缺少绑定", "status": "chunk_exact_pending",
+                    "description": "chunk_exact 题缺少 expected_segment_id / expected_content_hash"}
+        if ce_status == "no_trace":
+            return {"icon": "⚠️", "title": "未关联 trace", "status": "chunk_exact_pending",
+                    "description": "chunk_exact 题未关联真实 Langfuse trace"}
+        if ce_status == "no_retrieval":
+            return {"icon": "⚠️", "title": "无检索结果", "status": "chunk_exact_pending",
+                    "description": "trace 已关联但无检索结果，无法判定"}
         parts = []
         if t1 is not None:
             parts.append(f"Top1 {'命中' if t1 else '未命中'}")
@@ -189,7 +200,7 @@ def build_result_status(result):
             parts.append(f"Top3 {'命中' if t3 else '未命中'}")
         if t5 is not None:
             parts.append(f"Top5 {'命中' if t5 else '未命中'}")
-        hit_summary = "｜".join(parts) if parts else "无检索结果"
+        hit_summary = "｜".join(parts) if parts else "待判定"
         return {
             "icon": "🎯",
             "title": hit_summary,
@@ -480,23 +491,38 @@ def _judge_chunk_exact(sample):
     """chunk_exact 轨道纯机器判定：按 segment_id / content_hash 匹配。
 
     不调用 LLM，完全确定性判定。
+    fail-closed：缺少绑定或无检索结果时标记为不可评测，不写入 miss。
     """
     expected_id = (sample.get("expected_segment_id") or "").strip()
     expected_hash = (sample.get("expected_content_hash") or "").strip()
     retrieval_results = sample.get("retrieval_results") or []
+    trace_id = (sample.get("trace_id") or "").strip()
 
     if not expected_id and not expected_hash:
         return {
-            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
-            "retrieval_top5_hit": 0, "hit_evidence_position": None,
+            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
+            "retrieval_top5_hit": None, "hit_evidence_position": None,
             "reason": "chunk_exact 题缺少 expected_segment_id 和 expected_content_hash",
+            "chunk_exact_status": "missing_binding",
+            "retrieval_evaluable": False,
+        }
+
+    if not trace_id or trace_id.startswith("batch_qa_"):
+        return {
+            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
+            "retrieval_top5_hit": None, "hit_evidence_position": None,
+            "reason": "chunk_exact 题未关联真实 Langfuse trace",
+            "chunk_exact_status": "no_trace",
+            "retrieval_evaluable": False,
         }
 
     if not retrieval_results:
         return {
-            "retrieval_top1_hit": 0, "retrieval_top3_hit": 0,
-            "retrieval_top5_hit": 0, "hit_evidence_position": None,
-            "reason": "无检索结果",
+            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
+            "retrieval_top5_hit": None, "hit_evidence_position": None,
+            "reason": "trace 已关联但无检索结果，chunk_exact 无法判定",
+            "chunk_exact_status": "no_retrieval",
+            "retrieval_evaluable": False,
         }
 
     hit_position = None
@@ -527,6 +553,8 @@ def _judge_chunk_exact(sample):
         "hit_evidence_position": hit_position,
         "reason": reason,
         "_rule_name": "chunk_exact_match",
+        "chunk_exact_status": "",
+        "retrieval_evaluable": True,
     }
 
 
@@ -583,6 +611,79 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
         result["error"] = str(e)
 
     return result
+
+
+def write_chunk_exact_retry_artifacts(samples, processed_path, judged_path,
+                                      source_snapshot_id: str,
+                                      retry_of: str = "missing_binding") -> dict:
+    """Write a new, self-contained chunk_exact retry, never altering history.
+
+    This is deliberately local and machine-only.  It rejects pseudo traces,
+    incomplete bindings and missing retrieval evidence before writing either
+    output, so a retry artifact is formally usable by construction.
+    """
+    selected = [
+        sample for sample in samples
+        if classify_evaluation_track(sample) == TRACK_CHUNK_EXACT
+    ]
+    errors = []
+    for sample in selected:
+        trace_id = str(sample.get("trace_id") or "")
+        if not trace_id or trace_id.startswith("batch_qa_"):
+            errors.append(f"{sample.get('question_id') or trace_id}: not a real Langfuse trace")
+        if not (sample.get("expected_segment_id") or sample.get("expected_content_hash")):
+            errors.append(f"{sample.get('question_id') or trace_id}: missing binding")
+        if not sample.get("retrieval_results"):
+            errors.append(f"{sample.get('question_id') or trace_id}: missing retrieval")
+    if not selected:
+        raise ValueError("没有 chunk_exact 样本可创建重试产物")
+    if errors:
+        raise ValueError("拒绝创建不完整 chunk_exact 重试产物: " + "; ".join(errors))
+
+    processed_path = Path(processed_path)
+    judged_path = Path(judged_path)
+    if processed_path.exists() or judged_path.exists():
+        raise FileExistsError("重试产物路径已存在，拒绝覆盖历史或已有重试")
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    retry_samples = []
+    retry_results = []
+    for sample in selected:
+        retry_sample = dict(sample)
+        retry_sample.update({
+            "retry_of": retry_of,
+            "source_snapshot_id": source_snapshot_id,
+            "retry_created_at": timestamp,
+        })
+        retry_samples.append(retry_sample)
+        result = judge_sample(retry_sample, "", "", "")
+        for field in (
+            "expected_segment_id", "expected_content_hash", "dataset_id",
+            "document_id", "snapshot_id", "target_label", "evaluation_type",
+            "binding_source", "binding_recovery_verified",
+        ):
+            if retry_sample.get(field) not in (None, ""):
+                result[field] = retry_sample[field]
+        result.update({
+            "retry_of": retry_of,
+            "source_snapshot_id": source_snapshot_id,
+            "retry_created_at": timestamp,
+        })
+        if not result.get("retrieval_evaluable"):
+            raise ValueError("内部校验失败：重试样本未成为可评测 chunk_exact")
+        retry_results.append(result)
+
+    for path, rows in ((processed_path, retry_samples), (judged_path, retry_results)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return {
+        "processed_path": str(processed_path),
+        "judged_path": str(judged_path),
+        "sample_count": len(retry_samples),
+        "metrics": compute_chunk_exact_metrics(retry_results),
+    }
 
 
 def judge_all(samples, api_key, base_url, model, progress_callback=None,
@@ -1089,21 +1190,91 @@ def compute_metrics(results):
         "grounded_qa_answer_rate": sum(r.get("answer_correct", 0) for r in grounded_qa_tracks) / grounded_qa_n if grounded_qa_n else None,
 
         # chunk_exact 精确匹配指标（单独统计，不混入口径）
+        # 仅统计 retrieval_evaluable=True 的结果，排除未关联 trace / 无检索 / 缺绑定
         "chunk_exact_track_count": chunk_exact_n,
-        "chunk_exact_top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
-        "chunk_exact_top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
-        "chunk_exact_top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_tracks) / chunk_exact_n if chunk_exact_n else None,
+        "chunk_exact_evaluable_count": sum(1 for r in chunk_exact_tracks if r.get("retrieval_evaluable", True) and r.get("retrieval_top1_hit") is not None),
+        "chunk_exact_top1_hit_rate": (
+            sum(r["retrieval_top1_hit"] for r in chunk_exact_tracks if r.get("retrieval_top1_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top1_hit") is not None)
+            if any(r.get("retrieval_top1_hit") is not None for r in chunk_exact_tracks) else None
+        ),
+        "chunk_exact_top3_hit_rate": (
+            sum(r["retrieval_top3_hit"] for r in chunk_exact_tracks if r.get("retrieval_top3_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top3_hit") is not None)
+            if any(r.get("retrieval_top3_hit") is not None for r in chunk_exact_tracks) else None
+        ),
+        "chunk_exact_top5_hit_rate": (
+            sum(r["retrieval_top5_hit"] for r in chunk_exact_tracks if r.get("retrieval_top5_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top5_hit") is not None)
+            if any(r.get("retrieval_top5_hit") is not None for r in chunk_exact_tracks) else None
+        ),
 
         # 兼容旧版（混合口径，仅供参考）
         "with_ref_count": with_ref_n,
         "without_ref_count": without_ref_n,
         "has_reference_data": with_ref_n > 0,
-        "top1_hit_rate": sum(r.get("retrieval_top1_hit", 0) for r in valid) / valid_n if valid_n else None,
-        "top3_hit_rate": sum(r.get("retrieval_top3_hit", 0) for r in valid) / valid_n if valid_n else None,
-        "top5_hit_rate": sum(r.get("retrieval_top5_hit", 0) for r in valid) / valid_n if valid_n else None,
+        "top1_hit_rate": (
+            sum(r["retrieval_top1_hit"] for r in valid if r.get("retrieval_top1_hit") is not None)
+            / sum(1 for r in valid if r.get("retrieval_top1_hit") is not None)
+            if any(r.get("retrieval_top1_hit") is not None for r in valid) else None
+        ),
+        "top3_hit_rate": (
+            sum(r["retrieval_top3_hit"] for r in valid if r.get("retrieval_top3_hit") is not None)
+            / sum(1 for r in valid if r.get("retrieval_top3_hit") is not None)
+            if any(r.get("retrieval_top3_hit") is not None for r in valid) else None
+        ),
+        "top5_hit_rate": (
+            sum(r["retrieval_top5_hit"] for r in valid if r.get("retrieval_top5_hit") is not None)
+            / sum(1 for r in valid if r.get("retrieval_top5_hit") is not None)
+            if any(r.get("retrieval_top5_hit") is not None for r in valid) else None
+        ),
         "answer_correct_rate": sum(r.get("answer_correct", 0) for r in valid) / valid_n if valid_n else None,
         "with_ref_answer_rate": sum(r.get("answer_correct", 0) for r in with_ref) / with_ref_n if with_ref_n else None,
         "without_ref_answer_rate": sum(r.get("answer_correct", 0) for r in without_ref) / without_ref_n if without_ref_n else None,
     }
 
     return metrics
+
+
+def compute_chunk_exact_metrics(results: list[dict]) -> dict:
+    """计算 chunk_exact 的独立运行看板指标。
+
+    缺少 binding、真实 trace 或 retrieval 的样本为 fail-closed pending，
+    不计入 TopK miss，也不进入 retrieval_evidence 的跨配置口径。
+    """
+    chunk_results = [
+        result for result in results
+        if result.get("evaluation_track") == TRACK_CHUNK_EXACT
+        and "error" not in result
+    ]
+    evaluable = [
+        result for result in chunk_results
+        if result.get("retrieval_evaluable") is True
+        and result.get("retrieval_top1_hit") is not None
+    ]
+
+    def rate(field: str):
+        if not evaluable:
+            return None
+        return sum(result.get(field, 0) for result in evaluable) / len(evaluable)
+
+    return {
+        "total_count": len(chunk_results),
+        "evaluable_count": len(evaluable),
+        "missing_binding_count": sum(
+            result.get("chunk_exact_status") == "missing_binding"
+            for result in chunk_results
+        ),
+        "no_trace_count": sum(
+            result.get("chunk_exact_status") == "no_trace"
+            for result in chunk_results
+        ),
+        "no_retrieval_count": sum(
+            result.get("chunk_exact_status") == "no_retrieval"
+            for result in chunk_results
+        ),
+        "top1_hit_rate": rate("retrieval_top1_hit"),
+        "top3_hit_rate": rate("retrieval_top3_hit"),
+        "top5_hit_rate": rate("retrieval_top5_hit"),
+        "formal_usable": bool(evaluable),
+    }

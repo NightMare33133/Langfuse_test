@@ -14,6 +14,7 @@
 """
 
 import json
+import random
 import re
 import uuid
 from datetime import datetime
@@ -103,6 +104,87 @@ def filter_candidate_chunks(catalog, duplicates=None):
         "filtered": filtered_reasons,
     }
     return candidates, stats
+
+
+def get_candidates_by_documents(candidates, document_ids):
+    """按文档 ID 过滤候选 chunk。
+
+    Args:
+        candidates: filter_candidate_chunks() 返回的候选列表
+        document_ids: 要包含的文档 ID 列表
+
+    Returns:
+        过滤后的候选列表
+    """
+    if not document_ids:
+        return candidates
+    doc_set = set(document_ids)
+    return [c for c in candidates if c.get("document_id", "") in doc_set]
+
+
+def sample_candidates_random(candidates, num_questions, document_ids=None, seed=None):
+    """从候选 chunk 中无重复随机抽取 N 个。
+
+    Args:
+        candidates: filter_candidate_chunks() 返回的候选列表
+        num_questions: 需要抽取的数量
+        document_ids: 可选，限定文档 ID 列表
+        seed: 可选随机种子，用于复现
+
+    Returns:
+        (sampled, actual_count, capped)
+        sampled: 抽取后的候选列表
+        actual_count: 实际抽取数量
+        capped: bool，是否因候选不足而被截断
+    """
+    if document_ids:
+        candidates = get_candidates_by_documents(candidates, document_ids)
+
+    available = len(candidates)
+    if available == 0:
+        return [], 0, False
+
+    capped = False
+    if num_questions >= available:
+        actual_count = available
+        capped = True
+    else:
+        actual_count = num_questions
+
+    rng = random.Random(seed) if seed is not None else random
+    sampled = rng.sample(candidates, actual_count)
+    return sampled, actual_count, capped
+
+
+def generate_default_set_name(document_names, mode="random"):
+    """生成默认题集名称。
+
+    Args:
+        document_names: 文档名称列表
+        mode: "random" 或 "manual"
+
+    Returns:
+        str: 生成的名称
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    if mode == "manual":
+        return f"chunk_exact_{today}"
+
+    if not document_names:
+        return f"随机题集-{today}"
+
+    if len(document_names) == 1:
+        # 单文档：{原文件名去扩展名}-随机题集-{YYYYMMDD}
+        name = document_names[0]
+        # 去掉常见扩展名
+        for ext in (".txt", ".md", ".docx", ".xlsx", ".pdf", ".csv"):
+            if name.lower().endswith(ext):
+                name = name[:-len(ext)]
+                break
+        return f"{name}-随机题集-{today}"
+    else:
+        # 多文档：随机题集-{文档数量}份文档-{YYYYMMDD}
+        return f"随机题集-{len(document_names)}份文档-{today}"
 
 
 # ── LLM 生成检索查询 ─────────────────────────────────────────
@@ -323,7 +405,9 @@ def generate_chunk_exact_questions(
 
 
 def save_chunk_exact_questions(questions, question_set_name=None,
-                               dataset_id="", document_id="", snapshot_id=""):
+                               dataset_id="", document_id="", snapshot_id="",
+                               selection_mode="manual", selected_document_ids=None,
+                               random_seed=None):
     """保存 chunk_exact 题集。
 
     复用 question_generator.save_questions()，写入 chunk_exact 元数据。
@@ -353,6 +437,11 @@ def save_chunk_exact_questions(questions, question_set_name=None,
         manifest["snapshot_id"] = snapshot_id
         manifest["dataset_id"] = dataset_id
         manifest["document_id"] = document_id
+        manifest["selection_mode"] = selection_mode
+        if selected_document_ids:
+            manifest["selected_document_ids"] = selected_document_ids
+        if random_seed is not None:
+            manifest["random_seed"] = random_seed
         # 每题的 expected_segment_id 和 expected_content_hash 已在 question dict 中
         manifest_path.write_text(_json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

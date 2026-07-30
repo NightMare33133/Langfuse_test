@@ -29,3 +29,6 @@ data/reports/*ai_analysis*.md
 .env
 .credentials
 data/dify_connections/.credentials
+
+# Local Langfuse project cache: raw traces, observations, snapshots, provenance
+data/langfuse_projects/

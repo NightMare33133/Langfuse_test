@@ -217,3 +217,16 @@ def check_connection(host: str, public_key: str, secret_key: str) -> tuple:
         return False, "认证失败，请检查 Key"
     else:
         return False, f"HTTP {resp.status_code}"
+
+
+def identify_project_info(host: str, public_key: str, secret_key: str) -> dict:
+    """识别 Langfuse 项目信息。
+
+    Returns:
+        {"project_id", "project_name", "host", "key_masked", "total_traces"}
+
+    Raises:
+        RuntimeError: 连接失败
+    """
+    from langfuse_project import identify_project
+    return identify_project(host, public_key, secret_key)

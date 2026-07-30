@@ -13,6 +13,7 @@
 """
 
 import json
+import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -375,9 +376,75 @@ def load_question_index(questions_dir=None):
     return by_id, by_text
 
 
+def load_legacy_chunk_exact_id_index(questions_dir=None):
+    """Build a fail-closed index for legacy chunk_exact question sets.
+
+    Older question-set files predate persisted ``question_id``.  At execution
+    time those runs used ``md5(question)[:12]``; this function recovers that
+    *known historical protocol* without mutating the question set.  Entries
+    are scoped by question_set_id and a collision makes that ID unusable.
+    """
+    from pathlib import Path as _Path
+
+    if questions_dir is None:
+        questions_dir = _Path(__file__).parent / "data" / "questions"
+    else:
+        questions_dir = _Path(questions_dir)
+
+    candidates = defaultdict(dict)
+    conflicts = set()
+    if not questions_dir.exists():
+        return {}, conflicts
+
+    for path in sorted(questions_dir.glob("*.jsonl")):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        question = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (question.get("question_mode") != "chunk_exact" or
+                            question.get("question_id")):
+                        continue
+                    question_set_id = str(question.get("question_set_id") or "")
+                    question_text = (question.get("question") or "").strip()
+                    if not question_set_id or not question_text:
+                        continue
+                    question_id = hashlib.md5(
+                        question_text.encode("utf-8")).hexdigest()[:12]
+                    key = (question_set_id, question_id)
+                    existing = candidates[question_set_id].get(question_id)
+                    if existing and existing.get("question") != question_text:
+                        conflicts.add(key)
+                    else:
+                        candidates[question_set_id][question_id] = question
+        except OSError:
+            continue
+
+    for question_set_id, question_id in conflicts:
+        candidates.get(question_set_id, {}).pop(question_id, None)
+    return dict(candidates), conflicts
+
+
+def _question_set_id_for_run(run_id: str) -> str:
+    """Read only the immutable manifest to scope a legacy ID recovery."""
+    if not run_id:
+        return ""
+    manifest_path = Path(__file__).parent / "data" / "experiments" / run_id / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(manifest.get("question_set_id") or "")
+
+
 _BACKFILL_FIELDS = ("reference_answer", "source_excerpt", "difficulty", "topic", "question_id", "question_mode",
                     "question_set_id", "question_set_name",
-                    "source_format", "source_file_name", "evidence_sheet", "evidence_range")
+                    "source_format", "source_file_name", "evidence_sheet", "evidence_range",
+                    "expected_segment_id", "expected_content_hash",
+                    "dataset_id", "document_id", "snapshot_id", "target_label",
+                    "evaluation_type")
 
 
 def parse_rag_eval_user_id(user_id: str) -> dict:
@@ -445,11 +512,16 @@ def backfill_reference_answers(samples, questions_dir=None):
     - stats: {"total": N, "backfilled": M, "already_has": K, "run_id_parsed": int}
     """
     by_id, by_text = load_question_index(questions_dir)
+    legacy_by_set, legacy_conflicts = load_legacy_chunk_exact_id_index(questions_dir)
 
-    if not by_id and not by_text:
+    if not by_id and not by_text and not legacy_by_set:
         return samples, {"total": len(samples), "backfilled": 0, "already_has": 0, "run_id_parsed": 0}
 
-    stats = {"total": len(samples), "backfilled": 0, "already_has": 0, "run_id_parsed": 0}
+    stats = {
+        "total": len(samples), "backfilled": 0, "already_has": 0,
+        "run_id_parsed": 0, "legacy_id_recovered": 0,
+        "legacy_id_recovery_rejected": 0,
+    }
 
     for s in samples:
         # 从 user_id 解析 run_id/question_id
@@ -460,6 +532,9 @@ def backfill_reference_answers(samples, questions_dir=None):
             stats["run_id_parsed"] += 1
         if parsed.get("question_id") and not s.get("question_id"):
             s["question_id"] = parsed["question_id"]
+        if not s.get("question_set_id") and s.get("run_id"):
+            # This is metadata scoping only. Binding still requires exact ID.
+            s["question_set_id"] = _question_set_id_for_run(s["run_id"])
 
         # 已有 reference_answer 的跳过
         if (s.get("reference_answer") or "").strip():
@@ -473,17 +548,50 @@ def backfill_reference_answers(samples, questions_dir=None):
         if qid and str(qid) in by_id:
             matched_q = by_id[str(qid)]
 
-        # 其次按 question 文本精确匹配
+        # Legacy chunk_exact sets lack persisted IDs. Recover only the exact,
+        # deterministic ID that the historical runner put in rag_eval:user_id.
+        # A collision, missing run/question-set scope, or changed question text
+        # fails closed instead of guessing from text.
+        recovery_used = False
+        if not matched_q and qid:
+            question_set_id = str(s.get("question_set_id") or "")
+            recovery_key = (question_set_id, str(qid))
+            legacy_q = legacy_by_set.get(question_set_id, {}).get(str(qid))
+            if recovery_key in legacy_conflicts:
+                stats["legacy_id_recovery_rejected"] += 1
+            elif legacy_q:
+                sample_text = (s.get("question") or "").strip()
+                expected_id = hashlib.md5(
+                    (legacy_q.get("question") or "").strip().encode("utf-8")
+                ).hexdigest()[:12]
+                if sample_text == legacy_q.get("question", "").strip() and str(qid) == expected_id:
+                    matched_q = legacy_q
+                    recovery_used = True
+                else:
+                    stats["legacy_id_recovery_rejected"] += 1
+
+        # 其次按 question 文本精确匹配。chunk_exact 的目标 chunk 必须经
+        # question_id 精确确认，不能只因题干相同就绑定。
         if not matched_q:
             q_text = (s.get("question") or "").strip()
             if q_text and q_text in by_text:
-                matched_q = by_text[q_text]
+                text_matched_q = by_text[q_text]
+                if text_matched_q.get("question_mode") != "chunk_exact":
+                    matched_q = text_matched_q
 
         if matched_q:
             for field in _BACKFILL_FIELDS:
                 val = matched_q.get(field)
                 if val and not s.get(field):
                     s[field] = val
+            if recovery_used:
+                s["binding_source"] = "legacy_deterministic_question_id"
+                s["binding_recovery_verified"] = True
+                stats["legacy_id_recovered"] += 1
+            if matched_q.get("question_mode") == "chunk_exact" and not s.get("evaluation_type"):
+                # Legacy sets predate this explicit field; it is derivable only
+                # after the ID-verified chunk_exact match above.
+                s["evaluation_type"] = "chunk_exact"
             stats["backfilled"] += 1
 
     return samples, stats

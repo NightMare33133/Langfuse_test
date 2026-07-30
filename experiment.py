@@ -1132,6 +1132,39 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
         except (json.JSONDecodeError, IOError):
             pass
 
+    # A chunk_exact retry is intentionally written to a new immutable file.
+    # When present for this exact run + question set, it supersedes only the
+    # historical pending chunk_exact rows in the dashboard; it never changes
+    # eval_results.jsonl or mixes into retrieval metrics.
+    if judged_file:
+        retry_candidates = []
+        try:
+            for retry_path in sorted(Path(judged_file).parent.glob("chunk_exact_retry_*.jsonl"),
+                                     key=lambda path: path.stat().st_mtime, reverse=True):
+                retry_rows = []
+                with retry_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        if (obj.get("run_id") == run_id and
+                                obj.get("question_set_id") == question_set_id and
+                                obj.get("evaluation_track") == "chunk_exact" and
+                                obj.get("source_snapshot_id")):
+                            retry_rows.append(obj)
+                if retry_rows:
+                    retry_candidates = retry_rows
+                    break
+        except (OSError, json.JSONDecodeError):
+            retry_candidates = []
+
+        if retry_candidates:
+            judge_results_for_run = [
+                obj for obj in judge_results_for_run
+                if obj.get("evaluation_track") != "chunk_exact"
+            ] + retry_candidates
+            judge_count = len(judge_results_for_run)
+
     return {
         "batch_success": batch_success,
         "batch_total": batch_total,
