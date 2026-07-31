@@ -18,6 +18,8 @@ data/batch/
 *.jsonl
 *.json
 data/langfuse_connections.json
+data/langfuse_connections/
+data/langfuse_connections/.credentials
 
 /7.08进度汇报.md
 

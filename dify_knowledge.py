@@ -172,6 +172,31 @@ def list_documents(api_key: str, base_url: str, dataset_id: str,
     return {"data": docs, "has_more": has_more, "total": total}
 
 
+def list_all_documents(api_key: str, base_url: str, dataset_id: str,
+                       timeout: int = 30) -> list[dict]:
+    """自动分页拉取指定知识库的全部文档。
+
+    Args:
+        api_key: Dataset API Key
+        base_url: API Base URL
+        dataset_id: 知识库 ID
+        timeout: 每页请求超时秒数
+
+    Returns:
+        list[dict]: 全部文档列表，每项至少包含 id, name, word_count, status
+    """
+    all_docs = []
+    page = 1
+    while True:
+        result = list_documents(api_key, base_url, dataset_id,
+                                page=page, limit=100, timeout=timeout)
+        all_docs.extend(result.get("data", []))
+        if not result.get("has_more", False):
+            break
+        page += 1
+    return all_docs
+
+
 def list_segments(api_key: str, base_url: str, dataset_id: str,
                   document_id: str, page: int = 1, limit: int = 20,
                   status_filter: str = "completed",
@@ -203,6 +228,35 @@ def list_segments(api_key: str, base_url: str, dataset_id: str,
     has_more = data.get("has_more", False)
     total = data.get("total", 0)
     return {"data": segments, "has_more": has_more, "total": total}
+
+
+def list_all_segments(api_key: str, base_url: str, dataset_id: str,
+                      document_id: str, status_filter: str = "completed",
+                      timeout: int = 30) -> list[dict]:
+    """自动分页拉取指定文档的全部分块。
+
+    Args:
+        api_key: Dataset API Key
+        base_url: API Base URL
+        dataset_id: 知识库 ID
+        document_id: 文档 ID
+        status_filter: 状态过滤（默认 completed）
+        timeout: 每页请求超时秒数
+
+    Returns:
+        list[dict]: 全部分块原始数据
+    """
+    all_segments = []
+    page = 1
+    while True:
+        result = list_segments(api_key, base_url, dataset_id, document_id,
+                               page=page, limit=100,
+                               status_filter=status_filter, timeout=timeout)
+        all_segments.extend(result.get("data", []))
+        if not result.get("has_more", False):
+            break
+        page += 1
+    return all_segments
 
 
 def retrieve(api_key: str, base_url: str, dataset_id: str, query: str,

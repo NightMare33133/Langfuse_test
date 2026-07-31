@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
-from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref, build_result_status
+from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref, build_result_status, backfill_chunk_exact_topk
 from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS, MODE_RETRIEVAL, MODE_QA, MODE_LABELS, build_question_set_name
 from batch_query import run_batch_query, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
@@ -737,9 +737,15 @@ def render_retrieval_result_detail(result: dict, sample: dict, key_prefix: str =
                         with st.expander("展开完整内容"):
                             st.text(_rr.get("content", ""))
 
-        # 4. Top1/Top3/Top5 判定与 Judge 原因
+        # 4. TopK 判定与 Judge 原因
         st.markdown("**检索命中判定**")
-        st.markdown(f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}")
+        _track = result.get("evaluation_track", "")
+        _topk_line = f"Top1 {'✓ 命中' if _t1 else '✗ 未命中'} | Top3 {'✓ 命中' if _t3 else '✗ 未命中'} | Top5 {'✓ 命中' if _t5 else '✗ 未命中'}"
+        if _track == "chunk_exact":
+            _t10 = result.get("retrieval_top10_hit")
+            if _t10 is not None:
+                _topk_line += f" | Top10 {'✓ 命中' if _t10 else '✗ 未命中'}"
+        st.markdown(_topk_line)
         st.markdown(f"**Judge 原因**: {result.get('reason', '(无)')}")
 
         # 5. 最终回答（辅助参考）
@@ -865,6 +871,8 @@ def render_judge_result_detail(result: dict, sample: dict, key_prefix: str = "")
     track = result.get("evaluation_track", "")
     if track == TRACK_RETRIEVAL:
         render_retrieval_result_detail(result, sample, key_prefix)
+    elif track == "chunk_exact":
+        render_retrieval_result_detail(result, sample, key_prefix)
     elif track == TRACK_STRICT_QA:
         render_strict_qa_result_detail(result, sample, key_prefix)
     elif track == TRACK_GROUNDED_QA:
@@ -895,7 +903,7 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         st.info("暂无评测结果")
         return
 
-    from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA
+    from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_CHUNK_EXACT
 
     # ── 筛选控件 ──
     filter_col1, filter_col2, filter_col3 = st.columns(3)
@@ -904,6 +912,8 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         tracks_present = set(r.get("evaluation_track", "") for r in results)
         if TRACK_RETRIEVAL in tracks_present:
             track_options.append("retrieval")
+        if TRACK_CHUNK_EXACT in tracks_present:
+            track_options.append("chunk_exact")
         if TRACK_STRICT_QA in tracks_present:
             track_options.append("strict_qa")
         if TRACK_GROUNDED_QA in tracks_present:
@@ -912,7 +922,7 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
     with filter_col2:
         filter_status = st.selectbox(
             "按结果状态筛选",
-            ["全部", "命中/正确", "未命中/错误", "Top1 未命中", "Top3 未命中", "Top5 未命中", "错误"],
+            ["全部", "命中/正确", "未命中/错误", "Top1 未命中", "Top3 未命中", "Top5 未命中", "Top10 未命中", "错误"],
             key=f"{key_prefix}_status",
         )
     with filter_col3:
@@ -940,6 +950,10 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         filtered = [r for r in filtered if "error" not in r
                     and r.get("evaluation_track") == TRACK_RETRIEVAL
                     and not r.get("retrieval_top5_hit")]
+    elif filter_status == "Top10 未命中":
+        filtered = [r for r in filtered if "error" not in r
+                    and r.get("evaluation_track") == TRACK_CHUNK_EXACT
+                    and not r.get("retrieval_top10_hit")]
     elif filter_status == "错误":
         filtered = [r for r in filtered if "error" in r]
     if filter_keyword:
@@ -1301,6 +1315,7 @@ with tab_kb:
         else:
             # 构建选择列表
             ds_options = []
+            ds_name_map = {}  # ds_id -> ds_name
             for ds in datasets:
                 ds_id = ds.get("id", "")
                 ds_name = ds.get("name", "未命名")
@@ -1308,6 +1323,7 @@ with tab_kb:
                 ds_word_count = ds.get("word_count", 0)
                 label = f"{ds_name}（{ds_doc_count} 篇文档，{ds_word_count:,} 词）"
                 ds_options.append((ds_id, label))
+                ds_name_map[ds_id] = ds_name
 
             selected_ds_id = st.selectbox(
                 "选择知识库",
@@ -1317,6 +1333,16 @@ with tab_kb:
                 ),
                 key="kb_selected_dataset",
             )
+
+            # 切换知识库时清除其他 dataset 的全库候选统计缓存
+            if selected_ds_id:
+                _current_stats_key = f"_ce_ds_stats_{selected_ds_id}"
+                _stale_keys = [
+                    k for k in st.session_state
+                    if k.startswith("_ce_ds_stats_") and k != _current_stats_key
+                ]
+                for k in _stale_keys:
+                    del st.session_state[k]
 
             if selected_ds_id:
                 # ── 文档列表 ──────────────────────────────────────
@@ -1368,6 +1394,305 @@ with tab_kb:
                             "创建时间": doc.get("created_at", ""),
                         })
                     st.dataframe(doc_rows, use_container_width=True, key="kb_doc_table")
+
+                    # ── 按文档随机出题（知识库级，不依赖预览文档） ──
+                    st.divider()
+                    st.markdown("### 按文档随机出题（chunk_exact）")
+                    st.caption(
+                        "从当前知识库的全部文档中按文档独立采样，生成 chunk_exact 题集。"
+                        "不依赖当前预览文档，适用于多文档联合出题场景。"
+                    )
+
+                    # 导入所需函数
+                    from chunk_exact_questions import (
+                        filter_candidate_chunks, generate_chunk_exact_questions_multi_doc,
+                        save_chunk_exact_questions, validate_chunk_exact_set,
+                        validate_multi_doc_config,
+                        generate_default_set_name_for_dataset,
+                    )
+                    from dify_knowledge import list_all_segments, list_all_documents, build_chunk_catalog as _build_catalog
+
+                    # 缓存 key：按 dataset_id 缓存全库文档+候选统计
+                    _ds_stats_key = f"_ce_ds_stats_{selected_ds_id}"
+
+                    # 加载/刷新全库候选统计按钮
+                    _stats_loaded = _ds_stats_key in st.session_state
+                    _stats_label = "🔄 刷新全库候选统计" if _stats_loaded else "📥 加载全库候选统计"
+                    if st.button(_stats_label, key="ce_load_ds_stats"):
+                        try:
+                            with st.spinner("正在拉取知识库全部文档和候选 chunk 统计..."):
+                                # 拉取全部文档（自动分页）
+                                all_docs = list_all_documents(
+                                    kb_api_key, kb_base_url, selected_ds_id,
+                                )
+                                # 为每个文档拉取 segments 并统计可用候选数
+                                _ds_doc_stats = []
+                                _total_candidates = 0
+                                for doc in all_docs:
+                                    _doc_id = doc.get("id", "")
+                                    _doc_name = doc.get("name", "未命名")
+                                    if not _doc_id:
+                                        continue
+                                    try:
+                                        all_segs = list_all_segments(
+                                            kb_api_key, kb_base_url,
+                                            selected_ds_id, _doc_id,
+                                        )
+                                        doc_catalog = _build_catalog(
+                                            all_segs, selected_ds_id,
+                                            _doc_id, _doc_name,
+                                        )
+                                        doc_candidates, _ = filter_candidate_chunks(
+                                            doc_catalog
+                                        )
+                                        _cnt = len(doc_candidates)
+                                        _total_candidates += _cnt
+                                        _ds_doc_stats.append({
+                                            "document_id": _doc_id,
+                                            "document_name": _doc_name,
+                                            "candidate_count": _cnt,
+                                            "status": "ok",
+                                            "error": "",
+                                        })
+                                    except Exception as doc_exc:
+                                        _ds_doc_stats.append({
+                                            "document_id": _doc_id,
+                                            "document_name": _doc_name,
+                                            "candidate_count": 0,
+                                            "status": "error",
+                                            "error": str(doc_exc)[:80],
+                                        })
+                                st.session_state[_ds_stats_key] = _ds_doc_stats
+                                st.success(f"已加载 {len(_ds_doc_stats)} 个文档，{_total_candidates} 个可用候选 chunk")
+                                st.rerun()
+                        except Exception as exc:
+                            st.error(f"加载全库统计失败: {exc}")
+
+                    if _ds_stats_key not in st.session_state:
+                        st.info("请点击上方按钮加载知识库全部文档和候选 chunk 统计，以便配置多文档出题。")
+                    else:
+                        _ds_doc_stats = st.session_state[_ds_stats_key]
+
+                        if not _ds_doc_stats:
+                            st.warning("该知识库没有找到任何文档。请检查知识库是否有文档。")
+                        else:
+                            # 构建出题文档与数量表格
+                            st.markdown("##### 出题文档与数量")
+                            st.caption("勾选要纳入的文档，设置每文档生成题数。总题数为各文档题数之和。")
+
+                            _doc_table_rows = []
+                            for _ds in _ds_doc_stats:
+                                _did = _ds["document_id"]
+                                _dname = _ds["document_name"]
+                                _cnt = _ds["candidate_count"]
+                                _status = _ds.get("status", "ok")
+                                _error = _ds.get("error", "")
+                                _avail_label = str(_cnt)
+                                if _status == "error":
+                                    _avail_label = f"加载失败: {_error}"
+                                _doc_table_rows.append({
+                                    "纳入": _status == "ok" and _cnt > 0,
+                                    "文档名": _dname,
+                                    "文档ID": _did,
+                                    "可用chunk数": _cnt,
+                                    "状态": _avail_label,
+                                    "生成题数": min(_cnt, 5) if _cnt > 0 else 0,
+                                })
+
+                            _edited_rows = st.data_editor(
+                                _doc_table_rows,
+                                column_config={
+                                    "纳入": st.column_config.CheckboxColumn(
+                                        "纳入", default=True, width="small",
+                                    ),
+                                    "文档名": st.column_config.TextColumn(
+                                        "文档名", disabled=True, width="medium",
+                                    ),
+                                    "文档ID": st.column_config.TextColumn(
+                                        "文档ID", disabled=True, width="small",
+                                    ),
+                                    "可用chunk数": st.column_config.NumberColumn(
+                                        "可用chunk数", disabled=True, width="small",
+                                    ),
+                                    "状态": st.column_config.TextColumn(
+                                        "状态", disabled=True, width="medium",
+                                    ),
+                                    "生成题数": st.column_config.NumberColumn(
+                                        "生成题数", min_value=0, max_value=1000, step=1, width="small",
+                                    ),
+                                },
+                                disabled=["文档名", "文档ID", "可用chunk数", "状态"],
+                                hide_index=True,
+                                key="ce_doc_table",
+                            )
+
+                            # 解析表格结果
+                            _active_docs = [
+                                r for r in _edited_rows if r["纳入"] and r["生成题数"] > 0
+                            ]
+                            _total_gen = sum(r["生成题数"] for r in _active_docs)
+
+                            if _active_docs:
+                                _summary_parts = [
+                                    f"{r['文档名'][:12]}…({r['生成题数']}题)"
+                                    for r in _active_docs
+                                ]
+                                st.caption(f"已选 {len(_active_docs)} 个文档，共 {_total_gen} 题：" + "、".join(_summary_parts))
+                            else:
+                                st.info("请至少勾选一个文档并设置生成题数 > 0。")
+
+                            # LLM 配置（复用 Judge API）
+                            ce_api_key = os.getenv("JUDGE_API_KEY", "")
+                            ce_api_base = os.getenv("JUDGE_API_BASE", "")
+                            ce_model = os.getenv("JUDGE_MODEL", "")
+
+                            with st.expander("LLM 配置（复用 Judge API）", expanded=False):
+                                ce_api_key = st.text_input("API Key", value=ce_api_key, type="password", key="ce_api_key_random")
+                                ce_api_base = st.text_input("API Base URL", value=ce_api_base, key="ce_api_base_random")
+                                ce_model = st.text_input("Model", value=ce_model, key="ce_model_random")
+
+                            ce_col1, ce_col2 = st.columns(2)
+                            with ce_col1:
+                                # 随机种子
+                                ce_random_seed = st.number_input(
+                                    "随机种子（可选）",
+                                    min_value=0,
+                                    value=0,
+                                    step=1,
+                                    key="ce_random_seed",
+                                    help="设为 0 表示随机；正整数可复现",
+                                )
+                            with ce_col2:
+                                # 生成默认名称（使用知识库名称）
+                                _ds_name = ds_name_map.get(selected_ds_id, "")
+                                _default_name = generate_default_set_name_for_dataset(_ds_name)
+                                ce_random_name = st.text_input(
+                                    "题集名称",
+                                    value=_default_name,
+                                    key="ce_random_name",
+                                )
+
+                            # 校验：每个选中文档的题数不超过可用 chunk 数
+                            _validation_errors = []
+                            for r in _active_docs:
+                                if r["生成题数"] > r["可用chunk数"]:
+                                    _validation_errors.append(
+                                        f"文档「{r['文档名']}」需要 {r['生成题数']} 题，"
+                                        f"但仅有 {r['可用chunk数']} 个可用候选 chunk"
+                                    )
+
+                            if _validation_errors:
+                                for _err in _validation_errors:
+                                    st.error(_err)
+
+                            if st.button("🎯 随机生成 chunk_exact 题集", key="ce_random_generate",
+                                         disabled=not (ce_api_key and ce_api_base and ce_model
+                                                       and _active_docs and not _validation_errors)):
+                                try:
+                                    # 为每个选中文档重新拉取完整 catalog（正式校验）
+                                    doc_configs = []
+                                    with st.spinner("正在拉取各文档完整 chunk catalog..."):
+                                        for r in _active_docs:
+                                            _doc_id = r["文档ID"]
+                                            _doc_name = r["文档名"]
+                                            _num_q = r["生成题数"]
+
+                                            # 拉取该文档的全部 segments
+                                            all_segs = list_all_segments(
+                                                kb_api_key, kb_base_url,
+                                                selected_ds_id, _doc_id,
+                                            )
+                                            # 构建 catalog
+                                            doc_catalog = _build_catalog(
+                                                all_segs, selected_ds_id,
+                                                _doc_id, _doc_name,
+                                            )
+                                            # 过滤候选
+                                            doc_candidates, _ = filter_candidate_chunks(
+                                                doc_catalog
+                                            )
+
+                                            doc_configs.append({
+                                                "document_id": _doc_id,
+                                                "document_name": _doc_name,
+                                                "candidates": doc_candidates,
+                                                "num_questions": _num_q,
+                                            })
+
+                                    # 校验
+                                    ok, errors = validate_multi_doc_config(doc_configs)
+                                    if not ok:
+                                        for _err in errors:
+                                            st.error(_err)
+                                    else:
+                                        with st.spinner(f"正在从 {len(_active_docs)} 个文档生成 {_total_gen} 道题..."):
+                                            ce_questions = generate_chunk_exact_questions_multi_doc(
+                                                doc_configs,
+                                                ce_api_key, ce_api_base, ce_model,
+                                                dataset_id=selected_ds_id,
+                                                timeout=60,
+                                            )
+
+                                        ce_valid, ce_invalid = validate_chunk_exact_set(ce_questions)
+                                        if ce_invalid:
+                                            st.warning(f"{len(ce_invalid)} 道题绑定不完整，已剔除。剩余 {len(ce_valid)} 道。")
+                                            ce_questions = ce_valid
+
+                                        if not ce_questions:
+                                            st.error("所有题目均绑定不完整，无法保存。")
+                                        else:
+                                            # 构建 doc_question_counts
+                                            _doc_qc = {}
+                                            for r in _active_docs:
+                                                _doc_qc[r["文档ID"]] = r["生成题数"]
+
+                                            # 构建 doc_name_map
+                                            _dnm = {ds["document_id"]: ds["document_name"] for ds in _ds_doc_stats}
+
+                                            ce_output_path, ce_filename, ce_set_id = save_chunk_exact_questions(
+                                                ce_questions,
+                                                question_set_name=ce_random_name or None,
+                                                dataset_id=selected_ds_id,
+                                                document_id=_active_docs[0]["文档ID"] if len(_active_docs) == 1 else "",
+                                                selection_mode="random",
+                                                selected_document_ids=[r["文档ID"] for r in _active_docs],
+                                                doc_question_counts=_doc_qc,
+                                            )
+
+                                            st.success(
+                                                f"chunk_exact 题集已生成！\n\n"
+                                                f"- **题集 ID:** `{ce_set_id}`\n"
+                                                f"- **题目数量:** {len(ce_questions)}\n"
+                                                f"- **文件:** `{ce_filename}`\n"
+                                                f"- **文档:** {len(_active_docs)} 份"
+                                            )
+
+                                            # 各文档实际生成数量
+                                            _actual_counts = {}
+                                            for q in ce_questions:
+                                                _d_id = q.get("document_id", "")
+                                                _actual_counts[_d_id] = _actual_counts.get(_d_id, 0) + 1
+                                            _count_parts = []
+                                            for _did, _cnt in _actual_counts.items():
+                                                _dlabel = _dnm.get(_did, _did[:8] + "...")
+                                                _count_parts.append(f"{_dlabel}: {_cnt} 题")
+                                            st.caption("各文档实际生成: " + "、".join(_count_parts))
+
+                                            with st.expander("题目预览", expanded=False):
+                                                for i, q in enumerate(ce_questions):
+                                                    seg_id = q.get("expected_segment_id", "")
+                                                    seg_short = seg_id[:12] + "..." if len(str(seg_id)) > 12 else seg_id
+                                                    pos = q.get("source_position", "")
+                                                    doc_id = q.get("document_id", "")
+                                                    doc_label = _dnm.get(doc_id, doc_id[:8] + "...")
+                                                    st.markdown(
+                                                        f"**{i+1}.** {q.get('retrieval_query', '')} "
+                                                        f"(`{q.get('target_label', '')}`) "
+                                                        f"→ [{doc_label}] segment: `{seg_short}` pos:{pos}"
+                                                    )
+
+                                except Exception as exc:
+                                    st.error(f"生成失败: {exc}")
 
                     # ── 文档选择与分块浏览 ────────────────────────────
                     st.markdown("### 分块浏览")
@@ -1543,11 +1868,11 @@ with tab_kb:
                                 f"enabled, status, content_hash"
                             )
 
-                            # ── 从 Catalog 创建题集 ──────────────────────
+                            # ── 从 Catalog 创建题集（手动模式，当前预览文档） ──
                             st.divider()
-                            st.markdown("### 从 Catalog 创建题集（chunk_exact）")
+                            st.markdown("### 从 Catalog 创建题集（手动选择 chunk）")
                             st.caption(
-                                "从当前 Chunk Catalog 选择候选 chunk，调用 LLM 生成短检索查询，"
+                                "从当前预览文档的 Chunk Catalog 选择候选 chunk，调用 LLM 生成短检索查询，"
                                 "创建 chunk_exact 题集。评测时按 segment_id / content_hash 精确匹配判定。"
                             )
 
@@ -1575,29 +1900,19 @@ with tab_kb:
                             from chunk_exact_questions import (
                                 filter_candidate_chunks, generate_chunk_exact_questions,
                                 save_chunk_exact_questions, validate_chunk_exact_set,
-                                sample_candidates_random, get_candidates_by_documents,
-                                generate_default_set_name,
                             )
 
                             ce_candidates, ce_filter_stats = filter_candidate_chunks(catalog, duplicates)
 
-                            st.markdown(f"**候选 chunk：** {ce_filter_stats['passed']} / {ce_filter_stats['total']} 通过过滤")
+                            st.markdown(f"**当前预览文档候选 chunk：** {ce_filter_stats['passed']} / {ce_filter_stats['total']} 通过过滤")
                             if ce_filter_stats["filtered"]:
                                 filter_desc = "、".join(f"{reason}: {count}" for reason, count in ce_filter_stats["filtered"].items())
                                 st.caption(f"已过滤: {filter_desc}")
 
                             if not ce_candidates:
-                                st.warning("当前页没有符合条件的候选 chunk。请切换到有更多 completed+enabled 分块的文档。")
+                                st.warning("当前预览文档没有符合条件的候选 chunk。请切换到有更多 completed+enabled 分块的文档。")
                             else:
-                                # 出题模式切换
-                                ce_mode = st.radio(
-                                    "出题模式",
-                                    ["手动选择 chunk", "按文档随机"],
-                                    horizontal=True,
-                                    key="ce_mode",
-                                )
-
-                                # LLM 配置（复用 Judge API）— 两种模式共用
+                                # LLM 配置（复用 Judge API）
                                 ce_api_key = os.getenv("JUDGE_API_KEY", "")
                                 ce_api_base = os.getenv("JUDGE_API_BASE", "")
                                 ce_model = os.getenv("JUDGE_MODEL", "")
@@ -1607,8 +1922,7 @@ with tab_kb:
                                     ce_api_base = st.text_input("API Base URL", value=ce_api_base, key="ce_api_base")
                                     ce_model = st.text_input("Model", value=ce_model, key="ce_model")
 
-                                if ce_mode == "手动选择 chunk":
-                                    # ── 手动模式：保留现有逻辑 ──
+                                # ── 手动模式：从当前预览文档选择 chunk ──
                                     with st.expander("查看和调整候选 chunk", expanded=False):
                                         ce_exclude_ids = set()
                                         for c in ce_candidates:
@@ -1690,138 +2004,6 @@ with tab_kb:
                                                                 f"(`{q.get('target_label', '')}`) "
                                                                 f"→ segment: `{seg_short}` pos:{pos}"
                                                             )
-
-                                            except Exception as exc:
-                                                st.error(f"生成失败: {exc}")
-
-                                else:
-                                    # ── 随机模式：按文档随机出题 ──
-                                    # 构建文档多选列表（从 catalog 中提取不重复的文档列表）
-                                    _doc_ids_in_catalog = sorted(set(c.get("document_id", "") for c in ce_candidates if c.get("document_id")))
-                                    _doc_options_for_random = []
-                                    for _did in _doc_ids_in_catalog:
-                                        _dname = doc_name_map.get(_did, _did[:12] + "...")
-                                        _doc_count = sum(1 for c in ce_candidates if c.get("document_id") == _did)
-                                        _doc_options_for_random.append((_did, f"{_dname}（{_doc_count} 个候选 chunk）"))
-
-                                    ce_selected_doc_ids = st.multiselect(
-                                        "选择源文档（可多选）",
-                                        options=[c[0] for c in _doc_options_for_random],
-                                        format_func=lambda x: next(
-                                            (c[1] for c in _doc_options_for_random if c[0] == x), x
-                                        ),
-                                        default=_doc_ids_in_catalog,
-                                        key="ce_random_docs",
-                                    )
-
-                                    if not ce_selected_doc_ids:
-                                        st.info("请至少选择一个源文档。")
-                                    else:
-                                        # 计算所选文档的可用 chunk 数
-                                        _random_pool = get_candidates_by_documents(ce_candidates, ce_selected_doc_ids)
-                                        _available_count = len(_random_pool)
-
-                                        st.caption(f"所选文档共有 {_available_count} 个可用候选 chunk")
-
-                                        ce_col1, ce_col2, ce_col3 = st.columns(3)
-                                        with ce_col1:
-                                            ce_random_num = st.number_input(
-                                                "生成数量",
-                                                min_value=1,
-                                                max_value=max(_available_count, 1),
-                                                value=min(_available_count, 10),
-                                                step=1,
-                                                key="ce_random_num",
-                                            )
-                                        with ce_col2:
-                                            ce_random_seed = st.number_input(
-                                                "随机种子（可选）",
-                                                min_value=0,
-                                                value=0,
-                                                step=1,
-                                                key="ce_random_seed",
-                                                help="设为 0 表示随机；正整数可复现",
-                                            )
-                                        with ce_col3:
-                                            # 生成默认名称
-                                            _rand_doc_names = [doc_name_map.get(d, d) for d in ce_selected_doc_ids]
-                                            _default_name = generate_default_set_name(_rand_doc_names, mode="random")
-                                            ce_random_name = st.text_input(
-                                                "题集名称",
-                                                value=_default_name,
-                                                key="ce_random_name",
-                                            )
-
-                                        # 数量截断提示
-                                        if ce_random_num > _available_count:
-                                            st.warning(f"生成数量 {ce_random_num} 超过可用 chunk 数 {_available_count}，已自动限制。")
-                                            ce_random_num = _available_count
-
-                                        if st.button("🎯 随机生成 chunk_exact 题集", key="ce_random_generate",
-                                                     disabled=not (ce_api_key and ce_api_base and ce_model)):
-                                            try:
-                                                seed_val = ce_random_seed if ce_random_seed > 0 else None
-                                                sampled, actual_count, capped = sample_candidates_random(
-                                                    ce_candidates, ce_random_num,
-                                                    document_ids=ce_selected_doc_ids,
-                                                    seed=seed_val,
-                                                )
-
-                                                if capped:
-                                                    st.info(f"候选 chunk 不足，已从 {_available_count} 个中抽取全部。")
-
-                                                if not sampled:
-                                                    st.error("没有可用的候选 chunk。")
-                                                else:
-                                                    with st.spinner(f"正在从 {actual_count} 个随机 chunk 生成题集..."):
-                                                        ce_questions = generate_chunk_exact_questions(
-                                                            sampled,
-                                                            ce_api_key, ce_api_base, ce_model,
-                                                            num_questions=actual_count,
-                                                            dataset_id=selected_ds_id,
-                                                            document_id=",".join(ce_selected_doc_ids),
-                                                            timeout=60,
-                                                        )
-
-                                                    ce_valid, ce_invalid = validate_chunk_exact_set(ce_questions)
-                                                    if ce_invalid:
-                                                        st.warning(f"{len(ce_invalid)} 道题绑定不完整，已剔除。剩余 {len(ce_valid)} 道。")
-                                                        ce_questions = ce_valid
-
-                                                    if not ce_questions:
-                                                        st.error("所有题目均绑定不完整，无法保存。")
-                                                    else:
-                                                        ce_output_path, ce_filename, ce_set_id = save_chunk_exact_questions(
-                                                            ce_questions,
-                                                            question_set_name=ce_random_name or None,
-                                                            dataset_id=selected_ds_id,
-                                                            document_id=",".join(ce_selected_doc_ids),
-                                                            selection_mode="random",
-                                                            selected_document_ids=ce_selected_doc_ids,
-                                                            random_seed=seed_val,
-                                                        )
-
-                                                        _seed_msg = f" | 种子: {seed_val}" if seed_val else ""
-                                                        st.success(
-                                                            f"chunk_exact 题集已生成！\n\n"
-                                                            f"- **题集 ID:** `{ce_set_id}`\n"
-                                                            f"- **题目数量:** {len(ce_questions)}\n"
-                                                            f"- **文件:** `{ce_filename}`\n"
-                                                            f"- **文档:** {len(ce_selected_doc_ids)} 份{_seed_msg}"
-                                                        )
-
-                                                        with st.expander("题目预览", expanded=False):
-                                                            for i, q in enumerate(ce_questions):
-                                                                seg_id = q.get("expected_segment_id", "")
-                                                                seg_short = seg_id[:12] + "..." if len(str(seg_id)) > 12 else seg_id
-                                                                pos = q.get("source_position", "")
-                                                                doc_id = q.get("document_id", "")
-                                                                doc_label = doc_name_map.get(doc_id, doc_id[:8] + "...")
-                                                                st.markdown(
-                                                                    f"**{i+1}.** {q.get('retrieval_query', '')} "
-                                                                    f"(`{q.get('target_label', '')}`) "
-                                                                    f"→ [{doc_label}] segment: `{seg_short}` pos:{pos}"
-                                                                )
 
                                             except Exception as exc:
                                                 st.error(f"生成失败: {exc}")
@@ -4217,7 +4399,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
             from langfuse_connection import (
                 list_profiles, load_profile, create_profile, update_profile,
                 delete_profile, check_connection, mask_public_key,
-                identify_project_info,
+                identify_project_info, get_profile_api_keys, has_profile_api_keys,
             )
             from langfuse_project import (
                 list_projects, load_project, register_project, get_project_stats,
@@ -4245,9 +4427,13 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
 
             if _conn_mode == "使用已保存连接（推荐）":
                 profiles = list_profiles()
-                if not profiles:
-                    st.info("暂无已保存的 Langfuse 连接配置，请在下方新建，或切换为「临时手动填写」。")
-                else:
+                _has_profiles = bool(profiles)
+                if not _has_profiles:
+                    st.info("暂无已保存的 Langfuse 连接配置。请在下方新建，或切换为「临时手动填写」。")
+
+                # 选择器（有 profile 时显示）
+                selected_pid = ""
+                if _has_profiles:
                     _pid_options = {p["profile_id"]: f"{p['display_name']} | {p['host']}" for p in profiles}
                     _pid_list = list(_pid_options.keys())
                     selected_pid = st.selectbox(
@@ -4258,20 +4444,27 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     )
                     _sel_profile = load_profile(selected_pid)
                     if _sel_profile:
-                        st.caption(
-                            f"Host: {_sel_profile['host']}　|　"
-                            f"Public Key: {mask_public_key(_sel_profile.get('public_key', ''))}　|　"
-                            f"Secret Key: 已配置"
-                        )
+                        _has_keys = has_profile_api_keys(selected_pid)
+                        if _has_keys:
+                            _pk, _sk = get_profile_api_keys(selected_pid)
+                            st.caption(
+                                f"Host: {_sel_profile['host']}　|　"
+                                f"Public Key: {mask_public_key(_pk)}　|　"
+                                f"Secret Key: 已配置"
+                            )
+                        else:
+                            st.warning("已保存配置但凭据缺失，请编辑并填入 Key。")
 
-                # 管理连接配置
-                with st.expander("管理连接配置", expanded=False):
+                # 管理连接配置（新建始终可用）
+                with st.expander("管理连接配置", expanded=not _has_profiles):
+                    _mgmt_options = ["新建配置"]
+                    if _has_profiles:
+                        _mgmt_options.extend(["编辑当前", "删除当前"])
                     _mgmt_action = st.radio(
                         "操作",
-                        ["新建配置", "编辑当前", "删除当前"],
+                        _mgmt_options,
                         horizontal=True,
                         key="lf_mgmt_action",
-                        disabled=not profiles if 'profiles' in dir() else True,
                     )
 
                     if _mgmt_action == "新建配置":
@@ -4288,25 +4481,26 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 except ValueError as e:
                                     st.error(str(e))
 
-                    elif _mgmt_action == "编辑当前" and profiles:
-                        _ep = load_profile(st.session_state.get("lf_profile_select", ""))
+                    elif _mgmt_action == "编辑当前" and selected_pid:
+                        _ep = load_profile(selected_pid)
                         if _ep:
                             with st.form("lf_edit_profile_form"):
                                 _ed_name = st.text_input("配置名称", value=_ep["display_name"], key="lf_ed_name")
                                 _ed_host = st.text_input("Host", value=_ep["host"], key="lf_ed_host")
-                                _ed_pk = st.text_input("Public Key", value=_ep.get("public_key", ""), key="lf_ed_pk")
+                                _ed_pk = st.text_input("Public Key（留空保持原值）", key="lf_ed_pk")
                                 _ed_sk = st.text_input("Secret Key（留空保持原值）", key="lf_ed_sk", type="password")
                                 if st.form_submit_button("保存修改"):
                                     try:
+                                        pk_val = _ed_pk if _ed_pk else None
                                         sk_val = _ed_sk if _ed_sk else None
-                                        update_profile(_ep["profile_id"], _ed_name, _ed_host, _ed_pk, sk_val)
+                                        update_profile(_ep["profile_id"], _ed_name, _ed_host, pk_val, sk_val)
                                         st.success("已更新")
                                         st.rerun()
                                     except ValueError as e:
                                         st.error(str(e))
 
-                    elif _mgmt_action == "删除当前" and profiles:
-                        _dp = load_profile(st.session_state.get("lf_profile_select", ""))
+                    elif _mgmt_action == "删除当前" and selected_pid:
+                        _dp = load_profile(selected_pid)
                         if _dp:
                             st.warning(f"确认删除配置「{_dp['display_name']}」？此操作不可撤销，本地凭据将一并删除。")
                             if st.button("确认删除", key="lf_confirm_delete"):
@@ -4318,18 +4512,17 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 st.rerun()
 
                 # 测试连接 + 项目识别
-                if profiles and st.session_state.get("lf_profile_select"):
-                    _tp = load_profile(st.session_state["lf_profile_select"])
-                    if _tp and st.button("🔗 测试连接并识别项目", key="lf_test_conn"):
+                if selected_pid:
+                    _tp = load_profile(selected_pid)
+                    _tp_has_keys = has_profile_api_keys(selected_pid)
+                    if _tp and _tp_has_keys and st.button("🔗 测试连接并识别项目", key="lf_test_conn"):
                         try:
-                            ok, msg = check_connection(_tp["host"], _tp.get("public_key", ""), _tp.get("secret_key", ""))
+                            _tp_pk, _tp_sk = get_profile_api_keys(selected_pid)
+                            ok, msg = check_connection(_tp["host"], _tp_pk, _tp_sk)
                             if ok:
                                 st.success(msg)
-                                # 识别项目
                                 try:
-                                    _proj_info = identify_project_info(
-                                        _tp["host"], _tp.get("public_key", ""), _tp.get("secret_key", ""),
-                                    )
+                                    _proj_info = identify_project_info(_tp["host"], _tp_pk, _tp_sk)
                                     st.session_state["_lf_project_info"] = _proj_info
                                 except Exception as _pe:
                                     st.warning(f"项目识别失败: {_pe}")
@@ -4337,14 +4530,15 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 st.error(msg)
                         except ValueError as e:
                             st.error(str(e))
+                    elif _tp and not _tp_has_keys:
+                        st.warning("凭据缺失，请编辑配置并填入 Key 后再测试连接。")
 
                 # 从 profile 读取凭据
-                if profiles and st.session_state.get("lf_profile_select"):
-                    _cp = load_profile(st.session_state["lf_profile_select"])
+                if selected_pid and has_profile_api_keys(selected_pid):
+                    _cp = load_profile(selected_pid)
                     if _cp:
                         langfuse_host = _cp.get("host", "")
-                        langfuse_pk = _cp.get("public_key", "")
-                        langfuse_sk = _cp.get("secret_key", "")
+                        langfuse_pk, langfuse_sk = get_profile_api_keys(selected_pid)
 
             else:
                 # 临时手动填写模式
@@ -5352,6 +5546,10 @@ Judge 有三层减少重复调用的机制：
                 r["retrieval_evaluable"] = False
                 _unmatched_results.append(tid)
 
+        # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
+        for r in existing_results_map.values():
+            backfill_chunk_exact_topk(r, _sample_by_tid)
+
         # --- Judge config section (collapsible) ---
         with st.expander("评测配置", expanded=True):
             # API config
@@ -5830,6 +6028,42 @@ Judge 有三层减少重复调用的机制：
                                     f"Top1:{t1} | Top3:{t3} | Top5:{t5} | "
                                     f"最早命中位置:{pos_str}{tag}"
                                 )
+                            elif _track == TRACK_CHUNK_EXACT:
+                                ce_status = _r.get("chunk_exact_status", "")
+                                if ce_status:
+                                    # missing_binding / no_trace / no_retrieval
+                                    _status_labels = {
+                                        "missing_binding": "缺少绑定（expected_segment_id / expected_content_hash）",
+                                        "no_trace": "未关联真实 Langfuse trace",
+                                        "no_retrieval": "trace 已关联但无检索结果",
+                                    }
+                                    _label = _status_labels.get(ce_status, ce_status)
+                                    st.warning(f"⚠️ [{_idx}] {_q} — Chunk Exact 不可判定：{_label}{tag}")
+                                else:
+                                    t1 = "✓" if _r.get("retrieval_top1_hit") else "✗"
+                                    t3 = "✓" if _r.get("retrieval_top3_hit") else "✗"
+                                    t5 = "✓" if _r.get("retrieval_top5_hit") else "✗"
+                                    t10 = "✓" if _r.get("retrieval_top10_hit") else "✗"
+                                    pos = _r.get("hit_evidence_position")
+                                    seg_id = (_r.get("expected_segment_id") or "")[:12]
+                                    if _r.get("retrieval_top10_hit"):
+                                        st.write(
+                                            f"✅ [{_idx}] {_q} — Chunk Exact | "
+                                            f"Top1:{t1} | Top3:{t3} | Top5:{t5} | Top10:{t10} | "
+                                            f"首次命中:Top{pos}{tag}"
+                                        )
+                                    elif _r.get("retrieval_top5_hit"):
+                                        st.warning(
+                                            f"⚠️ [{_idx}] {_q} — Chunk Exact | "
+                                            f"Top5命中但 Top10 边缘 | "
+                                            f"Top1:{t1} | Top3:{t3} | Top5:{t5} | Top10:{t10} | "
+                                            f"首次命中:Top{pos}{tag}"
+                                        )
+                                    else:
+                                        st.warning(
+                                            f"⚠️ [{_idx}] {_q} — Chunk Exact | "
+                                            f"Top10未命中 | 目标 chunk:{seg_id}{tag}"
+                                        )
                             elif _track == TRACK_STRICT_QA:
                                 ans = "✓" if _r.get("answer_correct") else "✗"
                                 st.write(
@@ -5921,7 +6155,21 @@ Judge 有三层减少重复调用的机制：
                 st.markdown("#### 以下样本会被跳过，不消耗 token：")
 
                 if prescreen_results:
-                    st.markdown(f"**{len(prescreen_results)} 条 — 规则直接判定**（无检索结果/无回答，结果确定，不需要 LLM）")
+                    # 按类型分组统计
+                    _ps_chunk_exact = sum(1 for s, _ in prescreen_results
+                                         if classify_evaluation_track(s) == TRACK_CHUNK_EXACT)
+                    _ps_not_eval = sum(1 for s, _ in prescreen_results
+                                       if classify_evaluation_track(s) == TRACK_NOT_EVALUABLE)
+                    _ps_rule = len(prescreen_results) - _ps_chunk_exact - _ps_not_eval
+
+                    _ps_parts = []
+                    if _ps_chunk_exact:
+                        _ps_parts.append(f"Chunk Exact 机器判定 {_ps_chunk_exact} 条")
+                    if _ps_rule:
+                        _ps_parts.append(f"规则预筛选 {_ps_rule} 条")
+                    if _ps_not_eval:
+                        _ps_parts.append(f"缺少金标准 {_ps_not_eval} 条")
+                    st.markdown(f"**{len(prescreen_results)} 条 — 直接判定**（{'，'.join(_ps_parts)}，不需要 LLM）")
                     for s, ps in prescreen_results[:5]:
                         q = (s.get("question") or "(无问题)")[:60]
                         st.caption(f"  - `{q}` → {ps.get('reason', '')}")
@@ -7024,6 +7272,12 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 # 后出现的 run 更新，覆盖（即使都有 error 或都无 error）
                 _seen_trace[tid] = r
         all_judge_results = list(_seen_trace.values())
+        # 补齐旧版 chunk_exact 缺失的 Top10（需扫描 processed sample 的检索结果）
+        _ce_proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+        _ce_proc_mtime = str(_ce_proc_path.stat().st_mtime) if _ce_proc_path.exists() else ""
+        _ce_sample_lookup = _load_sample_lookup(_ce_proc_mtime)
+        for r in all_judge_results:
+            backfill_chunk_exact_topk(r, _ce_sample_lookup)
         cumulative_metrics = compute_metrics(all_judge_results)
 
         # 概览指标
@@ -7050,59 +7304,108 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         valid_all = [r for r in all_judge_results if "error" not in r]
         error_all = [r for r in all_judge_results if "error" in r]
 
-        retrieval_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_RETRIEVAL]
+        retrieval_all = [r for r in valid_all
+                         if r.get("evaluation_track") == TRACK_RETRIEVAL
+                         and r.get("retrieval_evaluable", True)]
         strict_qa_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_STRICT_QA]
         grounded_qa_all = [r for r in valid_all if r.get("evaluation_track") == TRACK_GROUNDED_QA]
+        chunk_exact_all = [r for r in valid_all
+                           if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+        chunk_exact_evaluable = [r for r in chunk_exact_all
+                                 if r.get("retrieval_evaluable", True) is not False
+                                 and r.get("retrieval_top1_hit") is not None]
+        chunk_exact_unevaluable = [r for r in chunk_exact_all
+                                   if r.get("retrieval_evaluable", True) is False
+                                   or r.get("retrieval_top1_hit") is None]
 
         st.markdown("---")
         st.markdown("**累计 Judge 指标**")
         st.caption("按样本加权汇总（命中总数 / 有效样本数），去重后统计。不同评测轨道不混合。")
 
-        has_any_track = retrieval_all or strict_qa_all or grounded_qa_all
+        has_any_track = retrieval_all or strict_qa_all or grounded_qa_all or chunk_exact_evaluable
         if not has_any_track:
-            st.info("暂无数据")
+            st.info("暂无评测数据（无 AI 证据评测题，也无 chunk_exact 可评测样本）")
         else:
-            track_col1, track_col2, track_col3 = st.columns(3)
-
+            # ── AI 证据评测 ──
+            st.markdown("##### AI 证据评测（retrieval）")
             if retrieval_all:
-                with track_col1:
-                    st.markdown("**检索评测**")
-                    n = len(retrieval_all)
-                    t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_all) / n
-                    t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_all) / n
-                    t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_all) / n
-                    st.metric("Top1 Hit", f"{t1:.0%}")
-                    st.metric("Top3 Hit", f"{t3:.0%}")
-                    st.metric("Top5 Hit", f"{t5:.0%}")
-                    st.caption(f"有效样本数 n={n}")
+                n = len(retrieval_all)
+                t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_all)
+                t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_all)
+                t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_all)
+                ai_col1, ai_col2, ai_col3, ai_col4 = st.columns(4)
+                with ai_col1:
+                    st.metric("可评测", n)
+                with ai_col2:
+                    st.metric("Top1", f"{t1}/{n} ({t1/n:.1%})")
+                with ai_col3:
+                    st.metric("Top3", f"{t3}/{n} ({t3/n:.1%})")
+                with ai_col4:
+                    st.metric("Top5", f"{t5}/{n} ({t5/n:.1%})")
             else:
-                with track_col1:
-                    st.markdown("**检索评测**")
-                    st.info("暂无数据")
+                st.info("本配置未包含 AI 证据评测题")
 
+            # ── Chunk Exact 机器判定 ──
+            if chunk_exact_all:
+                st.markdown("##### Chunk Exact（机器判定）")
+                ce_n = len(chunk_exact_evaluable)
+                ce_total = len(chunk_exact_all)
+                if ce_n > 0:
+                    ce_t1 = sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_evaluable)
+                    ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_evaluable)
+                    ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_evaluable)
+                    ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
+                    ce_col1, ce_col2, ce_col3, ce_col4, ce_col5 = st.columns(5)
+                    with ce_col1:
+                        st.metric("可评测", ce_n)
+                    with ce_col2:
+                        st.metric("Top1", f"{ce_t1}/{ce_n} ({ce_t1/ce_n:.1%})")
+                    with ce_col3:
+                        st.metric("Top3", f"{ce_t3}/{ce_n} ({ce_t3/ce_n:.1%})")
+                    with ce_col4:
+                        st.metric("Top5", f"{ce_t5}/{ce_n} ({ce_t5/ce_n:.1%})")
+                    with ce_col5:
+                        st.metric("Top10", f"{ce_t10}/{ce_n} ({ce_t10/ce_n:.1%})")
+
+                # 不可评测状态统计
+                if chunk_exact_unevaluable:
+                    ue_status_counts = {}
+                    for r in chunk_exact_unevaluable:
+                        s = r.get("chunk_exact_status") or r.get("reason", "未知")
+                        ue_status_counts[s] = ue_status_counts.get(s, 0) + 1
+                    ue_parts = [f"{s}: {c}" for s, c in ue_status_counts.items()]
+                    st.caption(f"不可评测 {len(chunk_exact_unevaluable)} 条 — " + "、".join(ue_parts))
+
+            # ── 严格问答 / 合理性问答 ──
+            qa_col1, qa_col2 = st.columns(2)
             if strict_qa_all:
-                with track_col2:
+                with qa_col1:
                     st.markdown("**严格问答**")
                     n = len(strict_qa_all)
                     acc = sum(r.get("answer_correct", 0) for r in strict_qa_all) / n
                     st.metric("Answer Correctness", f"{acc:.0%}")
                     st.caption(f"有效样本数 n={n}")
             else:
-                with track_col2:
+                with qa_col1:
                     st.markdown("**严格问答**")
                     st.info("暂无数据")
 
             if grounded_qa_all:
-                with track_col3:
+                with qa_col2:
                     st.markdown("**合理性问答**")
                     n = len(grounded_qa_all)
                     acc = sum(r.get("answer_correct", 0) for r in grounded_qa_all) / n
                     st.metric("Answer Groundedness", f"{acc:.0%}")
                     st.caption(f"有效样本数 n={n}")
             else:
-                with track_col3:
+                with qa_col2:
                     st.markdown("**合理性问答**")
                     st.info("暂无数据")
+
+            # ── 机器判定完成 vs AI Judge 完成 ──
+            machine_judged = len(chunk_exact_all)
+            ai_judged = len(retrieval_all) + len(strict_qa_all) + len(grounded_qa_all)
+            st.caption(f"机器判定完成: {machine_judged} | AI Judge 完成: {ai_judged} | Judge 错误: {len(error_all)}")
 
         # 累计可视化
         st.markdown("**配置方案累计结果**")
@@ -7148,7 +7451,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             else:
                 st.info("暂无问答评测数据")
 
-        # 轨道分布和结果状态分布
+        # 轨道分布和 chunk_exact 命中位置分布
         dist_col1, dist_col2 = st.columns(2)
         with dist_col1:
             st.markdown("**Judge 轨道分布**")
@@ -7157,6 +7460,9 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             if retrieval_all:
                 dist_labels.append("检索评测")
                 dist_values.append(len(retrieval_all))
+            if chunk_exact_evaluable:
+                dist_labels.append("Chunk Exact")
+                dist_values.append(len(chunk_exact_evaluable))
             if strict_qa_all:
                 dist_labels.append("严格问答")
                 dist_values.append(len(strict_qa_all))
@@ -7175,35 +7481,87 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 st.plotly_chart(fig_track_dist, use_container_width=True, key="cum_track_dist")
 
         with dist_col2:
-            st.markdown("**结果状态分布**")
-            hit_count = sum(1 for r in retrieval_all if r.get("retrieval_top1_hit"))
-            miss_count = len(retrieval_all) - hit_count
-            qa_correct = sum(1 for r in strict_qa_all + grounded_qa_all if r.get("answer_correct"))
-            qa_wrong = len(strict_qa_all + grounded_qa_all) - qa_correct
-            status_labels = []
-            status_values = []
-            if hit_count:
-                status_labels.append("检索 Top1 命中")
-                status_values.append(hit_count)
-            if miss_count:
-                status_labels.append("检索 Top1 未命中")
-                status_values.append(miss_count)
-            if qa_correct:
-                status_labels.append("QA 回答正确")
-                status_values.append(qa_correct)
-            if qa_wrong:
-                status_labels.append("QA 回答错误")
-                status_values.append(qa_wrong)
-            if error_all:
-                status_labels.append("评测错误")
-                status_values.append(len(error_all))
-            if status_labels:
-                fig_status_dist = go.Figure(data=[go.Pie(
-                    labels=status_labels, values=status_values,
-                    hole=0.4, textinfo="label+value+percent",
-                )])
-                fig_status_dist.update_layout(height=300, margin=dict(t=40, b=20))
-                st.plotly_chart(fig_status_dist, use_container_width=True, key="cum_status_dist")
+            if chunk_exact_evaluable:
+                # Chunk Exact 命中位置分布（互斥分桶，扩展至 Top10）
+                st.markdown("**Chunk Exact 命中位置分布**")
+                ce_n = len(chunk_exact_evaluable)
+                bucket_top1 = 0
+                bucket_2_3 = 0
+                bucket_4_5 = 0
+                bucket_6_10 = 0
+                bucket_miss = 0
+                for r in chunk_exact_evaluable:
+                    pos = r.get("hit_evidence_position")
+                    t1 = r.get("retrieval_top1_hit", 0)
+                    t10 = r.get("retrieval_top10_hit", 0)
+                    if t1:
+                        bucket_top1 += 1
+                    elif pos is not None and 2 <= pos <= 3:
+                        bucket_2_3 += 1
+                    elif pos is not None and 4 <= pos <= 5:
+                        bucket_4_5 += 1
+                    elif pos is not None and 6 <= pos <= 10:
+                        bucket_6_10 += 1
+                    elif t10:
+                        # 旧记录 position=None 但 top10=1（命中在 6-10）
+                        bucket_6_10 += 1
+                    else:
+                        bucket_miss += 1
+
+                buckets = [
+                    ("Top1 命中", bucket_top1, "#2ca02c"),
+                    ("第2-3位首次命中", bucket_2_3, "#1f77b4"),
+                    ("第4-5位首次命中", bucket_4_5, "#ff7f0e"),
+                    ("第6-10位首次命中", bucket_6_10, "#9467bd"),
+                    ("Top10 未命中", bucket_miss, "#d62728"),
+                ]
+                # 过滤空桶
+                buckets = [(l, v, c) for l, v, c in buckets if v > 0]
+                if buckets:
+                    fig_ce_hit = go.Figure(data=[go.Bar(
+                        y=[b[0] for b in buckets],
+                        x=[b[1] for b in buckets],
+                        orientation="h",
+                        marker_color=[b[2] for b in buckets],
+                        text=[f"{b[1]} ({b[1]/ce_n:.0%})" for b in buckets],
+                        textposition="auto",
+                    )])
+                    fig_ce_hit.update_layout(
+                        xaxis_title="样本数",
+                        height=300, margin=dict(t=20, b=30, l=120),
+                    )
+                    st.plotly_chart(fig_ce_hit, use_container_width=True, key="cum_ce_hit_pos")
+                    st.caption(f"可评测样本数: {ce_n}")
+            else:
+                st.markdown("**结果状态分布**")
+                hit_count = sum(1 for r in retrieval_all if r.get("retrieval_top1_hit"))
+                miss_count = len(retrieval_all) - hit_count
+                qa_correct = sum(1 for r in strict_qa_all + grounded_qa_all if r.get("answer_correct"))
+                qa_wrong = len(strict_qa_all + grounded_qa_all) - qa_correct
+                status_labels = []
+                status_values = []
+                if hit_count:
+                    status_labels.append("检索 Top1 命中")
+                    status_values.append(hit_count)
+                if miss_count:
+                    status_labels.append("检索 Top1 未命中")
+                    status_values.append(miss_count)
+                if qa_correct:
+                    status_labels.append("QA 回答正确")
+                    status_values.append(qa_correct)
+                if qa_wrong:
+                    status_labels.append("QA 回答错误")
+                    status_values.append(qa_wrong)
+                if error_all:
+                    status_labels.append("评测错误")
+                    status_values.append(len(error_all))
+                if status_labels:
+                    fig_status_dist = go.Figure(data=[go.Pie(
+                        labels=status_labels, values=status_values,
+                        hole=0.4, textinfo="label+value+percent",
+                    )])
+                    fig_status_dist.update_layout(height=300, margin=dict(t=40, b=20))
+                    st.plotly_chart(fig_status_dist, use_container_width=True, key="cum_status_dist")
 
     # ---------- 一键导出评测报告 ----------
     if not config_runs:
@@ -7615,6 +7973,12 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                     st.markdown("**Judge 评测指标**")
 
                     judge_results = run_status.get("judge_results", [])
+                    # 补齐旧版 chunk_exact 缺失的 Top10
+                    _detail_rp = PROCESSED_DIR / "langfuse_samples.jsonl"
+                    _detail_mtime = str(_detail_rp.stat().st_mtime) if _detail_rp.exists() else ""
+                    _detail_lookup = _load_sample_lookup(_detail_mtime)
+                    for r in judge_results:
+                        backfill_chunk_exact_topk(r, _detail_lookup)
                     if judge_results:
                         # 计算指标
                         valid_results = [r for r in judge_results if "error" not in r]
@@ -7669,10 +8033,11 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 ce_col5.metric("无 retrieval", chunk_metrics["no_retrieval_count"])
 
                                 if chunk_metrics["formal_usable"]:
-                                    top_col1, top_col2, top_col3 = st.columns(3)
+                                    top_col1, top_col2, top_col3, top_col4 = st.columns(4)
                                     top_col1.metric("Chunk Exact Top1", f"{chunk_metrics['top1_hit_rate']:.0%}")
                                     top_col2.metric("Chunk Exact Top3", f"{chunk_metrics['top3_hit_rate']:.0%}")
                                     top_col3.metric("Chunk Exact Top5", f"{chunk_metrics['top5_hit_rate']:.0%}")
+                                    top_col4.metric("Chunk Exact Top10", f"{chunk_metrics['top10_hit_rate']:.0%}")
                                 else:
                                     st.warning(
                                         "当前 chunk_exact Judge 结果不可正式使用：pending 状态不计入 TopK miss。"
@@ -7690,6 +8055,9 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         _rp = PROCESSED_DIR / "langfuse_samples.jsonl"
                         _proc_mtime_local = str(_rp.stat().st_mtime) if _rp.exists() else ""
                         _all_lookup = _load_sample_lookup(_proc_mtime_local)
+                        # 补齐旧版 chunk_exact 缺失的 Top10
+                        for r in judge_results_viz:
+                            backfill_chunk_exact_topk(r, _all_lookup)
                         _run_sample_map = {}
                         for _tid, _pobj in _all_lookup.items():
                             _p_run_id = _pobj.get("run_id", "")
@@ -7736,6 +8104,117 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 st.dataframe(_dist, use_container_width=True, hide_index=True)
                         elif not chunk_exact_viz:
                             st.info("当前运行无检索评测轨道数据")
+
+                        # -- Chunk Exact 指标 --
+                        if chunk_exact_viz:
+                            st.markdown("**Chunk Exact（机器判定）**")
+                            ce_evaluable = [r for r in chunk_exact_viz
+                                            if r.get("retrieval_evaluable", True) is not False
+                                            and r.get("retrieval_top1_hit") is not None]
+                            ce_unevaluable = [r for r in chunk_exact_viz
+                                              if r.get("retrieval_evaluable", True) is False
+                                              or r.get("retrieval_top1_hit") is None]
+                            ce_n = len(ce_evaluable)
+                            ce_total = len(chunk_exact_viz)
+                            if ce_n > 0:
+                                ce_t1 = sum(r.get("retrieval_top1_hit", 0) for r in ce_evaluable)
+                                ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in ce_evaluable)
+                                ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in ce_evaluable)
+                                ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in ce_evaluable)
+                                ce_m1, ce_m2, ce_m3, ce_m4, ce_m5 = st.columns(5)
+                                with ce_m1:
+                                    st.metric("可评测", f"{ce_n}/{ce_total}")
+                                with ce_m2:
+                                    st.metric("Top1", f"{ce_t1}/{ce_n} ({ce_t1/ce_n:.1%})")
+                                with ce_m3:
+                                    st.metric("Top3", f"{ce_t3}/{ce_n} ({ce_t3/ce_n:.1%})")
+                                with ce_m4:
+                                    st.metric("Top5", f"{ce_t5}/{ce_n} ({ce_t5/ce_n:.1%})")
+                                with ce_m5:
+                                    st.metric("Top10", f"{ce_t10}/{ce_n} ({ce_t10/ce_n:.1%})")
+
+                            if ce_unevaluable:
+                                ue_counts = {}
+                                for r in ce_unevaluable:
+                                    s = r.get("chunk_exact_status") or "未知"
+                                    ue_counts[s] = ue_counts.get(s, 0) + 1
+                                ue_parts = [f"{s}: {c}" for s, c in ue_counts.items()]
+                                st.caption(f"不可评测 {len(ce_unevaluable)} 条 — " + "、".join(ue_parts))
+
+                            # 命中分布（Top1 / Top2-3 / Top4-5 / Top6-10 / Top10 miss）
+                            if ce_n > 0:
+                                _bucket_top1 = 0
+                                _bucket_2_3 = 0
+                                _bucket_4_5 = 0
+                                _bucket_6_10 = 0
+                                _bucket_miss = 0
+                                for r in ce_evaluable:
+                                    pos = r.get("hit_evidence_position")
+                                    if pos is None:
+                                        if r.get("retrieval_top10_hit"):
+                                            # 有 top10 hit 但无 position（不应发生，防御性处理）
+                                            _bucket_miss += 0
+                                        else:
+                                            _bucket_miss += 1
+                                    elif pos <= 1:
+                                        _bucket_top1 += 1
+                                    elif pos <= 3:
+                                        _bucket_2_3 += 1
+                                    elif pos <= 5:
+                                        _bucket_4_5 += 1
+                                    elif pos <= 10:
+                                        _bucket_6_10 += 1
+                                    else:
+                                        _bucket_miss += 1
+                                # 对于旧记录：top10=1 但 position=None 的情况归入 Top6-10
+                                # （因为旧 judge 只扫 top5，position=None 意味着命中在 6-10）
+                                _no_pos_but_top10 = sum(
+                                    1 for r in ce_evaluable
+                                    if r.get("hit_evidence_position") is None
+                                    and r.get("retrieval_top10_hit")
+                                )
+                                _bucket_6_10 += _no_pos_but_top10
+                                _bucket_miss -= _no_pos_but_top10
+
+                                st.markdown("**命中分布**")
+                                _hit_dist = pd.DataFrame([
+                                    {"区间": "Top1", "数量": _bucket_top1, "占比": f"{_bucket_top1/ce_n:.0%}"},
+                                    {"区间": "Top2-3", "数量": _bucket_2_3, "占比": f"{_bucket_2_3/ce_n:.0%}"},
+                                    {"区间": "Top4-5", "数量": _bucket_4_5, "占比": f"{_bucket_4_5/ce_n:.0%}"},
+                                    {"区间": "Top6-10", "数量": _bucket_6_10, "占比": f"{_bucket_6_10/ce_n:.0%}"},
+                                    {"区间": "Top10 miss", "数量": _bucket_miss, "占比": f"{_bucket_miss/ce_n:.0%}"},
+                                ])
+                                st.dataframe(_hit_dist, use_container_width=True, hide_index=True)
+
+                            # 每条样本摘要
+                            with st.expander(f"样本判定详情 ({ce_total} 条)", expanded=False):
+                                for i, r in enumerate(ce_evaluable):
+                                    seg_id = r.get("expected_segment_id", "")
+                                    seg_short = seg_id[:12] + "..." if len(str(seg_id)) > 12 else seg_id
+                                    pos = r.get("hit_evidence_position")
+                                    t1 = r.get("retrieval_top1_hit", 0)
+                                    t10 = r.get("retrieval_top10_hit", 0)
+                                    hit_str = f"Top{pos}" if pos else "未命中"
+                                    status_str = "✅ 命中" if t1 else "❌ 未命中"
+                                    # Top10 状态
+                                    if t10:
+                                        t10_str = f"Top10 命中（第 {pos} 位）" if pos else "Top10 命中"
+                                    else:
+                                        t10_str = "Top10 未命中"
+                                    st.caption(f"#{i+1} 目标 chunk: {seg_short} | 首次命中: {hit_str} | {status_str} | {t10_str}")
+
+                                    # Top10 未命中时展示实际返回
+                                    if not t10:
+                                        sample = _run_sample_map.get(r.get("trace_id", ""), {})
+                                        ret_results = sample.get("retrieval_results", [])[:10] if sample else []
+                                        if ret_results:
+                                            with st.expander("实际 Top10 返回", expanded=False):
+                                                for j, rr in enumerate(ret_results):
+                                                    _sid = rr.get("segment_id", rr.get("document_name", ""))
+                                                    _sid_short = str(_sid)[:12] + "..." if len(str(_sid)) > 12 else str(_sid)
+                                                    _score = rr.get("score", "")
+                                                    _score_str = f"{_score:.4f}" if isinstance(_score, (int, float)) else str(_score)
+                                                    st.caption(f"  Top{j+1}: {_sid_short} | score: {_score_str}")
 
                         # -- QA 指标卡片 --
                         if strict_qa_viz or grounded_qa_viz:

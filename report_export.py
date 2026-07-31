@@ -11,7 +11,7 @@ import re
 from datetime import datetime
 from html import escape
 
-from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE
+from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE, TRACK_CHUNK_EXACT, backfill_chunk_exact_topk
 
 # 敏感字段黑名单
 _SENSITIVE_KEYS = frozenset({
@@ -179,6 +179,276 @@ def _build_one_diagnostic(judge_result, sample_lookup, config):
     return base
 
 
+# ====== Chunk Exact 诊断数据 ======
+
+def _short_id(id_str, n=12):
+    """缩短 ID 用于展示，完整值保留在 title 属性中。"""
+    if not id_str:
+        return ""
+    s = str(id_str)
+    return s[:n] + "..." if len(s) > n else s
+
+
+def build_chunk_exact_diagnostic_data(judge_results, sample_lookup, config=None,
+                                      max_samples=_MAX_DIAGNOSTIC_SAMPLES):
+    """为 chunk_exact 轨道构建诊断数据：Top10 未命中、排序偏后和排序问题。
+
+    诊断拆分：
+    - top10_miss: Top10 完全未命中（完全未召回）
+    - top5_miss_but_top10_hit: Top5 未命中但 Top10 命中（排序偏后，Top6-10）
+    - sorting_issues: Top1 未命中但 Top3/Top5 命中
+
+    Args:
+        judge_results: 全部 judged results
+        sample_lookup: {trace_id: processed_sample_dict}
+        config: 配置方案 dict
+        max_samples: 每类最大条数
+
+    Returns:
+        dict: {
+            "top10_miss": [...],
+            "top5_miss_but_top10_hit": [...],
+            "sorting_issues": [...],
+            "total_top10_miss": int,
+            "total_top5_miss_but_top10_hit": int,
+            "total_sorting_issues": int,
+        }
+    """
+    config = config or {}
+    # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
+    for r in judge_results:
+        backfill_chunk_exact_topk(r, sample_lookup)
+
+    valid = [r for r in judge_results if "error" not in r]
+    chunk_exact = [r for r in valid
+                   if r.get("evaluation_track") == TRACK_CHUNK_EXACT
+                   and r.get("retrieval_evaluable", True) is not False
+                   and r.get("retrieval_top1_hit") is not None]
+
+    top10_miss = []
+    top5_miss_but_top10_hit = []
+    sorting_issues = []
+
+    for r in chunk_exact:
+        t1 = r.get("retrieval_top1_hit", 0)
+        t5 = r.get("retrieval_top5_hit", 0)
+        t10 = r.get("retrieval_top10_hit", 0)
+
+        if t10 == 0:
+            category = "top10_miss"
+        elif t5 == 0:
+            # Top5 未命中但 Top10 命中 → 排序偏后
+            category = "top5_miss_but_top10_hit"
+        elif t1 == 0:
+            category = "sorting_issues"
+        else:
+            continue
+
+        record = _build_chunk_exact_one_diagnostic(r, sample_lookup, config)
+        if category == "top10_miss":
+            top10_miss.append(record)
+        elif category == "top5_miss_but_top10_hit":
+            top5_miss_but_top10_hit.append(record)
+        else:
+            sorting_issues.append(record)
+
+    return {
+        "top10_miss": top10_miss[:max_samples],
+        "top5_miss_but_top10_hit": top5_miss_but_top10_hit[:max_samples],
+        "sorting_issues": sorting_issues[:max_samples],
+        "total_top10_miss": len(top10_miss),
+        "total_top5_miss_but_top10_hit": len(top5_miss_but_top10_hit),
+        "total_sorting_issues": len(sorting_issues),
+    }
+
+
+def _build_chunk_exact_one_diagnostic(judge_result, sample_lookup, config):
+    """为单个 chunk_exact judged result 构建诊断记录。"""
+    tid = judge_result.get("trace_id", "")
+    sample = sample_lookup.get(tid)
+
+    base = {
+        "trace_id": tid,
+        "run_id": judge_result.get("_source_run_id", judge_result.get("run_id", "")),
+        "question": judge_result.get("question", ""),
+        "question_id": judge_result.get("question_id") or "",
+        "question_set_id": judge_result.get("question_set_id") or "",
+        "question_set_name": judge_result.get("question_set_name") or "",
+        "evaluation_track": TRACK_CHUNK_EXACT,
+        "hit_evidence_position": judge_result.get("hit_evidence_position"),
+        "expected_segment_id": judge_result.get("expected_segment_id") or "",
+        "expected_content_hash": judge_result.get("expected_content_hash") or "",
+        "chunk_exact_status": judge_result.get("chunk_exact_status", ""),
+        "target_label": judge_result.get("target_label") or "",
+        "reason": judge_result.get("reason", ""),
+        "config_name": config.get("config_name", ""),
+        "config_id": config.get("config_id", ""),
+    }
+
+    # 从 sample 获取 retrieval 结果（扫描 Top10）
+    if sample:
+        raw_results = sample.get("retrieval_results") or []
+        clean_results = []
+        for rr in raw_results[:10]:
+            clean_results.append({
+                "position": rr.get("position"),
+                "segment_id": rr.get("segment_id") or rr.get("document_name") or "",
+                "score": rr.get("score"),
+                "content": (rr.get("content") or "")[:300],
+            })
+        base["retrieval_results"] = clean_results
+        base["retrieval_result_count"] = len(raw_results)
+        base["retrieval_query"] = sample.get("retrieval_query") or sample.get("question") or ""
+    else:
+        base["retrieval_results"] = []
+        base["retrieval_result_count"] = 0
+        base["retrieval_query"] = judge_result.get("question", "")
+
+    return base
+
+
+def _render_chunk_exact_diagnostic_cards(html_parts, records, total_count, section_title):
+    """渲染 chunk_exact 诊断卡片列表。"""
+    if not records:
+        html_parts.append(f'<p class="section-note">无{section_title}</p>')
+        return
+
+    shown = len(records)
+    truncated = total_count > shown
+    if truncated:
+        html_parts.append(f'<p class="section-note">共 {total_count} 条，显示前 {shown} 条</p>')
+    else:
+        html_parts.append(f'<p class="section-note">共 {total_count} 条</p>')
+
+    html_parts.append('<table><tr><th>#</th><th>Query</th><th>Target Label</th>'
+                      '<th>Expected Segment</th><th>首次命中</th><th>状态</th></tr>')
+
+    for i, d in enumerate(records, 1):
+        query = _safe_str(d.get("retrieval_query") or d.get("question", ""))
+        target_label = _safe_str(d.get("target_label", ""))
+        expected_seg = _safe_str(_short_id(d.get("expected_segment_id", "")))
+        expected_seg_full = _safe_str(d.get("expected_segment_id", ""))
+        pos = d.get("hit_evidence_position")
+        pos_str = f"Top{pos}" if pos is not None else "未命中"
+        status = "✅ 命中" if pos is not None and pos <= 5 else "❌ 未命中"
+
+        html_parts.append(
+            f'<tr><td>{i}</td>'
+            f'<td title="{_safe_str(d.get("question", ""))}">{query[:60]}</td>'
+            f'<td>{target_label}</td>'
+            f'<td title="{expected_seg_full}">{expected_seg}</td>'
+            f'<td>{pos_str}</td>'
+            f'<td>{status}</td></tr>'
+        )
+
+    html_parts.append('</table>')
+
+    # 展开详细检索结果
+    for i, d in enumerate(records, 1):
+        ret_results = d.get("retrieval_results") or []
+        if ret_results:
+            query = d.get("retrieval_query") or d.get("question", "")
+            expected_seg = d.get("expected_segment_id", "")
+            html_parts.append(f'<details><summary>#{i} {_safe_str(query[:50])} — 实际 Top5 返回</summary>')
+            html_parts.append(f'<p class="section-note">Expected: <code>{_safe_str(expected_seg)}</code></p>')
+            html_parts.append('<table class="retrieval-table"><tr><th>Rank</th><th>Segment ID</th><th>Score</th></tr>')
+            for rr in ret_results:
+                seg_id = _safe_str(_short_id(rr.get("segment_id", "")))
+                seg_id_full = _safe_str(rr.get("segment_id", ""))
+                score = rr.get("score", "")
+                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _safe_str(str(score))
+                html_parts.append(
+                    f'<tr><td>{rr.get("position", "")}</td>'
+                    f'<td title="{seg_id_full}">{seg_id}</td>'
+                    f'<td>{score_str}</td></tr>'
+                )
+            html_parts.append('</table></details>')
+
+
+def _render_chunk_exact_sample_appendix(html_parts, all_judge_results, sample_lookup):
+    """渲染 chunk_exact 样本审计附录（按 run 分组，可折叠）。"""
+    valid = [r for r in all_judge_results
+             if "error" not in r and r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+    if not valid:
+        return
+
+    # 按 run_id 分组
+    by_run = {}
+    for r in valid:
+        rid = r.get("_source_run_id", r.get("run_id", "unknown"))
+        by_run.setdefault(rid, []).append(r)
+
+    html_parts.append('<h2>附录：Chunk Exact 样本明细</h2>')
+
+    for rid, results in sorted(by_run.items()):
+        evaluable = [r for r in results
+                     if r.get("retrieval_evaluable", True) is not False
+                     and r.get("retrieval_top1_hit") is not None]
+        unevaluable = [r for r in results if r not in evaluable]
+
+        n = len(evaluable)
+        t1 = sum(r.get("retrieval_top1_hit", 0) for r in evaluable) if n else 0
+        t3 = sum(r.get("retrieval_top3_hit", 0) for r in evaluable) if n else 0
+        t5 = sum(r.get("retrieval_top5_hit", 0) for r in evaluable) if n else 0
+        t10 = sum(r.get("retrieval_top10_hit", 0) for r in evaluable) if n else 0
+
+        # 默认展开有问题的 run
+        has_issues = any(r.get("retrieval_top1_hit", 0) == 0 for r in evaluable)
+        open_attr = " open" if has_issues else ""
+
+        html_parts.append(
+            f'<details{open_attr}><summary>'
+            f'<strong>{_safe_str(rid)}</strong> — '
+            f'可评测 {n}/{len(results)} | '
+            f'Top1 {t1}/{n} | Top3 {t3}/{n} | Top5 {t5}/{n} | Top10 {t10}/{n}'
+            f'</summary>'
+        )
+
+        html_parts.append(
+            '<table><tr><th>#</th><th>Query</th><th>Target</th>'
+            '<th>Expected Segment</th><th>Hit Rank</th><th>Top1</th><th>Top3</th><th>Top5</th><th>Top10</th><th>Status</th></tr>'
+        )
+
+        for i, r in enumerate(results, 1):
+            query = _safe_str(r.get("question", ""))[:40]
+            target = _safe_str(r.get("target_label", ""))
+            expected_seg = _safe_str(_short_id(r.get("expected_segment_id", "")))
+            expected_full = _safe_str(r.get("expected_segment_id", ""))
+            pos = r.get("hit_evidence_position")
+            pos_str = f"Top{pos}" if pos is not None else "—"
+            t1v = r.get("retrieval_top1_hit")
+            t3v = r.get("retrieval_top3_hit")
+            t5v = r.get("retrieval_top5_hit")
+            t10v = r.get("retrieval_top10_hit")
+            t1s = "✅" if t1v else ("❌" if t1v == 0 else "—")
+            t3s = "✅" if t3v else ("❌" if t3v == 0 else "—")
+            t5s = "✅" if t5v else ("❌" if t5v == 0 else "—")
+            t10s = "✅" if t10v else ("❌" if t10v == 0 else "—")
+
+            ce_status = r.get("chunk_exact_status", "")
+            if ce_status:
+                status = f"⚠️ {ce_status}"
+            elif t1v:
+                status = "✅ Top1"
+            elif t3v:
+                status = "✅ Top3"
+            elif t5v:
+                status = "✅ Top5"
+            elif t10v:
+                status = "✅ Top10"
+            else:
+                status = "❌ 未命中"
+
+            html_parts.append(
+                f'<tr><td>{i}</td><td>{query}</td><td>{target}</td>'
+                f'<td title="{expected_full}">{expected_seg}</td>'
+                f'<td>{pos_str}</td><td>{t1s}</td><td>{t3s}</td><td>{t5s}</td><td>{t10s}</td>'
+                f'<td>{status}</td></tr>'
+            )
+
+        html_parts.append('</table></details>')
+
+
 # ====== HTML 辅助函数 ======
 
 _SENSITIVE_SNAPSHOT_KEYS = frozenset({
@@ -334,6 +604,10 @@ def _render_local_analysis_table(groups, group_label):
 def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics,
                           all_judge_results, export_scope="", sample_lookup=None):
     """生成自包含 HTML 评测报告。"""
+    # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
+    for r in all_judge_results:
+        backfill_chunk_exact_topk(r, sample_lookup)
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     config_name = _safe_str(config.get("config_name", ""))
     config_id = _safe_str(config.get("config_id", ""))
@@ -349,9 +623,27 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     strict_qa_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_STRICT_QA]
     grounded_qa_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_GROUNDED_QA]
     not_evaluable_results = [r for r in valid_results if r.get("evaluation_track") == TRACK_NOT_EVALUABLE]
+    chunk_exact_all = [r for r in valid_results if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+    chunk_exact_evaluable = [r for r in chunk_exact_all
+                             if r.get("retrieval_evaluable", True) is not False
+                             and r.get("retrieval_top1_hit") is not None]
+    chunk_exact_unevaluable = [r for r in chunk_exact_all if r not in chunk_exact_evaluable]
+
+    # 判断是否为纯 chunk_exact 报告
+    is_pure_chunk_exact = (
+        not retrieval_results
+        and not strict_qa_results
+        and not grounded_qa_results
+        and bool(chunk_exact_evaluable)
+    )
+
+    # 检测跨题集
+    all_qsid = {r.get("question_set_id", "") for r in valid_results if r.get("question_set_id")}
+    is_cross_set = len(all_qsid) > 1
 
     # 诊断数据
     diag = build_diagnostic_data(all_judge_results, sample_lookup, config)
+    ce_diag = build_chunk_exact_diagnostic_data(all_judge_results, sample_lookup, config)
 
     # 总览统计
     total_questions = sum(rd.get("run", {}).get("question_count", 0) for rd in run_data_list)
@@ -366,11 +658,19 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
         "strict_qa": len(strict_qa_results),
         "grounded_qa": len(grounded_qa_results),
         "not_evaluable": len(not_evaluable_results),
+        "chunk_exact": len(chunk_exact_all),
+        "chunk_exact_evaluable": len(chunk_exact_evaluable),
     }
     no_retrieval_results_count = sum(
         1 for d in diag["top5_miss"] + diag["sorting_issues"]
         if d.get("diagnostic_status") == "ok" and not d.get("retrieval_results")
     )
+
+    # 报告标题
+    if is_pure_chunk_exact:
+        report_title = "RAG 评测报告 — Chunk Exact 机器判定（segment_id / content_hash）"
+    else:
+        report_title = "RAG 评测报告"
 
     # 构建 HTML
     html_parts = [f"""<!DOCTYPE html>
@@ -378,7 +678,7 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RAG 评测报告 - {config_name}</title>
+<title>{report_title} - {config_name}</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          max-width: 1200px; margin: 0 auto; padding: 20px; color: #333; line-height: 1.6; }}
@@ -400,6 +700,10 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
   .hit {{ color: #28a745; font-weight: 600; }}
   .miss {{ color: #dc3545; font-weight: 600; }}
   .warn {{ color: #ffc107; }}
+  .info-box {{ background: #e7f3ff; border: 1px solid #b3d7ff; border-radius: 6px;
+               padding: 12px 16px; margin: 12px 0; font-size: 0.9em; }}
+  .warn-box {{ background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px;
+               padding: 12px 16px; margin: 12px 0; font-size: 0.9em; }}
   .section-note {{ color: #888; font-size: 0.85em; font-style: italic; }}
   .diag-card {{ border: 1px solid #dee2e6; border-radius: 8px; padding: 16px; margin: 16px 0;
                 background: #fff; page-break-inside: avoid; }}
@@ -420,7 +724,7 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 </style>
 </head>
 <body>
-<h1>RAG 评测报告</h1>
+<h1>{report_title}</h1>
 <div class="meta">
   <p><strong>配置方案</strong>: {config_name} (<code>{config_id}</code>)</p>
   <p><strong>知识库版本</strong>: {kb_version or '未指定'}</p>
@@ -428,11 +732,33 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
   <p><strong>生成时间</strong>: {now}</p>
   <p><strong>导出范围</strong>: {_safe_str(export_scope) or '当前配置全部运行'}</p>
   <p><strong>数据口径</strong>: 通过 config_id → run_id → processed sample → 真实 Langfuse trace_id → judged result 关联；
-     检索命中仅对 evaluation_track=retrieval 的可评测样本计算 Top1/Top3/Top5；QA 轨道单独统计，不与检索命中率混合。</p>
+     检索命中仅对 evaluation_track=retrieval 的可评测样本计算 Top1/Top3/Top5；
+     chunk_exact 按 segment_id/content_hash 纯机器判定，单独统计；
+     QA 轨道单独统计，不与检索命中率混合；
+     missing_binding / no_trace / no_retrieval 不计入 chunk_exact TopK 分母。</p>
 </div>
 """]
 
+    # 跨题集警告
+    if is_cross_set:
+        html_parts.append(
+            '<div class="warn-box">⚠️ <strong>跨题集探索汇总</strong>：本报告聚合了多个 question_set_id 的结果，'
+            '不作为单一固定题集的横向模型比较基线。</div>'
+        )
+
+    # 纯 chunk_exact 说明
+    if is_pure_chunk_exact:
+        html_parts.append(
+            '<div class="info-box">本报告不含 AI 证据 Judge（retrieval）样本；'
+            '以下为 <strong>Chunk Exact 机器判定</strong>结果。</div>'
+        )
+
     # 1. 总览指标
+    ce_n = len(chunk_exact_evaluable)
+    ce_t1 = sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_evaluable)
+    ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_evaluable)
+    ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_evaluable)
+
     html_parts.append(f"""
 <h2>1. 总览</h2>
 <div class="metric-grid">
@@ -440,12 +766,14 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
   <div class="metric-card"><div class="value">{total_questions}</div><div class="label">题目总数</div></div>
   <div class="metric-card"><div class="value">{total_batch_success}/{total_batch_total}</div><div class="label">Batch 成功</div></div>
   <div class="metric-card"><div class="value">{total_processed}</div><div class="label">Processed</div></div>
-  <div class="metric-card"><div class="value">{total_judge}</div><div class="label">Judge 已评测</div></div>
+  <div class="metric-card"><div class="value">{total_judge}</div><div class="label">AI Judge 已评测</div></div>
+  <div class="metric-card"><div class="value">{track_counts['chunk_exact']}</div><div class="label">机器判定完成</div></div>
   <div class="metric-card"><div class="value">{len(error_results)}</div><div class="label">Judge 错误</div></div>
 </div>
 <table>
 <tr><th>轨道</th><th>样本数</th></tr>
 <tr><td>retrieval（可评测）</td><td>{track_counts['retrieval_evaluable']}</td></tr>
+<tr><td>chunk_exact（精确匹配）</td><td>{track_counts['chunk_exact']}</td></tr>
 <tr><td>strict_qa</td><td>{track_counts['strict_qa']}</td></tr>
 <tr><td>grounded_qa</td><td>{track_counts['grounded_qa']}</td></tr>
 <tr><td>不可评测</td><td>{track_counts['not_evaluable']}</td></tr>
@@ -454,45 +782,72 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 </table>
 """)
 
+    # chunk_exact 摘要卡片
+    if chunk_exact_evaluable:
+        html_parts.append(f"""
+<div class="metric-grid">
+  <div class="metric-card"><div class="value">{ce_n}/{track_counts['chunk_exact']}</div><div class="label">chunk_exact 可评测</div></div>
+  <div class="metric-card"><div class="value">{ce_t1}/{ce_n} ({_pct(ce_t1/ce_n)})</div><div class="label">Top1</div></div>
+  <div class="metric-card"><div class="value">{ce_t3}/{ce_n} ({_pct(ce_t3/ce_n)})</div><div class="label">Top3</div></div>
+  <div class="metric-card"><div class="value">{ce_t5}/{ce_n} ({_pct(ce_t5/ce_n)})</div><div class="label">Top5</div></div>
+</div>
+""")
+        if chunk_exact_unevaluable:
+            ue_counts = {}
+            for r in chunk_exact_unevaluable:
+                s = r.get("chunk_exact_status") or "未知"
+                ue_counts[s] = ue_counts.get(s, 0) + 1
+            ue_parts = [f"{s}: {c}" for s, c in ue_counts.items()]
+            html_parts.append(
+                f'<p class="section-note">不可评测 {len(chunk_exact_unevaluable)} 条 — {"、".join(ue_parts)}</p>'
+            )
+
     # 2. 配置与运行信息
     html_parts.append("<h2>2. 配置与运行信息</h2>")
+    # 共享配置显示一次
+    if run_data_list:
+        snapshot0 = run_data_list[0].get("run", {}).get("config_snapshot") or {}
+        if snapshot0:
+            html_parts.append('<details><summary>共享配置快照（config_snapshot）</summary>')
+            html_parts.append(_render_config_snapshot_table(snapshot0))
+            html_parts.append('</details>')
+
+    # 各 run 简表
+    html_parts.append(
+        '<table><tr><th>运行</th><th>题集</th><th>题集 ID</th><th>题目数</th>'
+        '<th>状态</th><th>Batch</th><th>开始时间</th></tr>'
+    )
     for rd in run_data_list:
         run = rd["run"]
         rs = rd["run_status"]
         rid = _safe_str(run.get("run_id", ""))
+        rid_short = _short_id(rid)
         qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
         qsid = _safe_str(rs.get("question_set_id") or run.get("question_set_id", "") or "")
-        started = _safe_str(run.get("started_at", ""))[:19]
+        qsid_short = _short_id(qsid)
+        qc = run.get("question_count", 0)
         status = _safe_str(run.get("status", ""))
-        snapshot = run.get("config_snapshot") or {}
-
-        html_parts.append(f'<h3>{rid}</h3><table>')
-        html_parts.append(f'<tr><td><strong>配置名</strong></td><td>{_safe_str(snapshot.get("config_name", "") or config_name)}</td></tr>')
-        html_parts.append(f'<tr><td><strong>Config ID</strong></td><td>{_safe_str(snapshot.get("config_id", "") or config_id)}</td></tr>')
-        html_parts.append(f'<tr><td><strong>知识库版本</strong></td><td>{_safe_str(snapshot.get("knowledge_base_version", "") or "未记录")}</td></tr>')
-        html_parts.append(f'<tr><td><strong>工作流版本</strong></td><td>{_safe_str(snapshot.get("workflow_version", "") or "未记录")}</td></tr>')
-        html_parts.append(f'<tr><td><strong>题集名称</strong></td><td>{qs}</td></tr>')
-        html_parts.append(f'<tr><td><strong>Question Set ID</strong></td><td>{qsid}</td></tr>')
-        html_parts.append(f'<tr><td><strong>开始时间</strong></td><td>{started}</td></tr>')
-        html_parts.append(f'<tr><td><strong>状态</strong></td><td>{status}</td></tr>')
-        html_parts.append('</table>')
-
-        # 完整 config_snapshot
-        if snapshot:
-            html_parts.append('<details><summary>完整配置快照（config_snapshot）</summary>')
-            html_parts.append(_render_config_snapshot_table(snapshot))
-            html_parts.append('</details>')
-        else:
-            html_parts.append('<p class="section-note">该运行未记录配置快照</p>')
+        bs = rs.get("batch_success", 0)
+        bt = rs.get("batch_total", 0)
+        started = _safe_str(run.get("started_at", ""))[:19]
+        html_parts.append(
+            f'<tr><td title="{rid}"><code>{rid_short}</code></td>'
+            f'<td>{qs}</td><td title="{qsid}"><code>{qsid_short}</code></td>'
+            f'<td>{qc}</td><td>{status}</td><td>{bs}/{bt}</td><td>{started}</td></tr>'
+        )
+    html_parts.append('</table>')
 
     # 3. 全局 Judge 指标
     html_parts.append("<h2>3. 全局 Judge 指标</h2>")
+
+    # retrieval 指标
     if retrieval_results:
         n = len(retrieval_results)
         t1 = sum(r.get("retrieval_top1_hit", 0) for r in retrieval_results)
         t3 = sum(r.get("retrieval_top3_hit", 0) for r in retrieval_results)
         t5 = sum(r.get("retrieval_top5_hit", 0) for r in retrieval_results)
         html_parts.append(f"""
+<h3>检索评测（AI Judge）</h3>
 <p class="section-note">仅 evaluation_track=retrieval 的可评测样本</p>
 <table>
 <tr><th>指标</th><th>命中数</th><th>样本数</th><th>命中率</th></tr>
@@ -501,8 +856,8 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 <tr><td>Top5 Hit</td><td>{t5}</td><td>{n}</td><td>{_pct(t5/n)}</td></tr>
 </table>
 """)
-    else:
-        html_parts.append('<p class="section-note">暂无检索评测数据</p>')
+    elif not is_pure_chunk_exact:
+        html_parts.append('<p class="section-note">本报告不含 AI 证据 Judge（retrieval）样本</p>')
 
     if strict_qa_results:
         n = len(strict_qa_results)
@@ -513,98 +868,187 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
         gnd = sum(r.get("answer_correct", 0) for r in grounded_qa_results)
         html_parts.append(f'<p>合理性问答: 有据 {gnd} / 总 {n} = {_pct(gnd/n)}</p>')
 
-    # 3.5 局部分析
-    html_parts.append("<h2>4. 局部分析</h2>")
-    local = _compute_local_analysis(retrieval_results, strict_qa_results, grounded_qa_results,
-                                    error_results, sample_lookup, diag)
-
-    html_parts.append("<h3>按源文件</h3>")
-    html_parts.append(_render_local_analysis_table(local["by_source_file"], "源文件"))
-
-    html_parts.append("<h3>按 Topic</h3>")
-    html_parts.append(_render_local_analysis_table(local["by_topic"], "Topic"))
-
-    html_parts.append("<h3>按难度</h3>")
-    html_parts.append(_render_local_analysis_table(local["by_difficulty"], "难度"))
-
-    if local["by_source_format"]:
-        html_parts.append("<h3>按文档格式</h3>")
-        html_parts.append(_render_local_analysis_table(local["by_source_format"], "格式"))
-
-    # 5. 运行汇总表
-    html_parts.append("""
-<h2>5. 运行汇总</h2>
+    # chunk_exact 指标
+    if chunk_exact_evaluable:
+        n = len(chunk_exact_evaluable)
+        t1 = sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_evaluable)
+        t3 = sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_evaluable)
+        t5 = sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_evaluable)
+        t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
+        html_parts.append(f"""
+<h3>Chunk Exact（机器判定）</h3>
+<p class="section-note">按 segment_id / content_hash 纯机器判定，分母仅限可评测样本 (n={n})</p>
 <table>
-<tr><th>运行 ID</th><th>题集</th><th>题目数</th><th>状态</th><th>Batch</th><th>Processed</th><th>Judge</th>
-<th>Top1</th><th>Top3</th><th>Top5</th><th>Top5未命中</th><th>排序问题</th><th>错误数</th></tr>
+<tr><th>指标</th><th>命中数</th><th>样本数</th><th>命中率</th></tr>
+<tr><td>Top1 Hit</td><td>{t1}</td><td>{n}</td><td>{_pct(t1/n)}</td></tr>
+<tr><td>Top3 Hit</td><td>{t3}</td><td>{n}</td><td>{_pct(t3/n)}</td></tr>
+<tr><td>Top5 Hit</td><td>{t5}</td><td>{n}</td><td>{_pct(t5/n)}</td></tr>
+<tr><td>Top10 Hit</td><td>{t10}</td><td>{n}</td><td>{_pct(t10/n)}</td></tr>
+</table>
 """)
-    for rd in run_data_list:
-        run = rd["run"]
-        rs = rd["run_status"]
-        m = rd.get("metrics") or {}
-        rid = _safe_str(run.get("run_id", ""))
-        qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
-        qc = run.get("question_count", 0)
-        status = _safe_str(run.get("status", ""))
-        bs = rs.get("batch_success", 0)
-        bt = rs.get("batch_total", 0)
-        pc = rs.get("processed_count", 0)
-        jc = rs.get("judge_count", 0)
-        t1 = _pct(m.get("retrieval_top1_hit_rate"))
-        t3 = _pct(m.get("retrieval_top3_hit_rate"))
-        t5 = _pct(m.get("retrieval_top5_hit_rate"))
-        errs = m.get("errors", 0)
-        # 从该 run 的 judge_results 计算 miss/sorting
-        _run_jr = rs.get("judge_results", [])
-        _run_valid = [r for r in _run_jr if "error" not in r]
-        _run_ret = [r for r in _run_valid
-                    if r.get("evaluation_track") == TRACK_RETRIEVAL
-                    and r.get("retrieval_evaluable", True)]
-        miss5 = sum(1 for r in _run_ret if r.get("retrieval_top5_hit", 0) == 0)
-        sort_issues = sum(1 for r in _run_ret
-                          if r.get("retrieval_top1_hit", 0) == 0 and r.get("retrieval_top5_hit", 0) == 1)
-        html_parts.append(
-            f'<tr><td><code>{rid}</code></td><td>{qs}</td><td>{qc}</td><td>{status}</td>'
-            f'<td>{bs}/{bt}</td><td>{pc}</td><td>{jc}</td>'
-            f'<td>{t1}</td><td>{t3}</td><td>{t5}</td>'
-            f'<td>{miss5}</td><td>{sort_issues}</td><td>{errs}</td></tr>'
-        )
-    html_parts.append("</table>")
 
-    # 5. 运行详情
+        # 命中位置分布（互斥分桶，扩展至 Top10）
+        bucket_top1 = 0
+        bucket_2_3 = 0
+        bucket_4_5 = 0
+        bucket_6_10 = 0
+        bucket_miss = 0
+        for r in chunk_exact_evaluable:
+            pos = r.get("hit_evidence_position")
+            t1 = r.get("retrieval_top1_hit", 0)
+            t10 = r.get("retrieval_top10_hit", 0)
+            if t1:
+                bucket_top1 += 1
+            elif pos is not None and 2 <= pos <= 3:
+                bucket_2_3 += 1
+            elif pos is not None and 4 <= pos <= 5:
+                bucket_4_5 += 1
+            elif pos is not None and 6 <= pos <= 10:
+                bucket_6_10 += 1
+            elif t10:
+                # 旧记录 position=None 但 top10=1（命中在 6-10）
+                bucket_6_10 += 1
+            else:
+                bucket_miss += 1
+
+        html_parts.append(f"""
+<h3>命中位置分布</h3>
+<table>
+<tr><th>分桶</th><th>数量</th><th>占比</th></tr>
+<tr><td>Top1 命中</td><td>{bucket_top1}</td><td>{_pct(bucket_top1/n)}</td></tr>
+<tr><td>第 2-3 位首次命中</td><td>{bucket_2_3}</td><td>{_pct(bucket_2_3/n)}</td></tr>
+<tr><td>第 4-5 位首次命中</td><td>{bucket_4_5}</td><td>{_pct(bucket_4_5/n)}</td></tr>
+<tr><td>第 6-10 位首次命中</td><td>{bucket_6_10}</td><td>{_pct(bucket_6_10/n)}</td></tr>
+<tr><td>Top10 未命中</td><td>{bucket_miss}</td><td>{_pct(bucket_miss/n)}</td></tr>
+</table>
+<p class="section-note">分母仅限 chunk_exact 可评测样本 (n={n})，分桶互斥</p>
+""")
+    elif not chunk_exact_all:
+        if not is_pure_chunk_exact:
+            html_parts.append('<p class="section-note">暂无 chunk_exact 评测数据</p>')
+
+    # 3.5 局部分析（仅当有 retrieval/QA 数据时展示）
+    if retrieval_results or strict_qa_results or grounded_qa_results:
+        html_parts.append("<h2>4. 局部分析</h2>")
+        local = _compute_local_analysis(retrieval_results, strict_qa_results, grounded_qa_results,
+                                        error_results, sample_lookup, diag)
+
+        html_parts.append("<h3>按源文件</h3>")
+        html_parts.append(_render_local_analysis_table(local["by_source_file"], "源文件"))
+
+        html_parts.append("<h3>按 Topic</h3>")
+        html_parts.append(_render_local_analysis_table(local["by_topic"], "Topic"))
+
+        html_parts.append("<h3>按难度</h3>")
+        html_parts.append(_render_local_analysis_table(local["by_difficulty"], "难度"))
+
+        if local["by_source_format"]:
+            html_parts.append("<h3>按文档格式</h3>")
+            html_parts.append(_render_local_analysis_table(local["by_source_format"], "格式"))
+
+    # 5. 运行汇总表（按题集分组）
+    # retrieval 汇总
+    if retrieval_results or strict_qa_results or grounded_qa_results:
+        html_parts.append("""
+<h2>5. 运行汇总</h2>
+<h3>AI Judge 轨道</h3>
+<table>
+<tr><th>题集</th><th>题集 ID</th><th>题目数</th><th>状态</th><th>Batch</th><th>Top1</th><th>Top3</th><th>Top5</th><th>Top5未命中</th><th>排序问题</th><th>错误数</th></tr>
+""")
+        for rd in run_data_list:
+            run = rd["run"]
+            rs = rd["run_status"]
+            m = rd.get("metrics") or {}
+            qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
+            qsid = _safe_str(rs.get("question_set_id") or run.get("question_set_id", "") or "")
+            qsid_short = _short_id(qsid)
+            qc = run.get("question_count", 0)
+            status = _safe_str(run.get("status", ""))
+            bs = rs.get("batch_success", 0)
+            bt = rs.get("batch_total", 0)
+            t1 = _pct(m.get("retrieval_top1_hit_rate"))
+            t3 = _pct(m.get("retrieval_top3_hit_rate"))
+            t5 = _pct(m.get("retrieval_top5_hit_rate"))
+            errs = m.get("errors", 0)
+            _run_jr = rs.get("judge_results", [])
+            _run_valid = [r for r in _run_jr if "error" not in r]
+            _run_ret = [r for r in _run_valid
+                        if r.get("evaluation_track") == TRACK_RETRIEVAL
+                        and r.get("retrieval_evaluable", True)]
+            miss5 = sum(1 for r in _run_ret if r.get("retrieval_top5_hit", 0) == 0)
+            sort_issues = sum(1 for r in _run_ret
+                              if r.get("retrieval_top1_hit", 0) == 0 and r.get("retrieval_top5_hit", 0) == 1)
+            html_parts.append(
+                f'<tr><td>{qs}</td><td title="{qsid}"><code>{qsid_short}</code></td>'
+                f'<td>{qc}</td><td>{status}</td><td>{bs}/{bt}</td>'
+                f'<td>{t1}</td><td>{t3}</td><td>{t5}</td>'
+                f'<td>{miss5}</td><td>{sort_issues}</td><td>{errs}</td></tr>'
+            )
+        html_parts.append("</table>")
+
+    # chunk_exact 汇总
+    if chunk_exact_evaluable:
+        html_parts.append("""
+<h3>Chunk Exact 轨道</h3>
+<table>
+<tr><th>题集</th><th>题集 ID</th><th>可评测</th><th>Top1</th><th>Top3</th><th>Top5</th><th>Top10</th><th>Top10未命中</th><th>排序问题</th></tr>
+""")
+        # 按 question_set_id 分组
+        ce_by_qsid = {}
+        for r in chunk_exact_evaluable:
+            qsid = r.get("question_set_id") or "未知"
+            ce_by_qsid.setdefault(qsid, []).append(r)
+
+        for rd in run_data_list:
+            run = rd["run"]
+            rs = rd["run_status"]
+            m = rd.get("metrics") or {}
+            qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
+            qsid = rs.get("question_set_id") or run.get("question_set_id", "") or ""
+            qsid_short = _short_id(qsid)
+
+            ce_count = m.get("chunk_exact_track_count", 0)
+            if ce_count == 0:
+                continue
+
+            ce_eval_n = m.get("chunk_exact_evaluable_count", 0)
+            ce_t1 = m.get("chunk_exact_top1_hit_count", 0)
+            ce_t3 = m.get("chunk_exact_top3_hit_count", 0)
+            ce_t5 = m.get("chunk_exact_top5_hit_count", 0)
+            ce_t10 = m.get("chunk_exact_top10_hit_count", 0)
+            ce_miss10 = sum(1 for r in chunk_exact_evaluable
+                            if r.get("question_set_id") == qsid
+                            and r.get("retrieval_top10_hit", 0) == 0)
+            ce_sort = sum(1 for r in chunk_exact_evaluable
+                          if r.get("question_set_id") == qsid
+                          and r.get("retrieval_top1_hit", 0) == 0
+                          and r.get("retrieval_top5_hit", 0) == 1)
+
+            html_parts.append(
+                f'<tr><td>{qs}</td><td title="{qsid}"><code>{qsid_short}</code></td>'
+                f'<td>{ce_eval_n}/{ce_count}</td>'
+                f'<td>{ce_t1}/{ce_eval_n} ({_pct(ce_t1/ce_eval_n) if ce_eval_n else "N/A"})</td>'
+                f'<td>{ce_t3}/{ce_eval_n} ({_pct(ce_t3/ce_eval_n) if ce_eval_n else "N/A"})</td>'
+                f'<td>{ce_t5}/{ce_eval_n} ({_pct(ce_t5/ce_eval_n) if ce_eval_n else "N/A"})</td>'
+                f'<td>{ce_t10}/{ce_eval_n} ({_pct(ce_t10/ce_eval_n) if ce_eval_n else "N/A"})</td>'
+                f'<td>{ce_miss10}</td><td>{ce_sort}</td></tr>'
+            )
+        html_parts.append("</table>")
+
+    # 6. 运行详情
     html_parts.append("<h2>6. 运行详情</h2>")
     for rd in run_data_list:
         run = rd["run"]
         rs = rd["run_status"]
         m = rd.get("metrics") or {}
         rid = _safe_str(run.get("run_id", ""))
+        rid_short = _short_id(rid)
         qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
         started = _safe_str(run.get("started_at", ""))[:19]
         status = _safe_str(run.get("status", ""))
-        batch_file = _safe_str(run.get("batch_results_file", "") or "无")
-        raw_file = _safe_str(run.get("raw_results_file", "") or "无")
 
-        # 该 run 的 config_snapshot
-        snapshot = run.get("config_snapshot") or {}
-
-        html_parts.append(f"""
-<h3>{rid}</h3>
-<table>
-<tr><td><strong>题集</strong></td><td>{qs}</td></tr>
-<tr><td><strong>创建时间</strong></td><td>{started}</td></tr>
-<tr><td><strong>状态</strong></td><td>{status}</td></tr>
-<tr><td><strong>Batch 文件</strong></td><td><code>{batch_file}</code></td></tr>
-<tr><td><strong>Raw 文件</strong></td><td><code>{raw_file}</code></td></tr>
-<tr><td><strong>Batch</strong></td><td>{rs.get('batch_success', 0)}/{rs.get('batch_total', 0)}</td></tr>
-<tr><td><strong>Processed</strong></td><td>{rs.get('processed_count', 0)}</td></tr>
-<tr><td><strong>Judge</strong></td><td>{rs.get('judge_count', 0)}</td></tr>
-</table>
-""")
-        # 展示 config_snapshot
-        if snapshot:
-            html_parts.append('<details><summary>该次运行配置快照（config_snapshot）</summary>')
-            html_parts.append(_render_config_snapshot_table(snapshot))
-            html_parts.append('</details>')
+        html_parts.append(f'<h3 title="{rid}">{qs} — <code>{rid_short}</code></h3>')
+        html_parts.append(f'<p class="section-note">状态: {status} | 开始: {started}</p>')
 
         jr = rs.get("judge_results", [])
         if jr:
@@ -616,45 +1060,92 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
                 t3 = sum(r.get("retrieval_top3_hit", 0) for r in ret_jr) / n
                 t5 = sum(r.get("retrieval_top5_hit", 0) for r in ret_jr) / n
                 html_parts.append(f'<p>检索评测 (n={n}): Top1={_pct(t1)} | Top3={_pct(t3)} | Top5={_pct(t5)}</p>')
-            sqa_jr = [r for r in valid_jr if r.get("evaluation_track") == TRACK_STRICT_QA]
-            if sqa_jr:
-                n = len(sqa_jr)
-                acc = sum(r.get("answer_correct", 0) for r in sqa_jr) / n
-                html_parts.append(f'<p>严格问答 (n={n}): Answer Correctness={_pct(acc)}</p>')
-            gqa_jr = [r for r in valid_jr if r.get("evaluation_track") == TRACK_GROUNDED_QA]
-            if gqa_jr:
-                n = len(gqa_jr)
-                acc = sum(r.get("answer_correct", 0) for r in gqa_jr) / n
-                html_parts.append(f'<p>合理性问答 (n={n}): Answer Grounded={_pct(acc)}</p>')
+
+            # chunk_exact 详情
+            ce_jr = [r for r in valid_jr if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+            if ce_jr:
+                ce_evaluable_jr = [r for r in ce_jr
+                                   if r.get("retrieval_evaluable", True) is not False
+                                   and r.get("retrieval_top1_hit") is not None]
+                ce_unevaluable_jr = [r for r in ce_jr if r not in ce_evaluable_jr]
+                n = len(ce_evaluable_jr)
+                total_ce = len(ce_jr)
+                if n > 0:
+                    t1 = sum(r.get("retrieval_top1_hit", 0) for r in ce_evaluable_jr)
+                    t3 = sum(r.get("retrieval_top3_hit", 0) for r in ce_evaluable_jr)
+                    t5 = sum(r.get("retrieval_top5_hit", 0) for r in ce_evaluable_jr)
+                    html_parts.append(
+                        f'<p><strong>Chunk Exact（机器判定）</strong> '
+                        f'可评测 {n}/{total_ce} | '
+                        f'Top1 {t1}/{n} ({_pct(t1/n)}) | '
+                        f'Top3 {t3}/{n} ({_pct(t3/n)}) | '
+                        f'Top5 {t5}/{n} ({_pct(t5/n)})</p>'
+                    )
+                if ce_unevaluable_jr:
+                    ue_counts = {}
+                    for r in ce_unevaluable_jr:
+                        s = r.get("chunk_exact_status") or "未知"
+                        ue_counts[s] = ue_counts.get(s, 0) + 1
+                    ue_parts = [f"{s}: {c}" for s, c in ue_counts.items()]
+                    html_parts.append(f'<p class="section-note">不可评测 {len(ce_unevaluable_jr)} 条 — {"、".join(ue_parts)}</p>')
+
             err_jr = [r for r in jr if "error" in r]
             if err_jr:
                 html_parts.append(f'<p class="miss">Judge 错误: {len(err_jr)} 条</p>')
 
-    # 6. Top5 完全未命中样本诊断
-    html_parts.append("<h2>7. Top5 完全未命中样本诊断</h2>")
-    _render_diagnostic_cards(html_parts, diag["top5_miss"], diag["total_top5_miss"],
-                             "Top5 未命中（检索结果均未命中金标准）", show_details=True)
+    # 7. Chunk Exact 诊断（Top10 未命中 / 排序偏后 / 排序问题）
+    if chunk_exact_evaluable:
+        html_parts.append("<h2>7. Chunk Exact 诊断</h2>")
 
-    # 7. 排序问题样本
-    html_parts.append("<h2>8. 排序问题样本（Top1 未命中但 Top3/Top5 命中）</h2>")
-    _render_diagnostic_cards(html_parts, diag["sorting_issues"], diag["total_sorting_issues"],
-                             "排序问题（Top1 未命中但更高排名命中，说明相关内容被排到较低位置）",
-                             show_details=True)
+        html_parts.append("<h3>Top10 未命中（完全未召回）</h3>")
+        _render_chunk_exact_diagnostic_cards(
+            html_parts, ce_diag["top10_miss"], ce_diag["total_top10_miss"],
+            "Top10 未命中",
+        )
 
-    # 8. 数据质量
+        html_parts.append("<h3>排序偏后（Top5 未命中但 Top10 命中，Top6-10）</h3>")
+        _render_chunk_exact_diagnostic_cards(
+            html_parts, ce_diag["top5_miss_but_top10_hit"], ce_diag["total_top5_miss_but_top10_hit"],
+            "排序偏后",
+        )
+
+        html_parts.append("<h3>排序问题（Top1 未命中但 Top3/Top5 命中）</h3>")
+        _render_chunk_exact_diagnostic_cards(
+            html_parts, ce_diag["sorting_issues"], ce_diag["total_sorting_issues"],
+            "排序问题",
+        )
+
+    # 8. AI Judge 诊断（retrieval 轨道）
+    if retrieval_results:
+        html_parts.append("<h2>8. AI Judge 诊断</h2>")
+
+        html_parts.append("<h3>Top5 完全未命中</h3>")
+        _render_diagnostic_cards(html_parts, diag["top5_miss"], diag["total_top5_miss"],
+                                 "Top5 未命中（检索结果均未命中金标准）", show_details=True)
+
+        html_parts.append("<h3>排序问题（Top1 未命中但 Top3/Top5 命中）</h3>")
+        _render_diagnostic_cards(html_parts, diag["sorting_issues"], diag["total_sorting_issues"],
+                                 "排序问题（Top1 未命中但更高排名命中，说明相关内容被排到较低位置）",
+                                 show_details=True)
+
+    # 9. 数据质量
     html_parts.append("<h2>9. 数据质量与可审计信息</h2><ul>")
     html_parts.append(f'<li>Judge 错误结果: <strong>{len(error_results)}</strong> 条</li>')
     html_parts.append(f'<li>不可评测样本（缺少金标准证据）: <strong>{len(not_evaluable_results)}</strong> 条</li>')
     html_parts.append(f'<li>无检索结果的样本: <strong>{no_retrieval_results_count}</strong> 条</li>')
 
+    # chunk_exact 不可评测状态
+    if chunk_exact_unevaluable:
+        ce_ue_counts = {}
+        for r in chunk_exact_unevaluable:
+            s = r.get("chunk_exact_status") or "未知"
+            ce_ue_counts[s] = ce_ue_counts.get(s, 0) + 1
+        for status, count in ce_ue_counts.items():
+            html_parts.append(f'<li>chunk_exact 不可评测 ({status}): <strong>{count}</strong> 条</li>')
+
     no_trace = [r for r in all_judge_results if not r.get("trace_id")]
     if no_trace:
         html_parts.append(f'<li class="warn">缺少 trace_id 的结果: <strong>{len(no_trace)}</strong> 条</li>')
-
-    no_sample = sum(1 for d in diag["top5_miss"] if d["diagnostic_status"] == "no_processed_sample")
-    no_sample += sum(1 for d in diag["sorting_issues"] if d["diagnostic_status"] == "no_processed_sample")
-    if no_sample:
-        html_parts.append(f'<li class="warn">未找到对应 processed sample 的诊断样本: <strong>{no_sample}</strong> 条</li>')
 
     if error_results:
         html_parts.append('</ul><h3>Judge 错误详情（前 10 条）</h3><table>')
@@ -666,6 +1157,10 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
         html_parts.append('</table>')
     else:
         html_parts.append('</ul>')
+
+    # 附录：Chunk Exact 样本明细
+    if chunk_exact_all:
+        _render_chunk_exact_sample_appendix(html_parts, all_judge_results, sample_lookup)
 
     html_parts.append("</body></html>")
     return "".join(html_parts)
@@ -867,7 +1362,8 @@ def build_runs_csv(run_data_list):
         "retrieval_track_count", "retrieval_top1_hit_rate", "retrieval_top3_hit_rate", "retrieval_top5_hit_rate",
         "strict_qa_count", "strict_qa_answer_rate",
         "grounded_qa_count", "grounded_qa_answer_rate",
-        "top5_miss_count", "sorting_issue_count",
+        "chunk_exact_count", "chunk_exact_top1_hit_rate", "chunk_exact_top3_hit_rate", "chunk_exact_top5_hit_rate", "chunk_exact_top10_hit_rate",
+        "top10_miss_count", "sorting_issue_count",
         "errors",
         "config_snapshot_summary",
     ])
@@ -887,6 +1383,11 @@ def build_runs_csv(run_data_list):
         miss5 = sum(1 for r in _run_ret if r.get("retrieval_top5_hit", 0) == 0)
         sort_issues = sum(1 for r in _run_ret
                           if r.get("retrieval_top1_hit", 0) == 0 and r.get("retrieval_top5_hit", 0) == 1)
+
+        # chunk_exact 未命中统计
+        _run_ce = [r for r in _run_valid
+                   if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+        ce_miss10 = sum(1 for r in _run_ce if r.get("retrieval_top10_hit", 0) == 0)
 
         # config_snapshot 可读摘要（排除敏感字段）
         safe_snapshot = {k: v for k, v in snapshot.items()
@@ -917,7 +1418,12 @@ def build_runs_csv(run_data_list):
             m.get("strict_qa_answer_rate"),
             m.get("grounded_qa_track_count", 0),
             m.get("grounded_qa_answer_rate"),
-            miss5,
+            m.get("chunk_exact_track_count", 0),
+            m.get("chunk_exact_top1_hit_rate"),
+            m.get("chunk_exact_top3_hit_rate"),
+            m.get("chunk_exact_top5_hit_rate"),
+            m.get("chunk_exact_top10_hit_rate"),
+            ce_miss10,
             sort_issues,
             m.get("errors", 0),
             snapshot_summary,
@@ -1015,5 +1521,64 @@ def build_failed_samples_csv(all_judge_results, sample_lookup=None, config=None)
 
     if truncated:
         output.write(f"\n# 截断说明: 共 {total_count} 条，仅导出前 {_MAX_DIAGNOSTIC_SAMPLES} 条\n")
+
+    return output.getvalue().encode("utf-8-sig")
+
+
+def build_chunk_exact_csv(all_judge_results, sample_lookup=None):
+    """生成 chunk_exact 明细 CSV。
+
+    包含每条 chunk_exact 结果的完整信息：绑定、命中、返回结果。
+    """
+    sample_lookup = sample_lookup or {}
+    # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
+    for r in all_judge_results:
+        backfill_chunk_exact_topk(r, sample_lookup)
+
+    valid = [r for r in all_judge_results
+             if "error" not in r and r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    header = [
+        "run_id", "question_set_id", "question_id", "query", "evaluation_track",
+        "expected_segment_id", "expected_content_hash", "chunk_exact_status",
+        "hit_evidence_position", "top1_hit", "top3_hit", "top5_hit", "top10_hit",
+        "returned_segment_ids", "retrieval_scores",
+    ]
+    writer.writerow(header)
+
+    for r in valid:
+        tid = r.get("trace_id", "")
+        sample = sample_lookup.get(tid, {})
+        ret_results = sample.get("retrieval_results", [])[:10] if sample else []
+
+        returned_sids = "; ".join(
+            str(rr.get("segment_id", rr.get("document_name", "")))
+            for rr in ret_results
+        )
+        returned_scores = "; ".join(
+            f"{rr.get('score', '')}" if isinstance(rr.get("score"), (int, float)) else str(rr.get("score", ""))
+            for rr in ret_results
+        )
+
+        writer.writerow([
+            r.get("run_id", ""),
+            r.get("question_set_id", ""),
+            r.get("question_id", ""),
+            r.get("question", ""),
+            r.get("evaluation_track", ""),
+            r.get("expected_segment_id", ""),
+            r.get("expected_content_hash", ""),
+            r.get("chunk_exact_status", ""),
+            r.get("hit_evidence_position", "") if r.get("hit_evidence_position") is not None else "",
+            r.get("retrieval_top1_hit", ""),
+            r.get("retrieval_top3_hit", ""),
+            r.get("retrieval_top5_hit", ""),
+            r.get("retrieval_top10_hit", ""),
+            returned_sids,
+            returned_scores,
+        ])
 
     return output.getvalue().encode("utf-8-sig")

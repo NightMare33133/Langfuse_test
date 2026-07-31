@@ -491,6 +491,7 @@ def _judge_chunk_exact(sample):
     """chunk_exact 轨道纯机器判定：按 segment_id / content_hash 匹配。
 
     不调用 LLM，完全确定性判定。
+    扫描 retrieval_results[:10]，计算 Top1/Top3/Top5/Top10。
     fail-closed：缺少绑定或无检索结果时标记为不可评测，不写入 miss。
     """
     expected_id = (sample.get("expected_segment_id") or "").strip()
@@ -498,35 +499,32 @@ def _judge_chunk_exact(sample):
     retrieval_results = sample.get("retrieval_results") or []
     trace_id = (sample.get("trace_id") or "").strip()
 
+    _none_result = {
+        "retrieval_top1_hit": None, "retrieval_top3_hit": None,
+        "retrieval_top5_hit": None, "retrieval_top10_hit": None,
+        "hit_evidence_position": None,
+    }
+
     if not expected_id and not expected_hash:
-        return {
-            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
-            "retrieval_top5_hit": None, "hit_evidence_position": None,
-            "reason": "chunk_exact 题缺少 expected_segment_id 和 expected_content_hash",
-            "chunk_exact_status": "missing_binding",
-            "retrieval_evaluable": False,
-        }
+        return {**_none_result,
+                "reason": "chunk_exact 题缺少 expected_segment_id 和 expected_content_hash",
+                "chunk_exact_status": "missing_binding",
+                "retrieval_evaluable": False}
 
     if not trace_id or trace_id.startswith("batch_qa_"):
-        return {
-            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
-            "retrieval_top5_hit": None, "hit_evidence_position": None,
-            "reason": "chunk_exact 题未关联真实 Langfuse trace",
-            "chunk_exact_status": "no_trace",
-            "retrieval_evaluable": False,
-        }
+        return {**_none_result,
+                "reason": "chunk_exact 题未关联真实 Langfuse trace",
+                "chunk_exact_status": "no_trace",
+                "retrieval_evaluable": False}
 
     if not retrieval_results:
-        return {
-            "retrieval_top1_hit": None, "retrieval_top3_hit": None,
-            "retrieval_top5_hit": None, "hit_evidence_position": None,
-            "reason": "trace 已关联但无检索结果，chunk_exact 无法判定",
-            "chunk_exact_status": "no_retrieval",
-            "retrieval_evaluable": False,
-        }
+        return {**_none_result,
+                "reason": "trace 已关联但无检索结果，chunk_exact 无法判定",
+                "chunk_exact_status": "no_retrieval",
+                "retrieval_evaluable": False}
 
     hit_position = None
-    for rank, r in enumerate(retrieval_results[:5]):
+    for rank, r in enumerate(retrieval_results[:10]):
         seg_id = (r.get("segment_id") or "").strip()
         content = (r.get("content") or "").strip()
         content_hash = _content_hash_for_match(content) if content else ""
@@ -540,6 +538,7 @@ def _judge_chunk_exact(sample):
     t1 = 1 if hit_position is not None and hit_position <= 1 else 0
     t3 = 1 if hit_position is not None and hit_position <= 3 else 0
     t5 = 1 if hit_position is not None and hit_position <= 5 else 0
+    t10 = 1 if hit_position is not None and hit_position <= 10 else 0
 
     reason = f"chunk_exact 匹配: {'命中 Top' + str(hit_position) if hit_position else '未命中'}"
     if hit_position:
@@ -550,12 +549,78 @@ def _judge_chunk_exact(sample):
         "retrieval_top1_hit": t1,
         "retrieval_top3_hit": t3,
         "retrieval_top5_hit": t5,
+        "retrieval_top10_hit": t10,
         "hit_evidence_position": hit_position,
         "reason": reason,
         "_rule_name": "chunk_exact_match",
         "chunk_exact_status": "",
         "retrieval_evaluable": True,
     }
+
+
+def backfill_chunk_exact_topk(result, sample_lookup=None):
+    """为旧版 chunk_exact 结果补齐缺失的 retrieval_top10_hit 字段。
+
+    历史 judged results 在新增 retrieval_top10_hit 前生成，
+    字段缺失导致 UI 将缺失值当 0。
+    旧版 judge 只扫描 top5，hit_evidence_position 对 position 6-10 为空，
+    因此不能从该字段推导 Top10。
+
+    本函数通过 trace_id 找到对应 processed sample，扫描完整
+    retrieval_results[:10]，用同一套 segment_id / content_hash
+    确定性匹配来计算 retrieval_top10_hit。
+
+    仅补齐缺失字段；已存在时不覆盖。非 chunk_exact 或不可评测时不修改。
+    原地修改并返回 result。
+
+    Args:
+        result: judged result dict
+        sample_lookup: {trace_id: processed_sample_dict}，可选；
+            不提供时仅做 Top1-Top5 的 position 回填（兼容旧路径）。
+    """
+    track = result.get("evaluation_track", "")
+    is_chunk_exact = (track == TRACK_CHUNK_EXACT
+                      or result.get("_rule_name") == "chunk_exact_match")
+
+    if not is_chunk_exact:
+        return result
+
+    if not result.get("retrieval_evaluable", True):
+        return result
+
+    # ── Top10：必须通过 sample_lookup 重新扫描 ──
+    if result.get("retrieval_top10_hit") is None and sample_lookup is not None:
+        tid = result.get("trace_id", "")
+        sample = sample_lookup.get(tid)
+        if sample:
+            expected_id = (sample.get("expected_segment_id") or "").strip()
+            expected_hash = (sample.get("expected_content_hash") or "").strip()
+            retrieval_results = sample.get("retrieval_results") or []
+
+            if (expected_id or expected_hash) and retrieval_results:
+                hit_position = None
+                for rank, r in enumerate(retrieval_results[:10]):
+                    seg_id = (r.get("segment_id") or "").strip()
+                    content = (r.get("content") or "").strip()
+                    content_hash = _content_hash_for_match(content) if content else ""
+                    if (expected_id and seg_id == expected_id) or \
+                       (expected_hash and content_hash and content_hash == expected_hash):
+                        hit_position = rank + 1
+                        break
+
+                result["retrieval_top10_hit"] = 1 if hit_position is not None and hit_position <= 10 else 0
+
+    # ── Top1/Top3/Top5：从 hit_evidence_position 推导（旧版扫描了 top5，position 可靠） ──
+    pos = result.get("hit_evidence_position")
+    if pos is not None:
+        if result.get("retrieval_top1_hit") is None:
+            result["retrieval_top1_hit"] = 1 if pos <= 1 else 0
+        if result.get("retrieval_top3_hit") is None:
+            result["retrieval_top3_hit"] = 1 if pos <= 3 else 0
+        if result.get("retrieval_top5_hit") is None:
+            result["retrieval_top5_hit"] = 1 if pos <= 5 else 0
+
+    return result
 
 
 def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout=60):
@@ -585,6 +650,7 @@ def judge_sample(sample, api_key, base_url, model, prompt_template=None, timeout
         result["retrieval_top1_hit"] = 0
         result["retrieval_top3_hit"] = 0
         result["retrieval_top5_hit"] = 0
+        result["retrieval_top10_hit"] = 0
         result["answer_correct"] = 0
         result["not_evaluable_reason"] = "检索评测题缺少金标准证据（source_excerpt 和 reference_answer 均为空）"
         result["reason"] = "不可评测：缺少金标准证据，无法可靠计算检索命中率"
@@ -1190,23 +1256,41 @@ def compute_metrics(results):
         "grounded_qa_answer_rate": sum(r.get("answer_correct", 0) for r in grounded_qa_tracks) / grounded_qa_n if grounded_qa_n else None,
 
         # chunk_exact 精确匹配指标（单独统计，不混入口径）
-        # 仅统计 retrieval_evaluable=True 的结果，排除未关联 trace / 无检索 / 缺绑定
+        # 仅统计 retrieval_evaluable=True 且 retrieval_top1_hit is not None 的结果
+        # 排除 missing_binding / no_trace / no_retrieval 等不可评测状态
         "chunk_exact_track_count": chunk_exact_n,
         "chunk_exact_evaluable_count": sum(1 for r in chunk_exact_tracks if r.get("retrieval_evaluable", True) and r.get("retrieval_top1_hit") is not None),
         "chunk_exact_top1_hit_rate": (
-            sum(r["retrieval_top1_hit"] for r in chunk_exact_tracks if r.get("retrieval_top1_hit") is not None)
-            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top1_hit") is not None)
-            if any(r.get("retrieval_top1_hit") is not None for r in chunk_exact_tracks) else None
+            sum(r["retrieval_top1_hit"] for r in chunk_exact_tracks
+                if r.get("retrieval_evaluable", True) and r.get("retrieval_top1_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks
+                  if r.get("retrieval_evaluable", True) and r.get("retrieval_top1_hit") is not None)
+            if any(r.get("retrieval_evaluable", True) and r.get("retrieval_top1_hit") is not None
+                   for r in chunk_exact_tracks) else None
         ),
         "chunk_exact_top3_hit_rate": (
-            sum(r["retrieval_top3_hit"] for r in chunk_exact_tracks if r.get("retrieval_top3_hit") is not None)
-            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top3_hit") is not None)
-            if any(r.get("retrieval_top3_hit") is not None for r in chunk_exact_tracks) else None
+            sum(r["retrieval_top3_hit"] for r in chunk_exact_tracks
+                if r.get("retrieval_evaluable", True) and r.get("retrieval_top3_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks
+                  if r.get("retrieval_evaluable", True) and r.get("retrieval_top3_hit") is not None)
+            if any(r.get("retrieval_evaluable", True) and r.get("retrieval_top3_hit") is not None
+                   for r in chunk_exact_tracks) else None
         ),
         "chunk_exact_top5_hit_rate": (
-            sum(r["retrieval_top5_hit"] for r in chunk_exact_tracks if r.get("retrieval_top5_hit") is not None)
-            / sum(1 for r in chunk_exact_tracks if r.get("retrieval_top5_hit") is not None)
-            if any(r.get("retrieval_top5_hit") is not None for r in chunk_exact_tracks) else None
+            sum(r["retrieval_top5_hit"] for r in chunk_exact_tracks
+                if r.get("retrieval_evaluable", True) and r.get("retrieval_top5_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks
+                  if r.get("retrieval_evaluable", True) and r.get("retrieval_top5_hit") is not None)
+            if any(r.get("retrieval_evaluable", True) and r.get("retrieval_top5_hit") is not None
+                   for r in chunk_exact_tracks) else None
+        ),
+        "chunk_exact_top10_hit_rate": (
+            sum(r["retrieval_top10_hit"] for r in chunk_exact_tracks
+                if r.get("retrieval_evaluable", True) and r.get("retrieval_top10_hit") is not None)
+            / sum(1 for r in chunk_exact_tracks
+                  if r.get("retrieval_evaluable", True) and r.get("retrieval_top10_hit") is not None)
+            if any(r.get("retrieval_evaluable", True) and r.get("retrieval_top10_hit") is not None
+                   for r in chunk_exact_tracks) else None
         ),
 
         # 兼容旧版（混合口径，仅供参考）
@@ -1276,5 +1360,6 @@ def compute_chunk_exact_metrics(results: list[dict]) -> dict:
         "top1_hit_rate": rate("retrieval_top1_hit"),
         "top3_hit_rate": rate("retrieval_top3_hit"),
         "top5_hit_rate": rate("retrieval_top5_hit"),
+        "top10_hit_rate": rate("retrieval_top10_hit"),
         "formal_usable": bool(evaluable),
     }

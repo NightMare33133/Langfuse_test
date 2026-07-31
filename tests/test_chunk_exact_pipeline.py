@@ -188,6 +188,7 @@ def test_chunk_exact_dashboard_metrics_keep_pending_out_of_topk():
             "retrieval_top1_hit": 1,
             "retrieval_top3_hit": 1,
             "retrieval_top5_hit": 1,
+            "retrieval_top10_hit": 1,
         },
     ])
 
@@ -195,6 +196,7 @@ def test_chunk_exact_dashboard_metrics_keep_pending_out_of_topk():
     assert metrics["evaluable_count"] == 1
     assert metrics["missing_binding_count"] == 1
     assert metrics["top1_hit_rate"] == 1.0
+    assert metrics["top10_hit_rate"] == 1.0
 
     app_source = (Path(__file__).parent.parent / "app.py").read_text(encoding="utf-8")
     assert "compute_chunk_exact_metrics(chunk_exact_results)" in app_source

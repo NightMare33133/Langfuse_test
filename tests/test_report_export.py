@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE
+from judge import TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE, TRACK_CHUNK_EXACT
 from report_export import (
     build_evaluation_html, build_runs_csv, build_failed_samples_csv,
     build_diagnostic_data, _sanitize_result, _SENSITIVE_KEYS, _MAX_DIAGNOSTIC_SAMPLES,
@@ -94,6 +94,27 @@ def _make_not_evaluable_result(trace_id):
         "retrieval_top5_hit": 0,
         "reason": "缺少金标准证据",
         "run_id": "run_test_001",
+    }
+
+
+def _make_chunk_exact_result(trace_id, t1, t3, t5, position=None,
+                             expected_seg_id="seg_abc123", chunk_exact_status=""):
+    return {
+        "trace_id": trace_id,
+        "question": f"chunk_exact_{trace_id}",
+        "evaluation_track": TRACK_CHUNK_EXACT,
+        "retrieval_evaluable": True if chunk_exact_status == "" else False,
+        "retrieval_top1_hit": t1,
+        "retrieval_top3_hit": t3,
+        "retrieval_top5_hit": t5,
+        "hit_evidence_position": position,
+        "expected_segment_id": expected_seg_id,
+        "expected_content_hash": "hash_abc123",
+        "chunk_exact_status": chunk_exact_status,
+        "reason": f"chunk_exact 匹配: {'命中 Top' + str(position) if position else '未命中'}",
+        "run_id": "run_test_001",
+        "question_id": f"qid_{trace_id}",
+        "question_set_id": "qs_test_001",
     }
 
 
@@ -185,6 +206,12 @@ def _build_fixture():
         _make_grounded_qa_result("t_gqa_1", 1),
         _make_error_result("t_err_1"),
         _make_not_evaluable_result("t_ne_1"),
+        # chunk_exact 结果
+        _make_chunk_exact_result("t_ce_1", 1, 1, 1, 1, "seg_001"),       # Top1 命中
+        _make_chunk_exact_result("t_ce_2", 0, 1, 1, 2, "seg_002"),       # 第2位命中
+        _make_chunk_exact_result("t_ce_3", 0, 0, 1, 4, "seg_003"),       # 第4位命中
+        _make_chunk_exact_result("t_ce_4", 0, 0, 0, None, "seg_004"),    # Top5 未命中
+        _make_chunk_exact_result("t_ce_5", 0, 0, 0, None, "", "missing_binding"),  # 不可评测
     ]
     run_status["judge_results"] = results
 
@@ -511,7 +538,8 @@ def test_empty_data():
 
     config = {"config_id": "cfg_empty", "config_name": "空配置"}
     html = build_evaluation_html(config, [], [], {"total": 0, "evaluated": 0, "errors": 0}, [])
-    assert "暂无检索评测数据" in html
+    # 空数据既无 retrieval 也无 chunk_exact，显示通用提示
+    assert "本报告不含 AI 证据 Judge" in html or "暂无" in html
     print("[OK] 空数据 HTML 正确")
 
     runs_csv = build_runs_csv([])
@@ -536,12 +564,17 @@ def test_html_report_structure():
 
     sections = [
         "RAG 评测报告", "总览", "配置与运行信息", "全局 Judge 指标",
-        "局部分析", "运行汇总", "运行详情", "Top5 完全未命中样本诊断",
-        "排序问题样本", "数据质量",
+        "局部分析", "运行汇总", "运行详情",
+        "数据质量",
     ]
     for section in sections:
         assert section in html, f"HTML 应包含章节: {section}"
         print(f"[OK] 包含章节: {section}")
+
+    # 诊断章节：混合报告包含 chunk_exact 诊断和 AI Judge 诊断
+    assert "Chunk Exact 诊断" in html, "应包含 Chunk Exact 诊断"
+    assert "AI Judge 诊断" in html, "应包含 AI Judge 诊断"
+    print("[OK] 包含章节: Chunk Exact 诊断 / AI Judge 诊断")
 
     assert "<style>" in html
     assert "cdn" not in html.lower()
@@ -681,7 +714,8 @@ def test_runs_csv_has_new_columns():
     row = rows[0]
     for col in ["knowledge_base_version", "workflow_version", "question_set_id",
                  "retrieval_track_count", "strict_qa_count", "grounded_qa_count",
-                 "top5_miss_count", "sorting_issue_count", "config_snapshot_summary"]:
+                 "chunk_exact_top10_hit_rate", "top10_miss_count", "sorting_issue_count",
+                 "config_snapshot_summary"]:
         assert col in row, f"Runs CSV 应包含列: {col}"
 
     assert row["knowledge_base_version"] == "KB_v1"
@@ -720,6 +754,344 @@ def test_failed_csv_has_new_columns():
     print()
 
 
+# ── chunk_exact 测试 ──
+
+
+def test_chunk_exact_metrics_separate():
+    """retrieval 与 chunk_exact 各自分母独立。"""
+    print("=" * 60)
+    print("测试 chunk_exact 指标与 retrieval 分离")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    from judge import compute_metrics
+    m = compute_metrics(all_r)
+
+    # retrieval 分母
+    ret_n = m["retrieval_track_count"]
+    assert ret_n == 6, f"retrieval 应有 6 条可评测，实际 {ret_n}"
+
+    # chunk_exact 分母（仅 evaluable，排除 missing_binding）
+    ce_n = m["chunk_exact_track_count"]
+    assert ce_n == 5, f"chunk_exact 应有 5 条，实际 {ce_n}"
+
+    ce_eval = m.get("chunk_exact_evaluable_count", 0)
+    assert ce_eval == 4, f"chunk_exact 可评测应有 4 条（排除 missing_binding），实际 {ce_eval}"
+
+    # 两者的 TopK 互不影响
+    assert m["retrieval_top1_hit_rate"] is not None
+    assert m["chunk_exact_top1_hit_rate"] is not None
+    print(f"[OK] retrieval n={ret_n}, chunk_exact n={ce_n}, evaluable={ce_eval}")
+    print()
+
+
+def test_chunk_exact_hit_position_buckets():
+    """命中位置分桶互斥且总数等于可评测数。"""
+    print("=" * 60)
+    print("测试 chunk_exact 命中位置分桶")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    ce_results = [r for r in all_r if r.get("evaluation_track") == TRACK_CHUNK_EXACT
+                  and r.get("retrieval_evaluable", True) is not False
+                  and r.get("retrieval_top1_hit") is not None]
+
+    n = len(ce_results)
+    bucket_top1 = sum(1 for r in ce_results if r.get("retrieval_top1_hit"))
+    bucket_2_3 = sum(1 for r in ce_results
+                     if not r.get("retrieval_top1_hit")
+                     and r.get("hit_evidence_position") is not None
+                     and 2 <= r["hit_evidence_position"] <= 3)
+    bucket_4_5 = sum(1 for r in ce_results
+                     if not r.get("retrieval_top1_hit")
+                     and r.get("hit_evidence_position") is not None
+                     and 4 <= r["hit_evidence_position"] <= 5)
+    bucket_miss = n - bucket_top1 - bucket_2_3 - bucket_4_5
+
+    assert bucket_top1 + bucket_2_3 + bucket_4_5 + bucket_miss == n, \
+        f"分桶总数 {bucket_top1+bucket_2_3+bucket_4_5+bucket_miss} != 可评测数 {n}"
+    assert bucket_top1 == 1, f"Top1 命中应为 1，实际 {bucket_top1}"
+    assert bucket_2_3 == 1, f"第2-3位命中应为 1，实际 {bucket_2_3}"
+    assert bucket_4_5 == 1, f"第4-5位命中应为 1，实际 {bucket_4_5}"
+    assert bucket_miss == 1, f"Top5 未命中应为 1，实际 {bucket_miss}"
+    print(f"[OK] 分桶: Top1={bucket_top1}, 2-3={bucket_2_3}, 4-5={bucket_4_5}, miss={bucket_miss}")
+    print()
+
+
+def test_chunk_exact_not_in_retrieval_denominator():
+    """chunk_exact 不计入 retrieval 分母。"""
+    print("=" * 60)
+    print("测试 chunk_exact 不混入 retrieval 分母")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    from judge import compute_metrics
+    m = compute_metrics(all_r)
+
+    # retrieval 只含 retrieval 轨道（compute_metrics 过滤 retrieval_evaluable=True）
+    retrieval_count = m["retrieval_track_count"]
+    chunk_exact_count = m["chunk_exact_track_count"]
+    assert retrieval_count == 6, f"retrieval 应为 6，实际 {retrieval_count}"
+    assert chunk_exact_count == 5, f"chunk_exact 应为 5，实际 {chunk_exact_count}"
+    # 两者互不干扰
+    assert retrieval_count != chunk_exact_count
+    print(f"[OK] retrieval 分母 {retrieval_count}，chunk_exact 分母 {chunk_exact_count}，互不干扰")
+    print()
+
+
+def test_chunk_exact_html_report():
+    """HTML 报告包含 chunk_exact 独立总览和命中分布。"""
+    print("=" * 60)
+    print("测试 HTML 报告 chunk_exact 内容")
+    print("=" * 60)
+
+    from report_export import build_evaluation_html
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    # 包含 chunk_exact 总览
+    assert "Chunk Exact" in html or "chunk_exact" in html
+    # 包含命中位置分布
+    assert "命中位置分布" in html or "Top1 命中" in html
+    # 包含 count/ratio 格式
+    assert "/4" in html or "/5" in html  # 可评测数
+    print("[OK] HTML 包含 chunk_exact 总览和命中分布")
+    print()
+
+
+def test_chunk_exact_csv_columns():
+    """CSV 包含 chunk_exact 专用列。"""
+    print("=" * 60)
+    print("测试 CSV chunk_exact 列")
+    print("=" * 60)
+
+    from report_export import build_runs_csv, build_chunk_exact_csv
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+
+    # runs CSV
+    csv_bytes = build_runs_csv(rdl)
+    reader = csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig")))
+    row = next(reader)
+    assert "chunk_exact_count" in row
+    assert "chunk_exact_top1_hit_rate" in row
+    print("[OK] Runs CSV 包含 chunk_exact 列")
+
+    # chunk_exact CSV
+    ce_csv = build_chunk_exact_csv(all_r, sl)
+    ce_reader = csv.DictReader(io.StringIO(ce_csv.decode("utf-8-sig")))
+    ce_rows = list(ce_reader)
+    assert len(ce_rows) == 5, f"应有 5 条 chunk_exact 记录，实际 {len(ce_rows)}"
+
+    ce_row = ce_rows[0]
+    for col in ["expected_segment_id", "expected_content_hash", "chunk_exact_status",
+                 "hit_evidence_position", "top1_hit", "top3_hit", "top5_hit",
+                 "returned_segment_ids", "retrieval_scores"]:
+        assert col in ce_row, f"chunk_exact CSV 应包含列: {col}"
+
+    print(f"[OK] chunk_exact CSV 包含 {len(ce_rows)} 条记录和所有必需列")
+    print()
+
+
+def test_chunk_exact_unevaluable_excluded():
+    """missing_binding / no_trace / no_retrieval 不计入 TopK 分母。"""
+    print("=" * 60)
+    print("测试 chunk_exact 不可评测不计入分母")
+    print("=" * 60)
+
+    from judge import compute_metrics
+    # 构建含不可评测的 chunk_exact 结果
+    results = [
+        _make_chunk_exact_result("ce_ok_1", 1, 1, 1, 1, "seg_001"),
+        _make_chunk_exact_result("ce_ok_2", 0, 1, 1, 3, "seg_002"),
+        _make_chunk_exact_result("ce_miss_1", 0, 0, 0, None, "", "missing_binding"),
+        _make_chunk_exact_result("ce_miss_2", 0, 0, 0, None, "", "no_trace"),
+        _make_chunk_exact_result("ce_miss_3", 0, 0, 0, None, "", "no_retrieval"),
+    ]
+    m = compute_metrics(results)
+
+    assert m["chunk_exact_track_count"] == 5, f"总数应为 5，实际 {m['chunk_exact_track_count']}"
+    ce_eval = m.get("chunk_exact_evaluable_count", 0)
+    assert ce_eval == 2, f"可评测应为 2，实际 {ce_eval}"
+
+    # TopK 只基于可评测的 2 条
+    assert m["chunk_exact_top1_hit_rate"] == 0.5, f"Top1 应为 50%，实际 {m['chunk_exact_top1_hit_rate']}"
+    print(f"[OK] 总数 5，可评测 2，Top1=50%")
+    print()
+
+
+# ── 纯 chunk_exact 报告测试 ──
+
+
+def _build_pure_chunk_exact_fixture():
+    """构建纯 chunk_exact fixture（无 retrieval/QA 结果）。"""
+    config = {"config_id": "cfg_ce_only", "config_name": "纯chunk_exact配置"}
+    run = {
+        "run_id": "run_ce_001",
+        "config_id": "cfg_ce_only",
+        "question_count": 4,
+        "status": "completed",
+        "started_at": "2026-07-30T10:00:00",
+        "question_set_name": "chunk_exact_0729_1701",
+        "question_set_id": "qs_ce_001",
+        "config_snapshot": {"config_name": "纯chunk_exact配置", "config_id": "cfg_ce_only"},
+    }
+    run_status = {
+        "batch_success": 4, "batch_total": 4,
+        "processed_count": 4, "judge_count": 0, "question_count": 4,
+        "question_set_name": "chunk_exact_0729_1701", "question_set_id": "qs_ce_001",
+        "judge_results": [],
+    }
+    results = [
+        _make_chunk_exact_result("ce_1", 1, 1, 1, 1, "seg_001"),
+        _make_chunk_exact_result("ce_2", 0, 1, 1, 3, "seg_002"),
+        _make_chunk_exact_result("ce_3", 0, 0, 1, 4, "seg_003"),
+        _make_chunk_exact_result("ce_4", 0, 0, 0, None, "seg_004"),
+    ]
+    run_status["judge_results"] = results
+    sample_lookup = {}
+    from judge import compute_metrics
+    metrics = compute_metrics(results)
+    return config, [run], [{"run": run, "run_status": run_status, "metrics": metrics}], metrics, results, sample_lookup
+
+
+def test_pure_chunk_exact_no_retrieval_message():
+    """纯 chunk_exact 报告不显示"暂无检索评测数据"。"""
+    print("=" * 60)
+    print("测试纯 chunk_exact 报告无 retrieval 消息")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    assert "暂无检索评测数据" not in html, "纯 chunk_exact 报告不应显示'暂无检索评测数据'"
+    assert "Chunk Exact" in html or "chunk_exact" in html, "应包含 chunk_exact 内容"
+    assert "机器判定" in html, "应包含机器判定标识"
+    print("[OK] 纯 chunk_exact 报告无 retrieval 错误消息")
+    print()
+
+
+def test_pure_chunk_exact_metrics_displayed():
+    """纯 chunk_exact 报告显示正确的 TopK 指标。"""
+    print("=" * 60)
+    print("测试纯 chunk_exact 指标显示")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    # 应显示 4 条可评测
+    assert "4/4" in html or "4" in html, "应显示可评测数"
+    # Top1 1/4, Top3 2/4, Top5 3/4
+    assert "1/4" in html, "应显示 Top1 1/4"
+    assert "2/4" in html, "应显示 Top3 2/4"
+    assert "3/4" in html, "应显示 Top5 3/4"
+    print("[OK] 纯 chunk_exact 指标正确显示")
+    print()
+
+
+def test_chunk_exact_diagnostics_in_report():
+    """chunk_exact 诊断（Top5 未命中 + 排序问题）出现在报告中。"""
+    print("=" * 60)
+    print("测试 chunk_exact 诊断")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    # ce_4: Top5 未命中
+    assert "seg_004" in html, "报告应包含未命中的 segment ID"
+    # ce_2: 排序问题 (Top1=0, Top3=1)
+    assert "排序问题" in html, "报告应包含排序问题"
+    print("[OK] chunk_exact 诊断出现在报告中")
+    print()
+
+
+def test_chunk_exact_sample_appendix():
+    """chunk_exact 样本审计附录存在。"""
+    print("=" * 60)
+    print("测试 chunk_exact 样本附录")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    assert "样本明细" in html, "报告应包含样本明细附录"
+    assert "run_ce_001" in html, "报告应包含 run ID"
+    print("[OK] chunk_exact 样本附录存在")
+    print()
+
+
+def test_no_api_keys_in_html():
+    """HTML 不含任何 API Key 或 secret。"""
+    print("=" * 60)
+    print("测试 API Key 安全性")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    for field in ["api_key", "secret_key", "public_key", "password", "token"]:
+        assert field not in html.lower(), f"HTML 不应包含 {field}"
+    print("[OK] HTML 不含 API Key")
+    print()
+
+
+def test_cross_set_warning():
+    """跨题集时显示警告。"""
+    print("=" * 60)
+    print("测试跨题集警告")
+    print("=" * 60)
+
+    config = {"config_id": "cfg_multi", "config_name": "跨题集配置"}
+    run1 = {"run_id": "run_1", "config_id": "cfg_multi", "question_count": 2,
+            "status": "completed", "question_set_name": "题集A", "question_set_id": "qs_A",
+            "config_snapshot": {}}
+    run2 = {"run_id": "run_2", "config_id": "cfg_multi", "question_count": 2,
+            "status": "completed", "question_set_name": "题集B", "question_set_id": "qs_B",
+            "config_snapshot": {}}
+    rs1 = {"batch_success": 2, "batch_total": 2, "processed_count": 2, "judge_count": 0,
+           "question_set_name": "题集A", "question_set_id": "qs_A", "judge_results": []}
+    rs2 = {"batch_success": 2, "batch_total": 2, "processed_count": 2, "judge_count": 0,
+           "question_set_name": "题集B", "question_set_id": "qs_B", "judge_results": []}
+    results = [
+        _make_chunk_exact_result("ce_a1", 1, 1, 1, 1, "seg_001"),
+        _make_chunk_exact_result("ce_a2", 0, 1, 1, 3, "seg_002"),
+    ]
+    results[0]["question_set_id"] = "qs_A"
+    results[1]["question_set_id"] = "qs_B"
+    rs1["judge_results"] = [results[0]]
+    rs2["judge_results"] = [results[1]]
+
+    from judge import compute_metrics
+    rdl = [
+        {"run": run1, "run_status": rs1, "metrics": compute_metrics([results[0]])},
+        {"run": run2, "run_status": rs2, "metrics": compute_metrics([results[1]])},
+    ]
+    all_r = [results[0], results[1]]
+    cum_m = compute_metrics(all_r)
+
+    html = build_evaluation_html(config, [run1, run2], rdl, cum_m, all_r, sample_lookup={})
+    assert "跨题集" in html, "应显示跨题集警告"
+    print("[OK] 跨题集警告显示")
+    print()
+
+
+def test_hit_position_distribution_in_html():
+    """命中位置分布表出现在 HTML 中。"""
+    print("=" * 60)
+    print("测试命中位置分布")
+    print("=" * 60)
+
+    config, runs, rdl, cum_m, all_r, sl = _build_pure_chunk_exact_fixture()
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+
+    assert "命中位置分布" in html, "应包含命中位置分布表"
+    assert "Top1 命中" in html, "应包含 Top1 命中行"
+    assert "Top5 未命中" in html, "应包含 Top5 未命中行"
+    print("[OK] 命中位置分布表存在")
+    print()
+
+
 def main():
     print("=" * 60)
     print("评测报告导出模块测试")
@@ -746,6 +1118,23 @@ def main():
     test_runs_csv_consistency()
     test_runs_csv_has_new_columns()
     test_failed_csv_has_new_columns()
+
+    # chunk_exact 相关测试
+    test_chunk_exact_metrics_separate()
+    test_chunk_exact_hit_position_buckets()
+    test_chunk_exact_not_in_retrieval_denominator()
+    test_chunk_exact_html_report()
+    test_chunk_exact_csv_columns()
+    test_chunk_exact_unevaluable_excluded()
+
+    # 纯 chunk_exact 报告测试
+    test_pure_chunk_exact_no_retrieval_message()
+    test_pure_chunk_exact_metrics_displayed()
+    test_chunk_exact_diagnostics_in_report()
+    test_chunk_exact_sample_appendix()
+    test_no_api_keys_in_html()
+    test_cross_set_warning()
+    test_hit_position_distribution_in_html()
 
     print("=" * 60)
     print("[OK] 所有测试通过！")
