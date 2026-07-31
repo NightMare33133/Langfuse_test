@@ -1153,83 +1153,94 @@ class TestMultiDocGeneration:
     """多文档联合出题测试。"""
 
     def test_two_docs_3_plus_5_questions(self):
-        """两文档 3+5 题生成。"""
+        """两文档 3+5 题生成（两阶段流程）。"""
         doc_configs = [
             {"document_id": "doc1", "document_name": "文档A",
-             "candidates": _make_doc_candidates("doc1", 10), "num_questions": 3},
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
             {"document_id": "doc2", "document_name": "文档B",
-             "candidates": _make_doc_candidates("doc2", 10), "num_questions": 5},
+             "candidates": _make_doc_candidates("doc2", 20), "num_questions": 5},
         ]
 
-        # 预测采样结果（使用与函数相同的种子逻辑）
-        sampled_seg_ids = set()
-        for dc in doc_configs:
-            seed = hash(dc["document_id"]) % (2**31)
-            rng = random.Random(seed)
-            sampled = rng.sample(dc["candidates"], dc["num_questions"])
-            for s in sampled:
-                sampled_seg_ids.add(s["segment_id"])
+        call_idx = [0]
+        last_planned_ids = [set()]
 
-        # Mock LLM 返回匹配采样结果的条目
-        mock_items = []
-        for dc in doc_configs:
-            for c in dc["candidates"]:
-                if c["segment_id"] in sampled_seg_ids:
-                    mock_items.append({
-                        "candidate_id": c["segment_id"],
-                        "retrieval_query": f"查询 {c['segment_id']}",
-                        "target_label": f"标签",
-                    })
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_idx[0] += 1
+            is_phase1 = (call_idx[0] % 2 == 1)
 
-        with patch("chunk_exact_questions.call_llm") as mock_llm:
-            mock_llm.return_value = json.dumps(mock_items)
-            questions = generate_chunk_exact_questions_multi_doc(
+            if is_phase1:
+                # Phase 1: 找到 prompt 中的 candidate_id，取前 N 个
+                found = []
+                for dc in doc_configs:
+                    for c in dc["candidates"]:
+                        if c["segment_id"] in prompt:
+                            found.append(c["segment_id"])
+                num = next((dc["num_questions"] for dc in doc_configs
+                           if any(c["segment_id"] in prompt and c["document_id"] == dc["document_id"]
+                                  for c in dc["candidates"])), 3)
+                planned = found[:num]
+                last_planned_ids[0] = set(planned)
+                return json.dumps([{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned])
+            else:
+                # Phase 2: 只返回 Phase 1 规划的 ID
+                return json.dumps([{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned_ids[0] if sid in prompt])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
                 doc_configs, "key", "url", "model",
-                dataset_id="ds1",
+                dataset_id="ds1", master_seed=42,
             )
 
-        assert len(questions) == 8
-        # 检查文档分布
         doc1_qs = [q for q in questions if q["document_id"] == "doc1"]
         doc2_qs = [q for q in questions if q["document_id"] == "doc2"]
         assert len(doc1_qs) == 3
         assert len(doc2_qs) == 5
+        assert len(doc_stats) == 2
+        assert all(s["status"] == "ok" for s in doc_stats)
 
     def test_no_cross_doc_duplicates(self):
         """跨文档无重复 chunk。"""
         doc_configs = [
             {"document_id": "doc1", "document_name": "文档A",
-             "candidates": _make_doc_candidates("doc1", 5), "num_questions": 3},
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
             {"document_id": "doc2", "document_name": "文档B",
-             "candidates": _make_doc_candidates("doc2", 5), "num_questions": 3},
+             "candidates": _make_doc_candidates("doc2", 20), "num_questions": 3},
         ]
 
-        # 预测采样结果
-        sampled_seg_ids = set()
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool_by_doc = {}
         for dc in doc_configs:
-            seed = hash(dc["document_id"]) % (2**31)
-            rng = random.Random(seed)
-            sampled = rng.sample(dc["candidates"], dc["num_questions"])
-            for s in sampled:
-                sampled_seg_ids.add(s["segment_id"])
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
 
-        mock_items = []
-        for dc in doc_configs:
-            for c in dc["candidates"]:
-                if c["segment_id"] in sampled_seg_ids:
-                    mock_items.append({
-                        "candidate_id": c["segment_id"],
-                        "retrieval_query": f"查询 {c['segment_id']}",
-                        "target_label": f"标签",
-                    })
+        call_idx = [0]
+        last_planned = [[]]
 
-        with patch("chunk_exact_questions.call_llm") as mock_llm:
-            mock_llm.return_value = json.dumps(mock_items)
-            questions = generate_chunk_exact_questions_multi_doc(
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_idx[0] += 1
+            is_phase1 = "规划专家" in prompt
+            found = []
+            for doc_id, pool in pool_by_doc.items():
+                for c in pool:
+                    if c["segment_id"] in prompt:
+                        found.append(c["segment_id"])
+            if is_phase1:
+                num = min(len(found), 3)
+                planned = found[:num]
+                last_planned[0] = planned
+                return json.dumps([{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned])
+            else:
+                return json.dumps([{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned[0] if sid in prompt])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
                 doc_configs, "key", "url", "model",
+                master_seed=master_seed,
             )
 
-        # 检查无重复 segment_id
         seg_ids = [q["expected_segment_id"] for q in questions]
         assert len(seg_ids) == len(set(seg_ids))
 
@@ -1237,35 +1248,43 @@ class TestMultiDocGeneration:
         """每题保留正确的 document_id。"""
         doc_configs = [
             {"document_id": "doc_A", "document_name": "文档A",
-             "candidates": _make_doc_candidates("doc_A", 5, "文档A"), "num_questions": 2},
+             "candidates": _make_doc_candidates("doc_A", 20, "文档A"), "num_questions": 2},
             {"document_id": "doc_B", "document_name": "文档B",
-             "candidates": _make_doc_candidates("doc_B", 5, "文档B"), "num_questions": 2},
+             "candidates": _make_doc_candidates("doc_B", 20, "文档B"), "num_questions": 2},
         ]
 
-        # 预测采样结果
-        sampled_seg_ids = set()
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool_by_doc = {}
         for dc in doc_configs:
-            seed = hash(dc["document_id"]) % (2**31)
-            rng = random.Random(seed)
-            sampled = rng.sample(dc["candidates"], dc["num_questions"])
-            for s in sampled:
-                sampled_seg_ids.add(s["segment_id"])
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
 
-        mock_items = []
-        for dc in doc_configs:
-            for c in dc["candidates"]:
-                if c["segment_id"] in sampled_seg_ids:
-                    mock_items.append({
-                        "candidate_id": c["segment_id"],
-                        "retrieval_query": f"查询 {c['segment_id']}",
-                        "target_label": f"标签",
-                    })
+        call_idx = [0]
+        last_planned = [[]]
 
-        with patch("chunk_exact_questions.call_llm") as mock_llm:
-            mock_llm.return_value = json.dumps(mock_items)
-            questions = generate_chunk_exact_questions_multi_doc(
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_idx[0] += 1
+            is_phase1 = "规划专家" in prompt
+            found = []
+            for doc_id, pool in pool_by_doc.items():
+                for c in pool:
+                    if c["segment_id"] in prompt:
+                        found.append(c["segment_id"])
+            if is_phase1:
+                num = min(len(found), 2)
+                planned = found[:num]
+                last_planned[0] = planned
+                return json.dumps([{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned])
+            else:
+                return json.dumps([{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned[0] if sid in prompt])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
                 doc_configs, "key", "url", "model",
-                dataset_id="ds1",
+                dataset_id="ds1", master_seed=master_seed,
             )
 
         for q in questions:
@@ -1461,3 +1480,522 @@ class TestStatusFilterFix:
         assert len(_ds_doc_stats) == 2
         assert _ds_doc_stats[0]["document_id"] == "doc1"
         assert _ds_doc_stats[1]["document_id"] == "doc3"
+
+
+class TestTwoPhaseGeneration:
+    """两阶段出题流程测试。"""
+
+    def test_multi_doc_independent_calls(self):
+        """多文档独立调用 LLM，每个文档各调用两次（Phase 1 + Phase 2）。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+            {"document_id": "doc2", "document_name": "文档B",
+             "candidates": _make_doc_candidates("doc2", 20), "num_questions": 3},
+        ]
+
+        # 使用与函数相同的种子派生逻辑预测候选池
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        call_count = [0]
+        last_planned = [[]]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_count[0] += 1
+            # Phase 1 prompt 包含 "你是 RAG 检索评测出题规划专家"
+            # Phase 2 prompt 包含 "你是 RAG 检索评测出题专家"
+            is_phase1 = "规划专家" in prompt
+
+            if is_phase1:
+                # 找到 prompt 中的 candidate_id（来自当前文档的候选池）
+                found = []
+                for doc_id, pool in pool_by_doc.items():
+                    for c in pool:
+                        if c["segment_id"] in prompt:
+                            found.append(c["segment_id"])
+                # Phase 1 返回前 N 个
+                num = min(len(found), 3)
+                planned = found[:num]
+                last_planned[0] = planned
+                return json.dumps([{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned])
+            else:
+                # Phase 2: 只返回 Phase 1 规划的 ID
+                return json.dumps([{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned[0] if sid in prompt])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        # 验证：每个文档都有统计信息
+        assert len(doc_stats) == 2
+        # 验证：LLM 被调用了多次（每个文档至少 2 次）
+        assert call_count[0] >= 4  # 2 docs × 2 phases
+
+    def test_single_doc_failure_doesnt_affect_others(self):
+        """单文档失败不影响其他文档（使用 side_effect 列表）。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+            {"document_id": "doc2", "document_name": "文档B",
+             "candidates": _make_doc_candidates("doc2", 20), "num_questions": 3},
+        ]
+
+        # 使用与函数相同的种子派生逻辑预测候选池
+        from chunk_exact_questions import _derive_doc_seed, sample_candidate_pool
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, pool_size, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        doc2_pool = pool_by_doc["doc2"]
+
+        # doc2 Phase 1 返回全部池中候选（模拟 LLM 选择全部）
+        doc2_phase1 = json.dumps([
+            {"candidate_id": c["segment_id"], "query_style": "semantic",
+             "search_intent": "意图", "target_label": "标签",
+             "must_preserve_terms": [], "plan": "说明"}
+            for c in doc2_pool
+        ])
+        # doc2 Phase 2 返回全部规划的候选
+        doc2_phase2 = json.dumps([
+            {"candidate_id": c["segment_id"], "retrieval_query": f"查询 {c['segment_id']}", "target_label": "标签"}
+            for c in doc2_pool
+        ])
+
+        # doc1 Phase 1 失败，doc2 正常
+        side_effects = [
+            RuntimeError("LLM 调用失败"),  # doc1 Phase 1
+            doc2_phase1,                     # doc2 Phase 1
+            doc2_phase2,                     # doc2 Phase 2
+        ]
+
+        with patch("chunk_exact_questions.call_llm", side_effect=side_effects):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        assert len(doc_stats) == 2
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc1")
+        doc2_stat = next(s for s in doc_stats if s["document_id"] == "doc2")
+        assert doc1_stat["status"] == "phase1_failed"
+        assert doc2_stat["status"] == "ok"
+        assert len(questions) > 0
+        assert all(q["document_id"] == "doc2" for q in questions)
+
+    def test_unknown_candidate_id_rejected(self):
+        """LLM 返回陌生 candidate_id 被拒绝。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+        valid_ids = {c["segment_id"] for c in pool}
+
+        call_count = [0]
+        last_planned = [[]]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+            if is_phase1:
+                # Phase 1: 返回有效 + 无效 ID
+                planned = found[:3]
+                last_planned[0] = planned
+                items = [{"candidate_id": "unknown_id_123", "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"}]
+                items += [{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned]
+                return json.dumps(items)
+            else:
+                # Phase 2: 返回有效 + 无效 ID
+                items = [{"candidate_id": "unknown_id_456", "retrieval_query": "查询", "target_label": "标签"}]
+                items += [{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned[0] if sid in prompt]
+                return json.dumps(items)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        assert len(questions) == 3
+        for q in questions:
+            assert q["candidate_id"] in valid_ids
+
+    def test_correct_chunk_binding(self):
+        """生成题仍保留正确的 chunk binding（segment_id, content_hash, document_id）。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        call_count = [0]
+        last_planned = [[]]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+            if is_phase1:
+                planned = found[:3]
+                last_planned[0] = planned
+                return json.dumps([{"candidate_id": sid, "query_style": "semantic", "search_intent": "意图", "target_label": "标签", "must_preserve_terms": [], "plan": "说明"} for sid in planned])
+            else:
+                return json.dumps([{"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"} for sid in last_planned[0] if sid in prompt])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _seed = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                dataset_id="ds1", master_seed=master_seed,
+            )
+
+        assert len(questions) == 3
+        for q in questions:
+            assert q["expected_segment_id"]
+            assert q["expected_content_hash"]
+            assert q["document_id"] == "doc1"
+            assert q["dataset_id"] == "ds1"
+            assert q["snapshot_id"]
+            assert q["question_mode"] == "chunk_exact"
+
+    def test_get_multi_doc_stats_summary(self):
+        """测试统计摘要生成。"""
+        from chunk_exact_questions import get_multi_doc_stats_summary
+
+        doc_stats = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "requested": 5, "candidate_pool": 8, "phase1_planned": 5,
+             "phase2_generated": 5, "bound": 5, "status": "ok", "errors": [],
+             "query_style_counts": {"lexical": 2, "semantic": 2, "disambiguating": 1}},
+            {"document_id": "doc2", "document_name": "文档B",
+             "requested": 3, "candidate_pool": 5, "phase1_planned": 0,
+             "phase2_generated": 0, "bound": 0, "status": "phase1_failed",
+             "errors": ["LLM 调用失败"], "query_style_counts": {}},
+            {"document_id": "doc3", "document_name": "文档C",
+             "requested": 3, "candidate_pool": 5, "phase1_planned": 3,
+             "phase2_generated": 2, "bound": 2, "status": "underfilled",
+             "errors": ["请求 3 题，实际绑定 2 题"],
+             "query_style_counts": {"semantic": 2}},
+        ]
+
+        summary = get_multi_doc_stats_summary(doc_stats)
+        assert "✅ 文档A:" in summary
+        assert "池8" in summary
+        assert "绑定5" in summary
+        assert "lexical:2" in summary
+        assert "❌ 文档B: phase1_failed" in summary
+        assert "⚠️ 文档C:" in summary
+        assert "underfilled" in summary or "绑定2" in summary
+
+
+class TestCandidatePoolAndSeed:
+    """候选池扩大与种子派生测试。"""
+
+    def test_pool_larger_than_n(self):
+        """N=10 时候选池大于 N（ceil(10*1.5)=15）。"""
+        from chunk_exact_questions import sample_candidate_pool
+        candidates = _make_doc_candidates("doc1", 30)
+        pool, pool_size, capped = sample_candidate_pool(candidates, 10, "doc1", 42)
+        assert pool_size >= 10
+        assert pool_size <= 15  # min(30, max(10, 15))
+        assert not capped
+        assert len(pool) == pool_size
+
+    def test_pool_capped_when_insufficient(self):
+        """可用候选不足时池被截断。"""
+        from chunk_exact_questions import sample_candidate_pool
+        candidates = _make_doc_candidates("doc1", 5)
+        pool, pool_size, capped = sample_candidate_pool(candidates, 10, "doc1", 42)
+        assert pool_size == 5
+        assert capped
+
+    def test_stable_seed_derivation(self):
+        """相同 user seed + document_id 跨进程得到相同种子。"""
+        from chunk_exact_questions import _derive_doc_seed
+        seed1 = _derive_doc_seed(42, "doc1")
+        seed2 = _derive_doc_seed(42, "doc1")
+        assert seed1 == seed2
+        # 不同 document_id 得到不同种子
+        seed3 = _derive_doc_seed(42, "doc2")
+        assert seed1 != seed3
+        # 不同 master_seed 得到不同种子
+        seed4 = _derive_doc_seed(99, "doc1")
+        assert seed1 != seed4
+
+    def test_seed_not_using_python_hash(self):
+        """种子派生不使用 Python hash()（跨进程不稳定）。"""
+        from chunk_exact_questions import _derive_doc_seed
+        # SHA-256 派生的种子应该是一个确定的值
+        seed = _derive_doc_seed(42, "doc1")
+        # Python hash() 在不同运行中会给出不同结果（由于 PYTHONHASHSEED）
+        # 但 SHA-256 是确定的
+        assert isinstance(seed, int)
+        assert 0 < seed < 2**64
+
+
+class TestQueryStyleMetadata:
+    """query_style 元数据测试。"""
+
+    def test_query_style_in_question_dict(self):
+        """生成题保留 query_style 和 generation_plan。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+            if is_phase1:
+                planned = found[:3]
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "lexical",
+                     "search_intent": "意图", "target_label": "标签",
+                     "must_preserve_terms": ["术语"], "plan": "出题策略"}
+                    for sid in planned
+                ])
+            else:
+                return json.dumps([
+                    {"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"}
+                    for sid in found[:3] if sid in prompt
+                ])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, _, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        assert len(questions) == 3
+        for q in questions:
+            assert q["query_style"] == "lexical"
+            assert q["generation_plan"] == "出题策略"
+            assert q["selection_seed"] == 42
+
+    def test_lexical_semantic_disambiguating_all_valid(self):
+        """三类 query_style 均可通过本地校验。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        styles = ["lexical", "semantic", "disambiguating"]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+            if is_phase1:
+                planned = found[:3]
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": styles[i % 3],
+                     "search_intent": "意图", "target_label": "标签",
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for i, sid in enumerate(planned)
+                ])
+            else:
+                return json.dumps([
+                    {"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"}
+                    for sid in found[:3] if sid in prompt
+                ])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, _, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        assert len(questions) == 3
+        actual_styles = {q["query_style"] for q in questions}
+        assert actual_styles == {"lexical", "semantic", "disambiguating"}
+
+
+class TestRetryAndUnderfilled:
+    """补充重试与 underfilled 状态测试。"""
+
+    def test_phase2_retry_for_missing_candidates(self):
+        """Phase 2 少题时只对缺失项重试一次。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        call_count = [0]
+        planned_ids = [[]]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+
+            if is_phase1:
+                planned = found[:3]
+                planned_ids[0] = planned
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "search_intent": "意图", "target_label": "标签",
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned
+                ])
+            else:
+                # 第一次 Phase 2 调用只返回 2 个（少题）
+                # 重试调用返回缺失的 1 个
+                if call_count[0] <= 2:  # Phase 1 + Phase 2 (first)
+                    return json.dumps([
+                        {"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"}
+                        for sid in planned_ids[0][:2] if sid in prompt
+                    ])
+                else:  # Phase 2 retry
+                    return json.dumps([
+                        {"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"}
+                        for sid in planned_ids[0][2:] if sid in prompt
+                    ])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        # 重试后应该有 3 题
+        assert len(questions) == 3
+        assert doc_stats[0]["status"] == "ok"
+
+    def test_underfilled_after_retry(self):
+        """重试后仍少题，文档标为 underfilled。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        # Phase 1 返回 3 个规划，但 Phase 2 始终只返回 1 个（同一个）
+        first_planned_id = [None]
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+
+            if is_phase1:
+                planned = found[:3]
+                first_planned_id[0] = planned[0] if planned else None
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "search_intent": "意图", "target_label": "标签",
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned
+                ])
+            else:
+                # 始终只返回第一个规划的候选（重试也返回同一个）
+                if first_planned_id[0] and first_planned_id[0] in prompt:
+                    return json.dumps([
+                        {"candidate_id": first_planned_id[0],
+                         "retrieval_query": f"查询 {first_planned_id[0]}",
+                         "target_label": "标签"}
+                    ])
+                return json.dumps([])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        # 只有 1 题（重试也只返回同一个），标记为 underfilled
+        assert len(questions) == 1
+        assert doc_stats[0]["status"] == "underfilled"
+        assert doc_stats[0]["bound"] == 1
+        assert doc_stats[0]["requested"] == 3
+
+
+class TestPhase1DuplicateRejected:
+    """Phase 1/2 重复 candidate_id 被拒绝。"""
+
+    def test_phase1_duplicate_candidate_id_rejected(self):
+        """Phase 1 返回重复 candidate_id 被拒绝。"""
+        doc_configs = [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 3},
+        ]
+
+        from chunk_exact_questions import sample_candidate_pool
+        master_seed = 42
+        pool, _, _ = sample_candidate_pool(
+            doc_configs[0]["candidates"], 3, "doc1", master_seed
+        )
+
+        def mock_llm_side_effect(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            found = [c["segment_id"] for c in pool if c["segment_id"] in prompt]
+            if is_phase1:
+                # 返回重复的 candidate_id
+                planned = found[:2]
+                items = []
+                for sid in planned:
+                    items.append({"candidate_id": sid, "query_style": "semantic",
+                                  "search_intent": "意图", "target_label": "标签",
+                                  "must_preserve_terms": [], "plan": "说明"})
+                # 重复第一个
+                items.append(items[0].copy())
+                return json.dumps(items)
+            else:
+                return json.dumps([
+                    {"candidate_id": sid, "retrieval_query": f"查询 {sid}", "target_label": "标签"}
+                    for sid in found[:2] if sid in prompt
+                ])
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm_side_effect):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+            )
+
+        # 重复的被拒绝，只有 2 题
+        assert len(questions) == 2
+        cids = [q["candidate_id"] for q in questions]
+        assert len(set(cids)) == len(cids)  # 无重复

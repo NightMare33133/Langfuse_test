@@ -285,3 +285,141 @@ class TestKeySafety:
         assert "key_masked" in meta
         assert meta["key_masked"].startswith("dataset-ab")
         assert "abc123def456" not in meta["key_masked"]
+
+
+# ── 自动选择逻辑测试 ──────────────────────────────────────────
+
+
+class TestAutoSelectLogic:
+    """测试知识库连接自动选择逻辑。"""
+
+    def _compute_auto_select(self, kb_profiles, last_pid, env_api_key):
+        """模拟 app.py 中的自动选择逻辑。"""
+        _auto_selected_pid = ""
+        _auto_reason = ""
+
+        if kb_profiles:
+            _valid_pids = {p.get("profile_id", "") for p in kb_profiles}
+
+            if last_pid and last_pid in _valid_pids:
+                _auto_selected_pid = last_pid
+                _auto_reason = "已恢复上次使用的连接"
+            elif len(kb_profiles) == 1:
+                _auto_selected_pid = kb_profiles[0].get("profile_id", "")
+                _auto_reason = "已自动选择唯一可用连接"
+        elif env_api_key:
+            _auto_selected_pid = "__env__"
+            _auto_reason = "已自动选择环境变量默认连接"
+
+        return _auto_selected_pid, _auto_reason
+
+    def test_single_profile_auto_select(self):
+        """只有一个 profile 时自动选择。"""
+        profiles = [{"profile_id": "p1", "profile_name": "测试"}]
+        pid, reason = self._compute_auto_select(profiles, "", "")
+        assert pid == "p1"
+        assert "唯一" in reason
+
+    def test_single_env_default_auto_select(self):
+        """无 profile 但有环境变量时自动选择 __env__。"""
+        pid, reason = self._compute_auto_select([], "", "dataset-test123")
+        assert pid == "__env__"
+        assert "环境变量" in reason
+
+    def test_multiple_profiles_no_history(self):
+        """多个 profile 无历史选择时保持空。"""
+        profiles = [
+            {"profile_id": "p1", "profile_name": "A"},
+            {"profile_id": "p2", "profile_name": "B"},
+        ]
+        pid, reason = self._compute_auto_select(profiles, "", "")
+        assert pid == ""
+        assert reason == ""
+
+    def test_restore_last_selected(self):
+        """有历史选择且 profile 仍存在时恢复。"""
+        profiles = [
+            {"profile_id": "p1", "profile_name": "A"},
+            {"profile_id": "p2", "profile_name": "B"},
+        ]
+        pid, reason = self._compute_auto_select(profiles, "p2", "")
+        assert pid == "p2"
+        assert "恢复" in reason
+
+    def test_last_selected_deleted_fallback(self):
+        """历史选择的 profile 已删除时回退。"""
+        profiles = [
+            {"profile_id": "p1", "profile_name": "A"},
+            {"profile_id": "p2", "profile_name": "B"},
+        ]
+        pid, reason = self._compute_auto_select(profiles, "deleted_pid", "")
+        # 多个 profile 无历史匹配 → 保持空
+        assert pid == ""
+        assert reason == ""
+
+    def test_last_selected_deleted_single_remaining(self):
+        """历史选择已删除，只剩一个 profile 时自动选择。"""
+        profiles = [{"profile_id": "p1", "profile_name": "A"}]
+        pid, reason = self._compute_auto_select(profiles, "deleted_pid", "")
+        assert pid == "p1"
+        assert "唯一" in reason
+
+    def test_no_profiles_no_env(self):
+        """无 profile 无环境变量时保持空。"""
+        pid, reason = self._compute_auto_select([], "", "")
+        assert pid == ""
+        assert reason == ""
+
+    def test_env_profile_with_last_env(self):
+        """有环境变量且上次选择的是 __env__ 时恢复。"""
+        # __env__ 不在 kb_profiles 中，所以走 env 分支
+        pid, reason = self._compute_auto_select([], "__env__", "dataset-test")
+        assert pid == "__env__"
+        assert "环境变量" in reason
+
+
+class TestPreferencesPersistence:
+    """测试用户偏好持久化（不含敏感信息）。"""
+
+    def test_save_and_load_prefs(self, tmp_path):
+        """保存和加载偏好。"""
+        prefs_file = tmp_path / "prefs.json"
+
+        def _save(pid):
+            prefs = {"last_selected_kb_profile_id": pid}
+            prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+
+        def _load():
+            if prefs_file.exists():
+                return json.loads(prefs_file.read_text(encoding="utf-8"))
+            return {}
+
+        _save("p123")
+        loaded = _load()
+        assert loaded["last_selected_kb_profile_id"] == "p123"
+
+    def test_clear_preference(self, tmp_path):
+        """清除偏好。"""
+        prefs_file = tmp_path / "prefs.json"
+        prefs_file.write_text(json.dumps({"last_selected_kb_profile_id": "p1"}), encoding="utf-8")
+
+        prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+        prefs.pop("last_selected_kb_profile_id", None)
+        prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+
+        loaded = json.loads(prefs_file.read_text(encoding="utf-8"))
+        assert "last_selected_kb_profile_id" not in loaded
+
+    def test_prefs_no_sensitive_data(self, tmp_path):
+        """偏好文件不含 API Key。"""
+        prefs_file = tmp_path / "prefs.json"
+        prefs = {
+            "last_selected_kb_profile_id": "p123",
+            "some_other_pref": "value",
+        }
+        prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+
+        content = prefs_file.read_text(encoding="utf-8")
+        assert "dataset-" not in content
+        assert "api_key" not in content.lower()
+        assert "key" not in json.loads(content)

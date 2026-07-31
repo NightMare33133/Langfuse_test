@@ -285,6 +285,41 @@ def _get_rss_mb():
     return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
 
+def _render_ce_topk(evaluable_count: int, top1: int, top3: int,
+                    top5: int, top10: int, total: int = 0):
+    """渲染 Chunk Exact TopK 指标的紧凑两行布局。
+
+    第一行：Top1 / Top3 / Top5 / Top10 百分比（st.metric）。
+    第二行：X / Y 命中（st.caption）。
+    可评测数量单独显示在最左侧。
+    """
+    n = evaluable_count
+    if n <= 0:
+        return
+
+    metrics = [
+        ("Top1", top1),
+        ("Top3", top3),
+        ("Top5", top5),
+        ("Top10", top10),
+    ]
+    labels = ["可评测"] + [m[0] for m in metrics]
+    cols = st.columns(len(labels))
+
+    with cols[0]:
+        _eval_label = f"{n}/{total}" if total else str(n)
+        st.metric("可评测", _eval_label)
+
+    for i, (label, hit) in enumerate(metrics):
+        with cols[i + 1]:
+            pct = hit / n
+            st.metric(label, f"{pct:.1%}")
+
+    # 第二行：分子分母
+    hit_parts = [f"{label}: **{hit}** / {n}" for label, hit in metrics]
+    st.caption("命中 — " + " | ".join(hit_parts))
+
+
 def _record_rss(stage):
     """记录当前 RSS 到 session_state，用于内存用量分析。"""
     if "_rss_log" not in st.session_state:
@@ -298,15 +333,19 @@ def _record_rss(stage):
 
 # ─── 缓存加载 ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=120, max_entries=2, show_spinner=False)
-def _load_sample_lookup(cache_key=""):
+@st.cache_data(ttl=120, max_entries=4, show_spinner=False)
+def _load_sample_lookup(cache_key="", proc_path_str=""):
     """加载 processed samples 为 {trace_id: sample} 查找表（不含 observations）。
 
-    缓存 120 秒、最多 2 个条目，避免实验看板切换 run 时累积占用。
+    缓存 120 秒、最多 4 个条目，避免实验看板切换 run 时累积占用。
     cache_key 应包含 proc_mtime 以在文件更新后自动失效。
+    proc_path_str: 显式指定的 processed 文件路径（隔离路径优先）。
     """
     lookup = {}
-    proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
+    if proc_path_str:
+        proc_path = Path(proc_path_str)
+    else:
+        proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
     if not proc_path.exists():
         return lookup
     try:
@@ -325,6 +364,28 @@ def _load_sample_lookup(cache_key=""):
     except IOError:
         pass
     return lookup
+
+
+def _resolve_processed_path():
+    """解析当前最合适的 processed 文件路径（隔离路径优先，回退全局）。
+
+    返回 (path_str, mtime_key) 供 _load_sample_lookup 使用。
+    """
+    _proj_id = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+    if _proj_id:
+        try:
+            from langfuse_project import find_latest_processed as _flp
+        except ImportError:
+            _flp = None
+        if _flp:
+            try:
+                _s, _ = _flp(_proj_id)
+                if _s and _s.exists():
+                    return str(_s), str(_s.stat().st_mtime)
+            except Exception:
+                pass
+    _gp = PROCESSED_DIR / "langfuse_samples.jsonl"
+    return str(_gp), str(_gp.stat().st_mtime) if _gp.exists() else ""
 
 
 def _get_created_at(filepath, info):
@@ -1023,18 +1084,23 @@ if _rss_log:
         _delta = _rss_log[-1]["rss_mb"] - _rss_log[0]["rss_mb"]
         st.caption(f"累计变化: {_delta:+.0f} MB")
 
-# Load existing samples if available
+# Load existing samples if available（优先隔离路径，回退旧全局路径）
 if "samples" not in st.session_state:
-    samples_file = PROCESSED_DIR / "langfuse_samples.jsonl"
-    summary_file = PROCESSED_DIR / "langfuse_summary.json"
-    if samples_file.exists():
-        with open(samples_file, "r", encoding="utf-8") as f:
+    _loaded_proj_id = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+    try:
+        from langfuse_project import find_latest_processed as _flp_startup
+        _samples_file, _summary_file = _flp_startup(_loaded_proj_id)
+    except ImportError:
+        _samples_file = PROCESSED_DIR / "langfuse_samples.jsonl"
+        _summary_file = PROCESSED_DIR / "langfuse_summary.json"
+    if _samples_file and _samples_file.exists():
+        with open(_samples_file, "r", encoding="utf-8") as f:
             _loaded = [json.loads(line) for line in f if line.strip()]
         for _s in _loaded:
             _s.pop("observations", None)
         st.session_state["samples"] = _loaded
-    if summary_file.exists():
-        st.session_state["summary"] = json.loads(summary_file.read_text(encoding="utf-8"))
+    if _summary_file and _summary_file.exists():
+        st.session_state["summary"] = json.loads(_summary_file.read_text(encoding="utf-8"))
 
 samples = st.session_state.get("samples")
 summary = st.session_state.get("summary") or {}
@@ -1095,11 +1161,65 @@ with tab_kb:
     _kb_env_api_key = os.getenv("DIFY_DATASET_API_KEY", "")
     _kb_env_base_url = os.getenv("DIFY_DATASET_API_BASE", "") or "http://localhost/v1"
 
+    # ── 用户偏好（非敏感） ──
+    _prefs_path = Path("data/user_preferences.json")
+
+    def _load_prefs():
+        if _prefs_path.exists():
+            try:
+                return json.loads(_prefs_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_prefs(prefs):
+        _prefs_path.parent.mkdir(parents=True, exist_ok=True)
+        _prefs_path.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _get_last_kb_profile_id():
+        return _load_prefs().get("last_selected_kb_profile_id", "")
+
+    def _set_last_kb_profile_id(pid):
+        prefs = _load_prefs()
+        if pid:
+            prefs["last_selected_kb_profile_id"] = pid
+        else:
+            prefs.pop("last_selected_kb_profile_id", None)
+        _save_prefs(prefs)
+
     with st.expander("知识库 API 连接配置", expanded=True):
         st.caption("本页仅使用 **知识库 API Key**（`dataset-` 开头），与批量提问的 App Key（`app-` 开头）完全独立。")
 
         # 列出已保存的配置
         kb_profiles = list_kb_profiles()
+
+        # ── 自动选择逻辑 ──
+        _auto_selected_pid = ""
+        _auto_reason = ""
+        _last_pid = _get_last_kb_profile_id()
+
+        if kb_profiles:
+            _valid_pids = {p.get("profile_id", "") for p in kb_profiles}
+
+            if _last_pid and _last_pid in _valid_pids:
+                # 优先级 1：上次选择的 profile 仍然存在
+                _auto_selected_pid = _last_pid
+                _auto_reason = "已恢复上次使用的连接"
+            elif len(kb_profiles) == 1:
+                # 优先级 2：只有一个 profile，自动选择
+                _auto_selected_pid = kb_profiles[0].get("profile_id", "")
+                _auto_reason = "已自动选择唯一可用连接"
+            # 优先级 4：多个 profile 无历史选择 → 保持 "(请选择)"
+        elif _kb_env_api_key:
+            # 优先级 3：无 profile 但有环境变量
+            _auto_selected_pid = "__env__"
+            _auto_reason = "已自动选择环境变量默认连接"
+
+        # 如果有历史选择但 profile 已被删除，清除失效偏好
+        if _last_pid and _last_pid not in {p.get("profile_id", "") for p in kb_profiles} and _last_pid != "__env__":
+            _set_last_kb_profile_id("")
+            if _auto_reason == "":
+                st.caption("⚠️ 上次使用的连接已删除，已清除历史偏好")
         kb_api_key = ""
         kb_base_url = _kb_env_base_url
 
@@ -1115,15 +1235,34 @@ with tab_kb:
                     label += f" · Key: {pmasked}"
                 kb_profile_options.append((pid, label))
 
+            # 计算默认选中索引
+            _options_list = [""] + [c[0] for c in kb_profile_options]
+            _default_idx = 0
+            if _auto_selected_pid and _auto_selected_pid in _options_list:
+                _default_idx = _options_list.index(_auto_selected_pid)
+
             kb_selected_pid = st.selectbox(
                 "选择知识库连接配置",
-                options=[""] + [c[0] for c in kb_profile_options],
+                options=_options_list,
+                index=_default_idx,
                 format_func=lambda x: (
                     "（请选择）" if not x
                     else next((c[1] for c in kb_profile_options if c[0] == x), x)
                 ),
                 key="kb_selected_profile",
             )
+
+            # 用户手动切换后更新偏好
+            if kb_selected_pid and kb_selected_pid != _last_pid:
+                _set_last_kb_profile_id(kb_selected_pid)
+
+            # 显示自动选择提示
+            if _auto_reason and kb_selected_pid == _auto_selected_pid:
+                _auto_profile_name = next(
+                    (c[1].split(" · ")[0] for c in kb_profile_options if c[0] == _auto_selected_pid),
+                    _auto_selected_pid
+                )
+                st.caption(f"✅ {_auto_reason}：{_auto_profile_name}")
 
             if kb_selected_pid:
                 kb_sel_meta = load_kb_profile(kb_selected_pid)
@@ -1231,7 +1370,12 @@ with tab_kb:
                 _env_ok, _env_err = validate_dataset_key(_kb_env_api_key)
                 if _env_ok:
                     kb_api_key = _kb_env_api_key
+                    # 保存环境变量选择偏好
+                    if _auto_selected_pid == "__env__" and _last_pid != "__env__":
+                        _set_last_kb_profile_id("__env__")
                     st.markdown("**当前使用：环境变量默认连接（未保存为命名配置）**")
+                    if _auto_reason:
+                        st.caption(f"✅ {_auto_reason}")
                     st.caption(f"Key 来源：`DIFY_DATASET_API_KEY`（`{kb_mask_api_key(_kb_env_api_key)}`）")
                     st.caption(f"Base URL：`{kb_base_url}`")
                     # 保存为命名配置
@@ -1407,8 +1551,10 @@ with tab_kb:
                     from chunk_exact_questions import (
                         filter_candidate_chunks, generate_chunk_exact_questions_multi_doc,
                         save_chunk_exact_questions, validate_chunk_exact_set,
-                        validate_multi_doc_config,
+                        validate_multi_doc_config, sample_candidates_random,
                         generate_default_set_name_for_dataset,
+                        get_multi_doc_stats_summary,
+                        CHUNK_EXACT_PHASE1_PROMPT, CHUNK_EXACT_PHASE2_PROMPT,
                     )
                     from dify_knowledge import list_all_segments, list_all_documents, build_chunk_catalog as _build_catalog
 
@@ -1541,15 +1687,88 @@ with tab_kb:
                             else:
                                 st.info("请至少勾选一个文档并设置生成题数 > 0。")
 
-                            # LLM 配置（复用 Judge API）
-                            ce_api_key = os.getenv("JUDGE_API_KEY", "")
+                            # ── 自动出题如何工作 ──
+                            with st.expander("📖 自动出题如何工作", expanded=False):
+                                st.markdown("""
+**两阶段自动流程（无需手动确认）：**
+
+1. **本地抽样** — 按每文档配额从完整候选 chunk 中独立随机抽取，不跨文档抢占，不重复
+2. **Phase 1 · 出题规划** — 逐文档调用 LLM，筛选有独立检索价值的 chunk，排除纯标题、无价值、重复片段
+3. **Phase 2 · 生成检索查询** — 逐文档调用 LLM，为 Phase 1 保留的 chunk 生成短检索查询与 target_label
+4. **本地绑定校验** — fail-closed 校验 candidate_id，从候选 chunk 绑定 segment_id / content_hash / document_id
+
+**安全规则：**
+- LLM 不产生 reference_answer，不能修改 gold chunk
+- LLM 不输出 segment_id 或 content_hash（由系统自动绑定）
+- 单个文档失败只跳过该文档，其余继续
+""")
+                                _n_docs = len(_active_docs)
+                                _n_total_q = _total_gen
+                                _n_llm_calls = _n_docs * 2  # 每文档 Phase 1 + Phase 2
+                                st.caption(f"本次：{_n_docs} 个文档 · 请求 {_n_total_q} 题 · 预计 {_n_llm_calls} 次 LLM 调用")
+
+                            # ── 查看提示词与本次输入预览 ──
+                            with st.expander("🔍 查看提示词与本次输入预览", expanded=False):
+                                st.markdown("**Phase 1 Prompt 模板（出题规划）**")
+                                st.code(CHUNK_EXACT_PHASE1_PROMPT[:1500] + "\n...", language="text")
+                                st.markdown("**Phase 2 Prompt 模板（生成检索查询）**")
+                                st.code(CHUNK_EXACT_PHASE2_PROMPT[:1500] + "\n...", language="text")
+
+                                st.markdown("---")
+                                st.markdown("**本次输入预览**（只读，不调用 LLM，不写题集）")
+                                if st.button("📋 生成只读预览", key="ce_preview_sampling"):
+                                    _preview_seed = st.session_state.get("ce_random_seed", 0)
+                                    _preview_seed = _preview_seed if _preview_seed > 0 else None
+                                    for _prev_r in _active_docs:
+                                        _prev_did = _prev_r["文档ID"]
+                                        _prev_dname = _prev_r["文档名"]
+                                        _prev_num = _prev_r["生成题数"]
+                                        _prev_cnt = _prev_r["可用chunk数"]
+
+                                        # 从缓存中获取该文档的候选（用于预览抽样）
+                                        _prev_candidates = [
+                                            {"segment_id": f"preview_{i}", "content": f"预览内容 {i}"}
+                                            for i in range(_prev_cnt)
+                                        ]
+                                        # 尝试从 session 缓存获取真实候选数
+                                        _prev_sampled, _prev_actual, _prev_capped = sample_candidates_random(
+                                            _prev_candidates, _prev_num,
+                                            seed=hash(_prev_did) % (2**31) if not _preview_seed else _preview_seed,
+                                        )
+
+                                        _cap_note = "（候选不足，已截取全部）" if _prev_capped else ""
+                                        st.markdown(
+                                            f"**{_prev_dname}** — 抽样 {_prev_actual}/{_prev_num} 题{_cap_note}，"
+                                            f"预计 2 次 LLM 调用"
+                                        )
+
+                                    _prev_total_llm = len(_active_docs) * 2
+                                    st.caption(f"预览完成：{len(_active_docs)} 个文档，共 {_total_gen} 题，预计 {_prev_total_llm} 次 LLM 调用")
+
+                            # 出题模型凭据（复用 Judge 配置）
                             ce_api_base = os.getenv("JUDGE_API_BASE", "")
                             ce_model = os.getenv("JUDGE_MODEL", "")
+                            _ce_judge_key = os.getenv("JUDGE_API_KEY", "")
 
-                            with st.expander("LLM 配置（复用 Judge API）", expanded=False):
-                                ce_api_key = st.text_input("API Key", value=ce_api_key, type="password", key="ce_api_key_random")
-                                ce_api_base = st.text_input("API Base URL", value=ce_api_base, key="ce_api_base_random")
-                                ce_model = st.text_input("Model", value=ce_model, key="ce_model_random")
+                            with st.expander("出题模型凭据（默认复用 Judge 模型）", expanded=False):
+                                st.caption("Base URL 和模型与 Judge 保持一致；如需临时使用另一把同服务商 Key，可仅替换 API Key。")
+                                st.markdown(f"**Base URL：** `{ce_api_base or '（未配置）'}`")
+                                st.markdown(f"**模型：** `{ce_model or '（未配置）'}`")
+                                ce_api_key = st.text_input(
+                                    "出题 API Key（可选覆盖）",
+                                    value="",
+                                    type="password",
+                                    key="ce_api_key_random",
+                                    placeholder="留空则使用 JUDGE_API_KEY",
+                                    help="填写时仅覆盖本次出题调用的 API Key，不保存到任何配置文件。",
+                                )
+                                if not ce_api_key:
+                                    ce_api_key = _ce_judge_key
+
+                            # Judge 配置完整性检查
+                            _ce_config_ok = bool(ce_api_base and ce_model and ce_api_key)
+                            if not ce_api_base or not ce_model:
+                                st.error("Judge Base URL 或 Model 未配置。请先在「Judge 评测」tab 配置 Judge API。")
 
                             ce_col1, ce_col2 = st.columns(2)
                             with ce_col1:
@@ -1586,38 +1805,44 @@ with tab_kb:
                                     st.error(_err)
 
                             if st.button("🎯 随机生成 chunk_exact 题集", key="ce_random_generate",
-                                         disabled=not (ce_api_key and ce_api_base and ce_model
-                                                       and _active_docs and not _validation_errors)):
-                                try:
-                                    # 为每个选中文档重新拉取完整 catalog（正式校验）
-                                    doc_configs = []
-                                    with st.spinner("正在拉取各文档完整 chunk catalog..."):
-                                        for r in _active_docs:
-                                            _doc_id = r["文档ID"]
-                                            _doc_name = r["文档名"]
-                                            _num_q = r["生成题数"]
+                                         disabled=not (_ce_config_ok and _active_docs and not _validation_errors)):
+                                _n_docs = len(_active_docs)
+                                _total_steps = _n_docs * 2 + 2  # 候选加载 + Phase1 + Phase2 + 校验保存
+                                _gen_progress = st.progress(0, text="准备开始...")
+                                _gen_status = st.empty()
+                                _failed_docs = []
 
-                                            # 拉取该文档的全部 segments
+                                try:
+                                    # ── 阶段 1/4：候选加载（0-20%）──
+                                    doc_configs = []
+                                    for _gi, r in enumerate(_active_docs):
+                                        _doc_id = r["文档ID"]
+                                        _doc_name = r["文档名"]
+                                        _num_q = r["生成题数"]
+                                        _pct = int((_gi / max(_n_docs, 1)) * 20)
+                                        _gen_progress.progress(_pct, text=f"候选加载 {_gi+1}/{_n_docs} — {_doc_name[:12]}…")
+                                        _gen_status.caption(f"📥 正在拉取「{_doc_name[:15]}」完整 chunk catalog...")
+
+                                        try:
                                             all_segs = list_all_segments(
                                                 kb_api_key, kb_base_url,
                                                 selected_ds_id, _doc_id,
                                             )
-                                            # 构建 catalog
                                             doc_catalog = _build_catalog(
                                                 all_segs, selected_ds_id,
                                                 _doc_id, _doc_name,
                                             )
-                                            # 过滤候选
-                                            doc_candidates, _ = filter_candidate_chunks(
-                                                doc_catalog
-                                            )
-
+                                            doc_candidates, _ = filter_candidate_chunks(doc_catalog)
                                             doc_configs.append({
                                                 "document_id": _doc_id,
                                                 "document_name": _doc_name,
                                                 "candidates": doc_candidates,
                                                 "num_questions": _num_q,
                                             })
+                                        except Exception as _load_exc:
+                                            _failed_docs.append((_doc_name, "候选加载", str(_load_exc)[:60]))
+
+                                    _gen_progress.progress(20, text=f"候选加载完成 — {len(doc_configs)}/{_n_docs} 文档就绪")
 
                                     # 校验
                                     ok, errors = validate_multi_doc_config(doc_configs)
@@ -1625,74 +1850,138 @@ with tab_kb:
                                         for _err in errors:
                                             st.error(_err)
                                     else:
-                                        with st.spinner(f"正在从 {len(_active_docs)} 个文档生成 {_total_gen} 道题..."):
-                                            ce_questions = generate_chunk_exact_questions_multi_doc(
-                                                doc_configs,
-                                                ce_api_key, ce_api_base, ce_model,
-                                                dataset_id=selected_ds_id,
-                                                timeout=60,
-                                            )
+                                        # ── 阶段 2-3/4：Phase 1 + Phase 2（20-90%）──
+                                        def _update_progress(done, total, message):
+                                            # done/total 是文档级步数（每文档 2 步）
+                                            _pct = 20 + int((done / max(total, 1)) * 70)
+                                            _gen_progress.progress(min(_pct, 90), text=message)
+                                            _gen_status.caption(message)
+
+                                        ce_questions, ce_doc_stats, _actual_seed = generate_chunk_exact_questions_multi_doc(
+                                            doc_configs,
+                                            ce_api_key, ce_api_base, ce_model,
+                                            dataset_id=selected_ds_id,
+                                            master_seed=ce_random_seed if ce_random_seed > 0 else 0,
+                                            timeout=60,
+                                            progress_callback=_update_progress,
+                                        )
+
+                                        # ── 阶段 4/4：校验保存（90-100%）──
+                                        _gen_progress.progress(90, text="本地绑定校验...")
+                                        _gen_status.caption("🔍 校验 chunk binding 完整性...")
 
                                         ce_valid, ce_invalid = validate_chunk_exact_set(ce_questions)
-                                        if ce_invalid:
-                                            st.warning(f"{len(ce_invalid)} 道题绑定不完整，已剔除。剩余 {len(ce_valid)} 道。")
-                                            ce_questions = ce_valid
+                                        _bind_ok = len(ce_valid)
+                                        _bind_fail = len(ce_invalid)
 
-                                        if not ce_questions:
+                                        if not ce_valid:
+                                            _gen_progress.progress(100, text="生成完成 — 无有效题目")
+                                            _gen_status.empty()
                                             st.error("所有题目均绑定不完整，无法保存。")
                                         else:
-                                            # 构建 doc_question_counts
-                                            _doc_qc = {}
-                                            for r in _active_docs:
-                                                _doc_qc[r["文档ID"]] = r["生成题数"]
-
-                                            # 构建 doc_name_map
+                                            # 保存
+                                            _doc_qc = {r["文档ID"]: r["生成题数"] for r in _active_docs}
                                             _dnm = {ds["document_id"]: ds["document_name"] for ds in _ds_doc_stats}
 
                                             ce_output_path, ce_filename, ce_set_id = save_chunk_exact_questions(
-                                                ce_questions,
+                                                ce_valid,
                                                 question_set_name=ce_random_name or None,
                                                 dataset_id=selected_ds_id,
                                                 document_id=_active_docs[0]["文档ID"] if len(_active_docs) == 1 else "",
                                                 selection_mode="random",
                                                 selected_document_ids=[r["文档ID"] for r in _active_docs],
                                                 doc_question_counts=_doc_qc,
+                                                random_seed=_actual_seed,
                                             )
 
+                                            _gen_progress.progress(100, text="生成完成")
+                                            _gen_status.empty()
+
+                                            # ── 成功摘要 ──
+                                            _total_requested = sum(s.get("phase1_planned", 0) for s in ce_doc_stats if s.get("status") == "ok")
+                                            _total_generated = len(ce_questions)
+                                            _total_skipped = _total_gen - _total_generated
                                             st.success(
                                                 f"chunk_exact 题集已生成！\n\n"
                                                 f"- **题集 ID:** `{ce_set_id}`\n"
-                                                f"- **题目数量:** {len(ce_questions)}\n"
+                                                f"- **请求题数:** {_total_gen} → **实际生成:** {_total_generated} → **绑定通过:** {_bind_ok}\n"
+                                                f"- **跳过/失败:** {_total_skipped}（含绑定失败 {_bind_fail}）\n"
                                                 f"- **文件:** `{ce_filename}`\n"
-                                                f"- **文档:** {len(_active_docs)} 份"
+                                                f"- **文档:** {_n_docs} 份"
                                             )
 
-                                            # 各文档实际生成数量
-                                            _actual_counts = {}
-                                            for q in ce_questions:
-                                                _d_id = q.get("document_id", "")
-                                                _actual_counts[_d_id] = _actual_counts.get(_d_id, 0) + 1
-                                            _count_parts = []
-                                            for _did, _cnt in _actual_counts.items():
-                                                _dlabel = _dnm.get(_did, _did[:8] + "...")
-                                                _count_parts.append(f"{_dlabel}: {_cnt} 题")
-                                            st.caption("各文档实际生成: " + "、".join(_count_parts))
+                                            # ── 按文档详细统计 ──
+                                            with st.expander("📊 每文档生成详情", expanded=True):
+                                                for _s in ce_doc_stats:
+                                                    _s_name = _s.get("document_name", "")[:15]
+                                                    _s_status = _s.get("status", "")
+                                                    _s_req = _s.get("requested", 0)
+                                                    _s_pool = _s.get("candidate_pool", 0)
+                                                    _s_p1 = _s.get("phase1_planned", 0)
+                                                    _s_p2 = _s.get("phase2_generated", 0)
+                                                    _s_bound = _s.get("bound", 0)
+                                                    _s_styles = _s.get("query_style_counts", {})
+                                                    _style_str = " | ".join(f"{k}:{v}" for k, v in sorted(_s_styles.items())) if _s_styles else ""
 
+                                                    if _s_status == "ok":
+                                                        _icon = "✅"
+                                                        _detail = f"请求{_s_req}→池{_s_pool}→计划{_s_p1}→生成{_s_p2}→绑定{_s_bound}"
+                                                        if _style_str:
+                                                            _detail += f" [{_style_str}]"
+                                                    elif _s_status == "underfilled":
+                                                        _icon = "⚠️"
+                                                        _err = (_s.get("errors") or [""])[-1][:40]
+                                                        _detail = f"请求{_s_req}→池{_s_pool}→计划{_s_p1}→生成{_s_p2}→绑定{_s_bound} — {_err}"
+                                                        if _style_str:
+                                                            _detail += f" [{_style_str}]"
+                                                    elif _s_status == "insufficient_candidates":
+                                                        _icon = "❌"
+                                                        _err = (_s.get("errors") or ["未知"])[0][:50]
+                                                        _detail = f"候选不足 — {_err}"
+                                                    elif _s_status == "phase1_failed":
+                                                        _icon = "❌"
+                                                        _err = (_s.get("errors") or ["未知"])[0][:50]
+                                                        _detail = f"Phase1 失败 — {_err}"
+                                                    elif _s_status == "phase1_empty":
+                                                        _icon = "⚠️"
+                                                        _detail = "Phase1 未返回有效规划"
+                                                    elif _s_status == "phase2_failed":
+                                                        _icon = "❌"
+                                                        _err = (_s.get("errors") or ["未知"])[0][:50]
+                                                        _detail = f"Phase2 失败 — {_err}"
+                                                    else:
+                                                        _icon = "⚠️"
+                                                        _detail = _s_status
+
+                                                    st.markdown(f"{_icon} **{_s_name}** — {_detail}")
+
+                                            # 显示实际种子
+                                            st.caption(f"🎲 实际随机种子：{_actual_seed}（可用于复现本次出题）")
+
+                                            # 题目预览
                                             with st.expander("题目预览", expanded=False):
-                                                for i, q in enumerate(ce_questions):
+                                                for i, q in enumerate(ce_valid):
                                                     seg_id = q.get("expected_segment_id", "")
                                                     seg_short = seg_id[:12] + "..." if len(str(seg_id)) > 12 else seg_id
                                                     pos = q.get("source_position", "")
                                                     doc_id = q.get("document_id", "")
                                                     doc_label = _dnm.get(doc_id, doc_id[:8] + "...")
+                                                    _qstyle = q.get("query_style", "")
+                                                    _style_badge = f" `{_qstyle}`" if _qstyle else ""
                                                     st.markdown(
                                                         f"**{i+1}.** {q.get('retrieval_query', '')} "
-                                                        f"(`{q.get('target_label', '')}`) "
+                                                        f"(`{q.get('target_label', '')}`{_style_badge}) "
                                                         f"→ [{doc_label}] segment: `{seg_short}` pos:{pos}"
                                                     )
 
                                 except Exception as exc:
+                                    _gen_progress.progress(100, text="生成失败")
+                                    _gen_status.empty()
                                     st.error(f"生成失败: {exc}")
+
+                                finally:
+                                    # 清理 progress 占位符（保留错误/成功消息）
+                                    pass
 
                     # ── 文档选择与分块浏览 ────────────────────────────
                     st.markdown("### 分块浏览")
@@ -1868,33 +2157,25 @@ with tab_kb:
                                 f"enabled, status, content_hash"
                             )
 
-                            # ── 从 Catalog 创建题集（手动模式，当前预览文档） ──
+                            # ── 基于当前预览文档手动创建题集 ──
                             st.divider()
-                            st.markdown("### 从 Catalog 创建题集（手动选择 chunk）")
+                            st.markdown("### 基于当前预览文档手动创建题集")
                             st.caption(
-                                "从当前预览文档的 Chunk Catalog 选择候选 chunk，调用 LLM 生成短检索查询，"
-                                "创建 chunk_exact 题集。评测时按 segment_id / content_hash 精确匹配判定。"
+                                "仅使用「分块浏览」当前选中文档、本页已加载的候选 chunk。"
+                                "适合针对关键条款、异常切分或特定内容做专项检索诊断；"
+                                "如需跨多个文档自动出题，请使用上方「按文档随机」模式。"
                             )
 
-                            with st.expander("chunk_exact 题集说明（点击展开）", expanded=False):
-                                st.markdown("""
-**用途：** 基于知识库实际分块内容，批量生成精确匹配评测题集。
-
-**流程：**
-1. 从当前 Chunk Catalog 自动过滤候选 chunk（completed、enabled、非重复、非空、长度达标）
-2. 可手动排除不需要的候选 chunk
-3. 调用 LLM 为每个候选生成短检索查询
-4. 保存为 chunk_exact 题集，绑定 expected_segment_id / expected_content_hash
-
-**评测方式：**
-- chunk_exact 题集使用**纯机器判定**，不调用 AI Judge
-- 从真实 Langfuse trace 的 Top1/Top3/Top5 检索结果中匹配 segment_id 或 content_hash
-- 与 retrieval_evidence 轨道**分开统计**，不混合成跨配置结论
-
-**重要：**
-- 正式评测必须使用 Dify 工作流真实调用和真实 Langfuse trace
-- chunk_exact 诊断结果不写入其他轨道的指标
-""")
+                            # 显示当前文档上下文
+                            _cur_doc_name = doc_name_map.get(selected_doc_id, selected_doc_id[:12])
+                            _cur_seg_total = seg_total if 'seg_total' in dir() else 0
+                            _cur_seg_page = seg_page if 'seg_page' in dir() else 1
+                            st.markdown(
+                                f"**当前文档：** `{_cur_doc_name}` | "
+                                f"**页码：** 第 {_cur_seg_page} 页 | "
+                                f"**本页分块数：** {len(segments)} | "
+                                f"**文档总分块数：** {_cur_seg_total}"
+                            )
 
                             # 过滤候选 chunk
                             from chunk_exact_questions import (
@@ -1904,23 +2185,40 @@ with tab_kb:
 
                             ce_candidates, ce_filter_stats = filter_candidate_chunks(catalog, duplicates)
 
-                            st.markdown(f"**当前预览文档候选 chunk：** {ce_filter_stats['passed']} / {ce_filter_stats['total']} 通过过滤")
+                            st.markdown(
+                                f"**候选 chunk：** {ce_filter_stats['passed']} / {ce_filter_stats['total']} 通过过滤"
+                            )
                             if ce_filter_stats["filtered"]:
                                 filter_desc = "、".join(f"{reason}: {count}" for reason, count in ce_filter_stats["filtered"].items())
-                                st.caption(f"已过滤: {filter_desc}")
+                                st.caption(f"过滤原因: {filter_desc}")
 
                             if not ce_candidates:
                                 st.warning("当前预览文档没有符合条件的候选 chunk。请切换到有更多 completed+enabled 分块的文档。")
                             else:
-                                # LLM 配置（复用 Judge API）
-                                ce_api_key = os.getenv("JUDGE_API_KEY", "")
+                                # 出题模型凭据（复用 Judge 配置）
                                 ce_api_base = os.getenv("JUDGE_API_BASE", "")
                                 ce_model = os.getenv("JUDGE_MODEL", "")
+                                _ce_judge_key = os.getenv("JUDGE_API_KEY", "")
 
-                                with st.expander("LLM 配置（复用 Judge API）", expanded=False):
-                                    ce_api_key = st.text_input("API Key", value=ce_api_key, type="password", key="ce_api_key")
-                                    ce_api_base = st.text_input("API Base URL", value=ce_api_base, key="ce_api_base")
-                                    ce_model = st.text_input("Model", value=ce_model, key="ce_model")
+                                with st.expander("出题模型凭据（默认复用 Judge 模型）", expanded=False):
+                                    st.caption("Base URL 和模型与 Judge 保持一致；如需临时使用另一把同服务商 Key，可仅替换 API Key。")
+                                    st.markdown(f"**Base URL：** `{ce_api_base or '（未配置）'}`")
+                                    st.markdown(f"**模型：** `{ce_model or '（未配置）'}`")
+                                    ce_api_key = st.text_input(
+                                        "出题 API Key（可选覆盖）",
+                                        value="",
+                                        type="password",
+                                        key="ce_api_key",
+                                        placeholder="留空则使用 JUDGE_API_KEY",
+                                        help="填写时仅覆盖本次出题调用的 API Key，不保存到任何配置文件。",
+                                    )
+                                    if not ce_api_key:
+                                        ce_api_key = _ce_judge_key
+
+                                # Judge 配置完整性检查
+                                _ce_config_ok = bool(ce_api_base and ce_model and ce_api_key)
+                                if not ce_api_base or not ce_model:
+                                    st.error("Judge Base URL 或 Model 未配置。请先在「Judge 评测」tab 配置 Judge API。")
 
                                 # ── 手动模式：从当前预览文档选择 chunk ──
                                     with st.expander("查看和调整候选 chunk", expanded=False):
@@ -1957,7 +2255,7 @@ with tab_kb:
                                             )
 
                                         if st.button("🎯 生成 chunk_exact 题集", key="ce_generate",
-                                                     disabled=not (ce_api_key and ce_api_base and ce_model)):
+                                                     disabled=not _ce_config_ok):
                                             try:
                                                 with st.spinner("正在生成 chunk_exact 题集..."):
                                                     ce_questions = generate_chunk_exact_questions(
@@ -4407,10 +4705,15 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 backfill_observations, get_observation_coverage,
                 list_cleanup_candidates, cleanup_files,
                 list_parseable_sources, list_snapshots, get_current_snapshot_id,
-                export_snapshot_as_jsonl, mark_snapshot_parsed,
+                export_snapshot_as_jsonl, export_current_cache_as_jsonl,
+                get_current_cache_stats, compute_file_fingerprint,
+                mark_snapshot_parsed,
                 can_cleanup_snapshot, cleanup_old_snapshots,
                 create_frozen_snapshot,
-                PROJECTS_DIR,
+                get_current_eval_cache, update_eval_cache,
+                _find_snapshot_references,
+                get_processed_paths, find_latest_processed,
+                PROJECTS_DIR, PROCESSED_DIR as _LP_PROCESSED_DIR,
             )
 
             # 连接模式选择
@@ -4734,7 +5037,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 f" | {result['pages']} 页 | 耗时 {result['elapsed']:.1f}s"
                             )
                             if _snap_created:
-                                st.info("✅ 已更新当前缓存快照（逻辑引用，未复制文件）")
+                                st.info("✅ 同步缓存已更新")
                             elif result["new_traces"] == 0 and _obs_new == 0:
                                 st.info("无新增数据，复用当前缓存快照")
                             if _obs_new == 0 and result["new_traces"] > 0:
@@ -4756,20 +5059,67 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         finally:
                             st.session_state["_fetching"] = False
 
-                    # ── 创建独立快照 ──
+                    # ── 当前动态缓存 ──
                     if _proj_id:
-                        _current_snap_id = get_current_snapshot_id(_proj_id)
-                        _snap_list = list_snapshots(_proj_id)
-                        _frozen_count = sum(1 for s in _snap_list if s.get("snapshot_type") == "frozen")
-                        st.caption(f"当前缓存快照: `{_current_snap_id[:20]}{'...' if len(_current_snap_id) > 20 else ''}` | 独立快照: {_frozen_count} 个")
-                        if st.button("📦 创建独立快照", key="lf_create_frozen",
-                                     help="将当前缓存复制为独立快照文件，用于归档或复现"):
+                        _cache_stats = get_current_cache_stats(_proj_id)
+                        _cs_trace = _cache_stats.get("trace_count", 0)
+                        _cs_obs = _cache_stats.get("observation_count", 0)
+                        _cs_has_obs = _cache_stats.get("has_observations", False)
+                        _cs_synced = _cache_stats.get("last_sync_at", "")
+                        _cs_size_mb = round(_cache_stats.get("file_size_bytes", 0) / (1024 * 1024), 2)
+
+                        st.markdown("**📋 当前动态缓存**")
+                        _cache_info = f"{_cs_trace} traces / {_cs_obs} obs | {_cs_size_mb} MB"
+                        if _cs_synced:
+                            _cache_info += f" | 上次同步: {_cs_synced}"
+                        if _cs_has_obs:
+                            _cache_info += " | ✅ 含检索证据"
+                        else:
+                            _cache_info += " | ⚠️ 不含检索证据"
+                        st.caption(_cache_info)
+
+                        # 冻结按钮（可选留档）
+                        _can_freeze = _cs_trace > 0 and _cs_has_obs
+                        if st.button(
+                            "📦 冻结当前缓存（可选留档）",
+                            key="lf_freeze_cache",
+                            disabled=not _can_freeze,
+                            help="将当前动态缓存复制为不可变历史版本，供未来手动回退。正常解析不需要此步骤。"
+                        ):
                             try:
-                                frozen = create_frozen_snapshot(_proj_id)
-                                st.success(f"独立快照已创建: `{frozen['snapshot_id']}`")
+                                with st.spinner("正在冻结当前缓存..."):
+                                    _frozen = create_frozen_snapshot(_proj_id)
+                                st.success(f"✅ 已冻结: `{_frozen['snapshot_id']}`（仅供历史复查）")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"创建失败: {e}")
+                                st.error(f"冻结失败: {e}")
+
+                        if not _can_freeze and _cs_trace > 0:
+                            st.caption("💡 冻结需要 observation 数据。请检查 API 权限。")
+
+                        # 历史冻结缓存（默认折叠）
+                        _snap_list = list_snapshots(_proj_id)
+                        _frozen_all = [
+                            s for s in _snap_list
+                            if s.get("snapshot_type") == "frozen"
+                        ]
+                        _frozen_evidence = [
+                            s for s in _frozen_all
+                            if s.get("has_observations", False)
+                        ]
+                        if _frozen_evidence:
+                            with st.expander(f"📖 历史冻结缓存（{len(_frozen_evidence)} 个，仅供手动回退）", expanded=False):
+                                for _of in sorted(_frozen_evidence, key=lambda s: s.get("created_at", ""), reverse=True):
+                                    _of_id = _of.get("snapshot_id", "")
+                                    _of_trace = _of.get("trace_count", 0)
+                                    _of_obs = _of.get("observation_count", 0)
+                                    _of_created = _of.get("created_at", "")[:16].replace("T", " ")
+                                    _refs = _find_snapshot_references(_proj_id, _of_id)
+                                    _ref_note = f" | 被 {len(_refs)} 个产物引用" if _refs else ""
+                                    st.caption(
+                                        f"`{_of_id}` | {_of_trace}t/{_of_obs}obs"
+                                        f" | {_of_created}{_ref_note}"
+                                    )
 
                     # ── 清理旧导出文件 ──
                     _cleanup_candidates = list_cleanup_candidates()
@@ -4801,117 +5151,128 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 else:
                     st.info("请点击「测试连接并识别项目」以开始。")
 
-        # Step 2: 选择数据源并解析
+        # Step 2: 解析当前缓存
         st.divider()
-        st.markdown("**第二步：选择数据源并解析**")
+        st.markdown("**第二步：解析当前缓存**")
 
-        # 收集可解析数据源（项目快照 + 旧版 raw 文件）
+        # ── 权威来源：当前动态缓存 ──
         _proj_id_for_sources = st.session_state.get("_lf_project_info", {}).get("project_id")
-        parseable_sources = list_parseable_sources(_proj_id_for_sources)
+        _current_cache_stats = get_current_cache_stats(_proj_id_for_sources) if _proj_id_for_sources else {}
+        _cc_has_obs = _current_cache_stats.get("has_observations", False)
+        _cc_trace = _current_cache_stats.get("trace_count", 0)
 
-        if not parseable_sources:
-            st.info("无可解析数据。请先通过上方「同步」获取数据，或检查 data/raw 目录。")
-            # 清除过期的 session 状态
-            st.session_state.pop("samples", None)
-            st.session_state.pop("summary", None)
-            selected_name = None
-            selected_path = None
-        else:
-            # 构建选项
-            source_ids = [s["source_id"] for s in parseable_sources]
-            source_labels = []
-            for s in parseable_sources:
-                parsed_badge = " ✅已解析" if s["parsed"] else ""
-                _s_trace = s.get("trace_count", "?")
-                _s_obs = s.get("observation_count", 0)
-                if s["source_type"] == "evidence_snapshot":
-                    _s_info = f"{s['size_mb']} MB | {_s_trace}t/{_s_obs}obs"
-                elif s["source_type"] == "logical_snapshot":
-                    _s_info = f"{s['size_mb']} MB | 同步缓存，不可正式解析"
-                elif s["source_type"] == "index_snapshot":
-                    _s_info = f"{s['size_mb']} MB | 仅索引"
-                else:
-                    _s_info = f"{s['size_mb']} MB"
-                source_labels.append(
-                    f"{s['label']} | {_s_info} | {s['mtime']}{parsed_badge}"
-                )
+        # ── 统一初始化解析变量 ──
+        selected_source = None
+        selected_name = None
+        selected_path = None
+        source_type = None
+        is_gzip = False
+        has_obs = False
+        _can_parse = False
 
-            # 默认选中：优先选当前项目的最新证据快照
-            default_idx = 0
-            saved_select = st.session_state.get("raw_select")
-            if saved_select and saved_select in source_ids:
-                default_idx = source_ids.index(saved_select)
-            elif _proj_id_for_sources:
-                # 正式解析优先 frozen evidence snapshot，其次 legacy_raw。
-                for i, s in enumerate(parseable_sources):
-                    if s.get("source_type") in ("evidence_snapshot", "legacy_raw"):
-                        default_idx = i
-                        break
+        # 已解析结果来源检测
+        _parsed_samples = st.session_state.get("samples")
+        _parsed_summary = st.session_state.get("summary", {})
+        _parsed_source_type = _parsed_summary.get("langfuse_source_type", "")
 
-            selected_label = st.selectbox(
-                "待解析数据源", source_labels, index=default_idx,
-                key="raw_select_label",
+        # ── 默认路径：当前动态缓存 ──
+        if _proj_id_for_sources and _cc_trace > 0 and _cc_has_obs:
+            source_type = "current_cache"
+            _can_parse = True
+            has_obs = True
+
+            st.markdown(
+                f"**当前数据源：** 当前动态缓存"
+                f" — `{_proj_id_for_sources[:20]}...`"
             )
-            selected_idx = source_labels.index(selected_label)
-            selected_source = parseable_sources[selected_idx]
-            selected_name = selected_source["source_id"]
-            selected_path = selected_source["path"]
-
-            # 同步 session_state
-            st.session_state["raw_select"] = selected_name
-
-            # 数据源变化时清理解析状态
-            prev_select = st.session_state.get("_prev_raw_select")
-            if prev_select is not None and prev_select != selected_name:
-                st.session_state.pop("samples", None)
-                st.session_state.pop("summary", None)
-            st.session_state["_prev_raw_select"] = selected_name
-
-            # 文件信息
-            size_mb = selected_source["size_mb"]
-            trace_mb = selected_source.get("trace_size_mb", size_mb)
-            obs_mb = selected_source.get("obs_size_mb", 0)
-            source_type = selected_source["source_type"]
-            is_gzip = selected_path.endswith(".gz")
-            has_obs = selected_source.get("has_observations", False)
-            _trace_cnt = selected_source.get("trace_count", "?")
-            _obs_cnt = selected_source.get("observation_count", 0)
-
-            _info_parts = []
-            if source_type == "evidence_snapshot":
-                _info_parts.append(f"总大小: {size_mb} MB（TRACE: {trace_mb} MB + Observation: {obs_mb} MB）")
-                _info_parts.append(f"{_trace_cnt} traces / {_obs_cnt} observations")
-            elif source_type == "logical_snapshot":
-                _info_parts.append(f"大小: {size_mb} MB（项目主缓存引用，未复制）")
-                _info_parts.append("仅用于同步状态，不可作为正式样本解析来源")
-            elif source_type == "index_snapshot":
-                _info_parts.append(f"大小: {trace_mb} MB（仅索引）")
-                _info_parts.append(f"{_trace_cnt} traces")
-            else:
-                _info_parts.append(f"大小: {size_mb} MB")
-
-            if is_gzip:
-                _info_parts.append("gzip 压缩")
-            if source_type == "logical_snapshot":
-                _info_parts.append("⚠️ logical snapshot 不可正式解析")
-            elif source_type == "index_snapshot":
-                _info_parts.append("⚠️ 不含检索证据")
-            elif has_obs:
-                _info_parts.append("✅ 包含检索证据")
-            if selected_source.get("parsed"):
-                _info_parts.append("已解析")
+            _info_parts = [
+                f"{_cc_trace} traces / {_current_cache_stats.get('observation_count', 0)} obs",
+                "✅ 含检索证据",
+            ]
             st.caption(" | ".join(_info_parts))
 
-            # 只有 frozen evidence snapshot 和 legacy raw 可作为正式来源。
-            _can_parse = source_type in ("evidence_snapshot", "legacy_raw")
-            if source_type == "logical_snapshot":
-                st.warning("logical snapshot 仅引用当前项目缓存，不可作为正式样本解析来源。请创建并选择 frozen evidence snapshot。")
-            elif source_type == "index_snapshot":
-                st.warning("索引快照：不含检索证据，不可解析为评测样本。请使用证据快照或旧版全量导出。")
+            # 已解析结果来源检测
+            if _parsed_samples and _parsed_source_type:
+                if _parsed_source_type != "current_cache":
+                    st.warning(
+                        f"⚠️ 当前展示的是历史解析结果（来源类型：`{_parsed_source_type}`）。"
+                        f"点击下方按钮解析当前缓存。"
+                    )
 
+        elif _proj_id_for_sources and _cc_trace > 0 and not _cc_has_obs:
+            st.warning("当前缓存不含 observation 数据。请检查 API 权限后重新同步。")
+        elif _proj_id_for_sources:
+            st.info("当前缓存无数据。请先点击「同步新增」获取 trace 数据。")
+        else:
+            st.info("请先在上方选择 Langfuse 连接并同步数据。")
+
+        # ── 历史冻结缓存选择（可选，折叠） ──
+        parseable_sources = list_parseable_sources(_proj_id_for_sources)
+        _frozen_evidence = [
+            s for s in parseable_sources
+            if s["source_type"] == "evidence_snapshot"
+        ]
+        _legacy_sources = [
+            s for s in parseable_sources
+            if s["source_type"] == "legacy_raw"
+        ]
+
+        if _frozen_evidence or _legacy_sources:
+            _frozen_labels = []
+            _frozen_sources = []
+            for _fs in _frozen_evidence:
+                _fid = _fs.get("snapshot_id", "")
+                _ft = _fs.get("trace_count", 0)
+                _fo = _fs.get("observation_count", 0)
+                _frozen_labels.append(f"📦 冻结: {_fid} ({_ft}t/{_fo}obs)")
+                _frozen_sources.append(_fs)
+            for _ls in _legacy_sources:
+                _frozen_labels.append(f"📁 {_ls['label']} ({_ls['size_mb']} MB)")
+                _frozen_sources.append(_ls)
+
+            with st.expander(f"🔄 切换到历史缓存（{len(_frozen_labels)} 个可选）", expanded=False):
+                if _frozen_labels:
+                    _sel_frozen_label = st.selectbox(
+                        "选择历史数据源",
+                        _frozen_labels,
+                        key="frozen_source_select",
+                    )
+                    _sel_frozen_idx = _frozen_labels.index(_sel_frozen_label)
+                    _sel_frozen = _frozen_sources[_sel_frozen_idx]
+
+                    if st.button("使用此历史数据源解析", key="use_frozen_btn"):
+                        # 切换到历史数据源
+                        selected_source = _sel_frozen
+                        selected_name = _sel_frozen.get("source_id", "")
+                        selected_path = _sel_frozen.get("path", "")
+                        source_type = _sel_frozen.get("source_type", "")
+                        is_gzip = selected_path.endswith(".gz")
+                        has_obs = _sel_frozen.get("has_observations", False)
+                        _can_parse = True
+                        st.session_state["_use_frozen_source"] = _sel_frozen
+                        st.rerun()
+
+        # 检查是否用户选择了历史数据源
+        _use_frozen = st.session_state.get("_use_frozen_source")
+        if _use_frozen and not _can_parse:
+            selected_source = _use_frozen
+            selected_name = _use_frozen.get("source_id", "")
+            selected_path = _use_frozen.get("path", "")
+            source_type = _use_frozen.get("source_type", "")
+            is_gzip = selected_path.endswith(".gz")
+            has_obs = _use_frozen.get("has_observations", False)
+            _can_parse = True
+            st.info(f"📌 使用历史数据源: `{_use_frozen.get('snapshot_id', '') or _use_frozen.get('source_id', '')}`")
+            if st.button("↩️ 切回当前缓存", key="back_to_current"):
+                st.session_state.pop("_use_frozen_source", None)
+                st.rerun()
+
+        # ── 解析按钮与执行逻辑 ──
+        if _can_parse:
+            _parse_btn_label = "解析当前缓存" if source_type == "current_cache" else "开始解析"
             if st.button(
-                "开始解析", type="primary", key="parse_btn",
-                disabled=st.session_state.get("_parsing", False) or not _can_parse,
+                _parse_btn_label, type="primary", key="parse_btn",
+                disabled=st.session_state.get("_parsing", False),
             ):
                 st.session_state["_parsing"] = True
                 parse_status = st.status("正在解析...", expanded=True)
@@ -4919,33 +5280,34 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 detail_text = st.empty()
                 t0 = time.time()
 
-                # gzip 需要先解压
-                actual_parse_path = Path(selected_path)
+                # 准备解析文件
+                actual_parse_path = None
                 temp_jsonl = None
-                if is_gzip:
-                    progress_bar.progress(0, text="正在解压 gzip 文件...")
-                    try:
-                        if source_type == "evidence_snapshot" and selected_source.get("snapshot_id"):
-                            # 证据快照：合并 traces + observations
-                            temp_jsonl = export_snapshot_as_jsonl(
-                                selected_source["project_id"],
-                                selected_source["snapshot_id"],
-                            )
-                        else:
-                            # 通用 gzip 解压（legacy raw 等）
-                            import gzip as _gzip
-                            temp_jsonl = actual_parse_path.with_suffix("")
-                            with _gzip.open(actual_parse_path, "rt", encoding="utf-8") as fin, \
-                                 temp_jsonl.open("w", encoding="utf-8") as fout:
-                                for line in fin:
-                                    fout.write(line)
-                        actual_parse_path = temp_jsonl
-                    except Exception as e:
-                        st.error(f"解压失败: {e}")
-                        st.session_state["_parsing"] = False
-                        st.stop()
-
                 try:
+                    if source_type == "current_cache":
+                        # 当前动态缓存：直接合并 traces + observations
+                        progress_bar.progress(0, text="正在合并当前缓存...")
+                        actual_parse_path = export_current_cache_as_jsonl(_proj_id_for_sources)
+                    elif source_type == "evidence_snapshot" and selected_source.get("snapshot_id"):
+                        # 冻结快照：合并 traces + observations
+                        progress_bar.progress(0, text="正在解冻快照...")
+                        actual_parse_path = export_snapshot_as_jsonl(
+                            selected_source["project_id"],
+                            selected_source["snapshot_id"],
+                        )
+                    elif is_gzip:
+                        # 通用 gzip 解压
+                        progress_bar.progress(0, text="正在解压 gzip 文件...")
+                        import gzip as _gzip
+                        temp_jsonl = Path(selected_path).with_suffix("")
+                        with _gzip.open(selected_path, "rt", encoding="utf-8") as fin, \
+                             temp_jsonl.open("w", encoding="utf-8") as fout:
+                            for line in fin:
+                                fout.write(line)
+                        actual_parse_path = temp_jsonl
+                    else:
+                        actual_parse_path = Path(selected_path)
+
                     def _on_progress(phase, current, total, traces, retrieval):
                         if phase == "counting":
                             progress_bar.progress(0, text="正在统计行数...")
@@ -4969,17 +5331,50 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     )
 
                     _on_progress("saving", 0, 0, 0, 0)
-                    output_path = PROCESSED_DIR / "langfuse_samples.jsonl"
-                    summary_path = PROCESSED_DIR / "langfuse_summary.json"
+
+                    # ── 隔离路径：按 project_id 写入 ──
+                    _src_pid = _proj_id_for_sources or ""
+                    _src_snap = selected_source.get("snapshot_id", "") if selected_source else ""
+                    _src_sid = selected_source.get("source_id", "") if selected_source else ""
+                    output_path, summary_path = get_processed_paths(
+                        source_type or "current_cache", project_id=_src_pid,
+                        snapshot_id=_src_snap, source_id=_src_sid,
+                    )
                     if output_path.exists():
-                        st.info(f"将覆盖已有解析结果：`{output_path.name}`")
+                        st.info(f"将覆盖已有解析结果：`{output_path}`")
+
+                    # ── 计算文件指纹 ──
+                    _trace_fp = ""
+                    _obs_fp = ""
+                    if source_type == "current_cache":
+                        from langfuse_project import _traces_path, _obs_path
+                        _trace_fp = compute_file_fingerprint(_traces_path(_src_pid))
+                        _obs_fp = compute_file_fingerprint(_obs_path(_src_pid))
+
+                    # ── 构建 provenance（落盘前固化到 summary 和每个 sample） ──
+                    _provenance = {
+                        "langfuse_project_id": _src_pid,
+                        "langfuse_snapshot_id": _src_snap,
+                        "langfuse_source_type": source_type or "",
+                        "source_file": str(actual_parse_path) if actual_parse_path else "",
+                        "cache_last_sync_at": _current_cache_stats.get("last_sync_at", ""),
+                        "cache_trace_count": _current_cache_stats.get("trace_count", 0),
+                        "cache_observation_count": _current_cache_stats.get("observation_count", 0),
+                        "source_file_fingerprint": f"{_trace_fp}|{_obs_fp}" if _trace_fp else "",
+                    }
+                    summary.update(_provenance)
+                    for _s in samples:
+                        _s.update(_provenance)
+                        # 确保每条 sample 有真实 trace_id（非 batch_qa_*）
+                        # trace_id 由 parser 从原始数据提取，此处不覆盖
                     full_summary = save_results(samples, summary, output_path, summary_path)
+
                     for _s in samples:
                         _s.pop("observations", None)
                     st.session_state["samples"] = samples
                     st.session_state["summary"] = full_summary
 
-                    # 标记快照已解析
+                    # 标记快照已解析（仅冻结快照）
                     if source_type == "evidence_snapshot" and selected_source.get("snapshot_id"):
                         mark_snapshot_parsed(
                             selected_source["project_id"],
@@ -5028,6 +5423,12 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     if temp_jsonl and temp_jsonl.exists():
                         try:
                             temp_jsonl.unlink()
+                        except Exception:
+                            pass
+                    # 清理 current_cache 临时文件
+                    if source_type == "current_cache" and actual_parse_path and actual_parse_path.exists():
+                        try:
+                            actual_parse_path.unlink()
                         except Exception:
                             pass
 
@@ -7041,7 +7442,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             if st.button("迁移 Judge 结果（回填 run_id）", key="migrate_judged"):
                 with st.spinner("正在迁移..."):
                     result = migrate_judged_results(
-                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        processed_file=_resolve_processed_path()[0],
                         judged_file=str(JUDGED_FILE),
                         backup=True,
                     )
@@ -7053,7 +7454,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             if st.button("迁移 Processed 样本（回填 config_id）", key="migrate_processed"):
                 with st.spinner("正在迁移..."):
                     result = migrate_processed_samples(
-                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        processed_file=_resolve_processed_path()[0],
                         experiments_dir=str(EXPERIMENTS_DIR),
                         backup=True,
                     )
@@ -7229,7 +7630,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 rid,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                processed_file=_resolve_processed_path()[0],
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=True,
             )
@@ -7273,9 +7674,8 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 _seen_trace[tid] = r
         all_judge_results = list(_seen_trace.values())
         # 补齐旧版 chunk_exact 缺失的 Top10（需扫描 processed sample 的检索结果）
-        _ce_proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
-        _ce_proc_mtime = str(_ce_proc_path.stat().st_mtime) if _ce_proc_path.exists() else ""
-        _ce_sample_lookup = _load_sample_lookup(_ce_proc_mtime)
+        _ce_proc_path_str, _ce_proc_mtime = _resolve_processed_path()
+        _ce_sample_lookup = _load_sample_lookup(_ce_proc_mtime, _ce_proc_path_str)
         for r in all_judge_results:
             backfill_chunk_exact_topk(r, _ce_sample_lookup)
         cumulative_metrics = compute_metrics(all_judge_results)
@@ -7355,17 +7755,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                     ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_evaluable)
                     ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_evaluable)
                     ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
-                    ce_col1, ce_col2, ce_col3, ce_col4, ce_col5 = st.columns(5)
-                    with ce_col1:
-                        st.metric("可评测", ce_n)
-                    with ce_col2:
-                        st.metric("Top1", f"{ce_t1}/{ce_n} ({ce_t1/ce_n:.1%})")
-                    with ce_col3:
-                        st.metric("Top3", f"{ce_t3}/{ce_n} ({ce_t3/ce_n:.1%})")
-                    with ce_col4:
-                        st.metric("Top5", f"{ce_t5}/{ce_n} ({ce_t5/ce_n:.1%})")
-                    with ce_col5:
-                        st.metric("Top10", f"{ce_t10}/{ce_n} ({ce_t10/ce_n:.1%})")
+                    _render_ce_topk(ce_n, ce_t1, ce_t3, ce_t5, ce_t10, ce_total)
 
                 # 不可评测状态统计
                 if chunk_exact_unevaluable:
@@ -7581,9 +7971,8 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             _run_data_list.append({"run": _run, "run_status": _rs, "metrics": _m})
 
         # 构建 processed sample lookup（trace_id -> sample，缓存）
-        _proc_path = PROCESSED_DIR / "langfuse_samples.jsonl"
-        _proc_mtime = str(_proc_path.stat().st_mtime) if _proc_path.exists() else ""
-        _sample_lookup = _load_sample_lookup(_proc_mtime)
+        _proc_path_str, _proc_mtime = _resolve_processed_path()
+        _sample_lookup = _load_sample_lookup(_proc_mtime, _proc_path_str)
 
         _disp_name = selected_config.get('config_name', '未命名')
         _cid = selected_config.get('config_id', '')
@@ -7783,7 +8172,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 run["run_id"],
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                processed_file=_resolve_processed_path()[0],
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=False,
             )
@@ -7812,7 +8201,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 _rid,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                processed_file=_resolve_processed_path()[0],
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=False,
             )
@@ -7846,7 +8235,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 run_id,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                processed_file=_resolve_processed_path()[0],
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=True,
             )
@@ -7974,9 +8363,8 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
 
                     judge_results = run_status.get("judge_results", [])
                     # 补齐旧版 chunk_exact 缺失的 Top10
-                    _detail_rp = PROCESSED_DIR / "langfuse_samples.jsonl"
-                    _detail_mtime = str(_detail_rp.stat().st_mtime) if _detail_rp.exists() else ""
-                    _detail_lookup = _load_sample_lookup(_detail_mtime)
+                    _detail_rp_str, _detail_mtime = _resolve_processed_path()
+                    _detail_lookup = _load_sample_lookup(_detail_mtime, _detail_rp_str)
                     for r in judge_results:
                         backfill_chunk_exact_topk(r, _detail_lookup)
                     if judge_results:
@@ -8052,9 +8440,8 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         error_viz = [r for r in judge_results_viz if "error" in r]
 
                         # 加载当前 run 的 processed samples 构建 sample_map（从缓存过滤）
-                        _rp = PROCESSED_DIR / "langfuse_samples.jsonl"
-                        _proc_mtime_local = str(_rp.stat().st_mtime) if _rp.exists() else ""
-                        _all_lookup = _load_sample_lookup(_proc_mtime_local)
+                        _rp_str, _proc_mtime_local = _resolve_processed_path()
+                        _all_lookup = _load_sample_lookup(_proc_mtime_local, _rp_str)
                         # 补齐旧版 chunk_exact 缺失的 Top10
                         for r in judge_results_viz:
                             backfill_chunk_exact_topk(r, _all_lookup)
@@ -8121,17 +8508,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in ce_evaluable)
                                 ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in ce_evaluable)
                                 ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in ce_evaluable)
-                                ce_m1, ce_m2, ce_m3, ce_m4, ce_m5 = st.columns(5)
-                                with ce_m1:
-                                    st.metric("可评测", f"{ce_n}/{ce_total}")
-                                with ce_m2:
-                                    st.metric("Top1", f"{ce_t1}/{ce_n} ({ce_t1/ce_n:.1%})")
-                                with ce_m3:
-                                    st.metric("Top3", f"{ce_t3}/{ce_n} ({ce_t3/ce_n:.1%})")
-                                with ce_m4:
-                                    st.metric("Top5", f"{ce_t5}/{ce_n} ({ce_t5/ce_n:.1%})")
-                                with ce_m5:
-                                    st.metric("Top10", f"{ce_t10}/{ce_n} ({ce_t10/ce_n:.1%})")
+                                _render_ce_topk(ce_n, ce_t1, ce_t3, ce_t5, ce_t10, ce_total)
 
                             if ce_unevaluable:
                                 ue_counts = {}
@@ -8558,7 +8935,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         rid,
                         batch_dir=str(BATCH_DIR),
                         raw_dir=str(RAW_DIR),
-                        processed_file=str(PROCESSED_DIR / "langfuse_samples.jsonl"),
+                        processed_file=_resolve_processed_path()[0],
                         judged_file=str(JUDGED_FILE),
                         include_judge_results=True,
                     )

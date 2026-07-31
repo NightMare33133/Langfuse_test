@@ -33,6 +33,71 @@ import requests
 PROJECTS_DIR = Path(__file__).parent / "data" / "langfuse_projects"
 RAW_DIR = Path(__file__).parent / "data" / "raw"
 DATA_DIR = Path(__file__).parent / "data"
+PROCESSED_DIR = DATA_DIR / "processed"
+
+
+def get_processed_paths(source_type: str, project_id: str = "",
+                        snapshot_id: str = "", source_id: str = "") -> tuple[Path, Path]:
+    """获取隔离的解析产物路径 (samples_path, summary_path)。
+
+    路径规则：
+    - current_cache     → data/processed/langfuse_projects/<project_id>/current/
+    - evidence_snapshot → data/processed/langfuse_projects/<project_id>/<snapshot_id>/
+    - legacy_raw        → data/processed/legacy/<sanitized_source_id>/
+    - 其他（兼容）      → data/processed/langfuse_samples.jsonl / langfuse_summary.json
+
+    不创建目录，仅返回路径。
+    """
+    if source_type == "current_cache" and project_id:
+        base = PROCESSED_DIR / "langfuse_projects" / project_id / "current"
+        return base / "samples.jsonl", base / "summary.json"
+
+    if source_type == "evidence_snapshot" and project_id and snapshot_id:
+        base = PROCESSED_DIR / "langfuse_projects" / project_id / snapshot_id
+        return base / "samples.jsonl", base / "summary.json"
+
+    if source_type == "legacy_raw" and source_id:
+        # source_id 形如 "legacy:langfuse_api_export_xxx.jsonl"
+        safe_name = source_id.replace(":", "_").replace("/", "_").replace("\\", "_")
+        base = PROCESSED_DIR / "legacy" / safe_name
+        return base / "samples.jsonl", base / "summary.json"
+
+    # 兼容回退
+    return PROCESSED_DIR / "langfuse_samples.jsonl", PROCESSED_DIR / "langfuse_summary.json"
+
+
+def find_latest_processed(project_id: str = "") -> tuple[Path | None, Path | None]:
+    """查找最新的解析产物路径。
+
+    优先查找 project_id 对应的隔离目录，再回退到全局旧路径。
+    返回 (samples_path, summary_path)，找不到返回 (None, None)。
+    """
+    # 隔离目录（优先 current 缓存，再按时间戳降序找冻结版本）
+    if project_id:
+        proj_dir = PROCESSED_DIR / "langfuse_projects" / project_id
+        if proj_dir.exists():
+            # 优先 current 缓存
+            current_s = proj_dir / "current" / "samples.jsonl"
+            if current_s.exists():
+                current_sm = proj_dir / "current" / "summary.json"
+                return current_s, current_sm if current_sm.exists() else None
+            # 回退到冻结版本（按 snapshot_id 时间戳降序）
+            candidates = sorted(proj_dir.iterdir(), reverse=True)
+            for snap_dir in candidates:
+                if snap_dir.name == "current":
+                    continue
+                s = snap_dir / "samples.jsonl"
+                sm = snap_dir / "summary.json"
+                if s.exists():
+                    return s, sm if sm.exists() else None
+
+    # 兼容旧全局路径
+    global_s = PROCESSED_DIR / "langfuse_samples.jsonl"
+    global_sm = PROCESSED_DIR / "langfuse_summary.json"
+    if global_s.exists():
+        return global_s, global_sm if global_sm.exists() else None
+
+    return None, None
 
 
 # ── 项目识别 ─────────────────────────────────────────────────
@@ -1132,6 +1197,112 @@ def export_snapshot_as_jsonl(project_id: str, snapshot_id: str,
     return output_path
 
 
+def export_current_cache_as_jsonl(project_id: str,
+                                  output_path: Path = None) -> Path:
+    """将当前动态同步缓存（traces + observations）合并为纯 JSONL。
+
+    直接读取项目的 traces.jsonl.gz 和 observations.jsonl.gz，
+    合并为单一 JSONL 文件供 parser 使用。不要求 frozen snapshot。
+
+    Args:
+        project_id: 项目 ID
+        output_path: 输出路径（可选，默认为项目目录下 current_cache.jsonl）
+
+    Returns:
+        合并后的 JSONL 文件路径
+
+    Raises:
+        RuntimeError: 缓存文件不存在或不含 observation 数据
+    """
+    tp = _traces_path(project_id)
+    op = _obs_path(project_id)
+
+    if not tp.exists() or tp.stat().st_size == 0:
+        raise RuntimeError("当前缓存无 trace 数据，请先同步")
+
+    if not op.exists() or op.stat().st_size == 0:
+        raise RuntimeError(
+            "当前缓存不含 observation 数据，无法解析为评测样本。"
+            "请检查 API 权限后重新同步。"
+        )
+
+    if output_path is None:
+        output_path = _project_dir(project_id) / "current_cache.jsonl"
+
+    # 合并 traces + observations
+    with output_path.open("w", encoding="utf-8") as fout:
+        with gzip.open(tp, "rt", encoding="utf-8") as fin:
+            for line in fin:
+                fout.write(line)
+        with gzip.open(op, "rt", encoding="utf-8") as fin:
+            for line in fin:
+                fout.write(line)
+
+    return output_path
+
+
+def get_current_cache_stats(project_id: str) -> dict:
+    """获取当前动态缓存的统计信息。
+
+    Returns:
+        {"trace_count", "observation_count", "has_observations",
+         "last_sync_at", "file_size_bytes"}
+    """
+    registry = load_project(project_id)
+    if not registry:
+        return {"trace_count": 0, "observation_count": 0,
+                "has_observations": False, "last_sync_at": "", "file_size_bytes": 0}
+
+    # 从逻辑快照获取最新统计
+    current_id = registry.get("current_snapshot_id", "")
+    logical_snap = next(
+        (s for s in registry.get("snapshots", [])
+         if s.get("snapshot_id") == current_id
+         and s.get("snapshot_type") == "logical"),
+        None,
+    )
+
+    if logical_snap:
+        return {
+            "trace_count": logical_snap.get("trace_count", 0),
+            "observation_count": logical_snap.get("observation_count", 0),
+            "has_observations": logical_snap.get("has_observations", False),
+            "last_sync_at": (logical_snap.get("updated_at") or "")[:16].replace("T", " "),
+            "file_size_bytes": logical_snap.get("total_file_size_bytes", 0),
+        }
+
+    # 回退：直接统计文件
+    tp = _traces_path(project_id)
+    op = _obs_path(project_id)
+    has_obs = op.exists() and op.stat().st_size > 0
+    return {
+        "trace_count": _count_lines_by_type(tp, "TRACE") if tp.exists() else 0,
+        "observation_count": _count_lines_by_type(op, "non-TRACE") if has_obs else 0,
+        "has_observations": has_obs,
+        "last_sync_at": "",
+        "file_size_bytes": (tp.stat().st_size if tp.exists() else 0) + (op.stat().st_size if has_obs else 0),
+    }
+
+
+def compute_file_fingerprint(file_path: Path) -> str:
+    """计算文件的轻量指纹（SHA-256 前 16 位 + 文件大小）。
+
+    用于 provenance 中标识文件内容，不读取全部内容。
+    """
+    if not file_path.exists():
+        return ""
+    size = file_path.stat().st_size
+    # 读取首尾各 4KB 做快速哈希
+    h = hashlib.sha256()
+    with file_path.open("rb") as f:
+        h.update(f.read(4096))
+        if size > 8192:
+            f.seek(-4096, 2)
+            h.update(f.read(4096))
+    h.update(str(size).encode())
+    return f"{h.hexdigest()[:16]}_{size}"
+
+
 def mark_snapshot_parsed(project_id: str, snapshot_id: str):
     """标记快照已解析。"""
     registry = load_project(project_id)
@@ -1296,6 +1467,236 @@ def _get_snapshot_sizes(project_id: str, snap: dict) -> dict:
     }
 
 
+def _load_ids_from_gzip(file_path: Path, id_field: str = "id",
+                         type_filter: str = None) -> set:
+    """从 gzip JSONL 文件中提取 ID 集合。
+
+    Args:
+        file_path: gzip 文件路径
+        id_field: 提取的 ID 字段名
+        type_filter: 若指定，只收集 type==type_filter 的行；None 表示收集所有行
+
+    Returns:
+        ID 集合
+    """
+    ids = set()
+    if not file_path.exists():
+        return ids
+    try:
+        with gzip.open(file_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    if type_filter is not None and row.get("type") != type_filter:
+                        continue
+                    val = row.get(id_field)
+                    if val:
+                        ids.add(val)
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return ids
+
+
+def _get_snapshot_id_sets(project_id: str, snapshot_id: str) -> tuple[set, set]:
+    """获取快照的 trace_id 和 observation_id 集合。
+
+    Returns:
+        (trace_ids, obs_ids)
+    """
+    registry = load_project(project_id)
+    if not registry:
+        return set(), set()
+
+    snap_meta = next(
+        (s for s in registry.get("snapshots", [])
+         if s.get("snapshot_id") == snapshot_id),
+        None,
+    )
+    if not snap_meta:
+        return set(), set()
+
+    snap_type = snap_meta.get("snapshot_type", "frozen")
+
+    if snap_type == "logical":
+        # 逻辑快照：读项目缓存文件
+        trace_ids = _load_ids_from_gzip(
+            _traces_path(project_id), id_field="id", type_filter="TRACE")
+        obs_ids = _load_ids_from_gzip(
+            _obs_path(project_id), id_field="id", type_filter=None)
+    else:
+        # 冻结快照：读 snapshots/ 目录下的副本
+        snap_dir = _snapshots_dir(project_id)
+        trace_ids = _load_ids_from_gzip(
+            snap_dir / f"{snapshot_id}.jsonl.gz",
+            id_field="id", type_filter="TRACE")
+        obs_file = snap_dir / f"{snapshot_id}.obs.jsonl.gz"
+        obs_ids = _load_ids_from_gzip(obs_file, id_field="id", type_filter=None)
+
+    return trace_ids, obs_ids
+
+
+def validate_frozen_snapshot_eligibility(project_id: str,
+                                         snapshot_id: str) -> tuple[bool, str]:
+    """验证冻结快照是否具备正式解析资格。
+
+    严格条件（基于实际文件内容，不依赖 registry 元数据）：
+    1. snapshot_type == "frozen"
+    2. has_observations == True
+    3. trace 文件存在且非空
+    4. observation 文件存在且非空
+    5. 实际 observation 数 >= 实际 trace 数（每个 trace 至少 1 个 obs）
+
+    Returns:
+        (eligible, reason)
+    """
+    registry = load_project(project_id)
+    if not registry:
+        return False, "项目不存在"
+
+    snap_meta = next(
+        (s for s in registry.get("snapshots", [])
+         if s.get("snapshot_id") == snapshot_id),
+        None,
+    )
+    if not snap_meta:
+        return False, "快照不存在"
+
+    if snap_meta.get("snapshot_type") != "frozen":
+        return False, "非冻结快照"
+
+    if not snap_meta.get("has_observations", False):
+        return False, "不含 observation 数据"
+
+    # 检查 trace 文件
+    snap_dir = _snapshots_dir(project_id)
+    trace_file = snap_dir / f"{snapshot_id}.jsonl.gz"
+    if not trace_file.exists() or trace_file.stat().st_size == 0:
+        return False, "trace 文件不存在或为空"
+
+    # 检查 observation 文件
+    obs_file = snap_dir / f"{snapshot_id}.obs.jsonl.gz"
+    if not obs_file.exists() or obs_file.stat().st_size == 0:
+        return False, "observation 文件不存在或为空"
+
+    # 基于实际文件内容的覆盖率检查
+    actual_trace_count = _count_lines_by_type(trace_file, count_type="TRACE")
+    actual_obs_count = _count_lines_by_type(obs_file, count_type="non-TRACE")
+    if actual_trace_count <= 0:
+        return False, "trace 文件中无有效 TRACE 行"
+    if actual_obs_count < actual_trace_count:
+        return False, (
+            f"observation 覆盖率不足：实际 {actual_obs_count} obs / "
+            f"{actual_trace_count} traces（需每个 trace 至少 1 个 obs）"
+        )
+
+    return True, "合格"
+
+
+def get_current_eval_cache(project_id: str) -> dict | None:
+    """获取当前评测解析缓存（最新的合格 frozen evidence snapshot）。
+
+    返回通过 validate_frozen_snapshot_eligibility 的最新 frozen snapshot，
+    按 created_at 降序。无可用缓存时返回 None。
+    """
+    registry = load_project(project_id)
+    if not registry:
+        return None
+
+    frozen_evidence = [
+        s for s in registry.get("snapshots", [])
+        if s.get("snapshot_type") == "frozen"
+        and s.get("has_observations", False)
+    ]
+    if not frozen_evidence:
+        return None
+
+    frozen_evidence.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+
+    # 返回第一个通过严格资格验证的快照
+    for snap in frozen_evidence:
+        eligible, _ = validate_frozen_snapshot_eligibility(
+            project_id, snap["snapshot_id"])
+        if eligible:
+            return snap
+
+    return None
+
+
+def update_eval_cache(project_id: str) -> dict:
+    """更新评测解析缓存：从同步缓存创建或复用冻结版本。
+
+    比较当前同步缓存（逻辑快照）与最新评测解析缓存（冻结）的
+    trace_id + observation_id 集合：
+    - 若一致 → 复用已有冻结版本
+    - 若不同 → 创建新的冻结版本
+
+    Returns:
+        {"action": "reused"|"created", "snapshot": {...}}
+
+    Raises:
+        RuntimeError: 无同步缓存（未同步过数据）
+    """
+    registry = load_project(project_id)
+    if not registry:
+        raise RuntimeError("项目不存在")
+
+    # 确认同步缓存在
+    current_snap_id = registry.get("current_snapshot_id", "")
+    if not current_snap_id:
+        raise RuntimeError("无同步缓存，请先同步数据")
+
+    sync_snap = next(
+        (s for s in registry.get("snapshots", [])
+         if s.get("snapshot_id") == current_snap_id
+         and s.get("snapshot_type") == "logical"),
+        None,
+    )
+    if not sync_snap:
+        raise RuntimeError("无同步缓存，请先同步数据")
+
+    # 同步缓存必须有 observation 数据才能用于评测
+    if not sync_snap.get("has_observations", False):
+        raise RuntimeError(
+            "同步缓存不含 observation 数据，无法创建评测解析缓存。"
+            "请检查 API 权限后重新同步。"
+        )
+
+    # 验证同步缓存的 observation 覆盖率（基于实际文件）
+    actual_trace_count = _count_lines_by_type(
+        _traces_path(project_id), count_type="TRACE")
+    actual_obs_count = _count_lines_by_type(
+        _obs_path(project_id), count_type="non-TRACE")
+    if actual_trace_count > 0 and actual_obs_count < actual_trace_count:
+        raise RuntimeError(
+            f"同步缓存 observation 覆盖率不足："
+            f"实际 {actual_obs_count} obs / {actual_trace_count} traces"
+            f"（需每个 trace 至少 1 个 obs）。"
+            f"请检查 observation 同步是否完整。"
+        )
+
+    # 获取最新评测解析缓存
+    latest_eval = get_current_eval_cache(project_id)
+
+    if latest_eval:
+        # 比较 ID 集合
+        sync_trace_ids, sync_obs_ids = _get_snapshot_id_sets(
+            project_id, current_snap_id)
+        eval_trace_ids, eval_obs_ids = _get_snapshot_id_sets(
+            project_id, latest_eval["snapshot_id"])
+
+        if sync_trace_ids == eval_trace_ids and sync_obs_ids == eval_obs_ids:
+            return {"action": "reused", "snapshot": latest_eval}
+
+    # 创建新的冻结快照
+    new_frozen = create_frozen_snapshot(project_id)
+    return {"action": "created", "snapshot": new_frozen}
+
+
 def list_parseable_sources(project_id: str = None) -> list[dict]:
     """列出所有可解析的数据源（项目快照 + 旧版 raw 文件）。
 
@@ -1321,21 +1722,28 @@ def list_parseable_sources(project_id: str = None) -> list[dict]:
                 snap_path = _traces_path(project_id)
                 if not snap_path.exists():
                     continue
-                type_badge = "📋 当前缓存"
+                type_badge = "📋 同步缓存（可变）"
             else:
                 snap_path = get_snapshot_path(project_id, sid)
                 if not snap_path.exists():
                     continue
-                type_badge = "📦 独立快照"
+                type_badge = "📦 评测解析缓存（冻结）"
 
             if snap_type == "logical":
-                label = f"{type_badge} — {trace_count} traces（仅同步缓存，不可正式解析）"
+                label = f"{type_badge} — {trace_count} traces, {obs_count} obs"
                 source_type = "logical_snapshot"
             elif has_obs:
-                label = f"{type_badge} — {trace_count} traces, {obs_count} obs"
-                source_type = "evidence_snapshot"
+                # 严格验证冻结快照的正式解析资格
+                eligible, reason = validate_frozen_snapshot_eligibility(project_id, sid)
+                if eligible:
+                    label = f"{type_badge} — {trace_count} traces, {obs_count} obs"
+                    source_type = "evidence_snapshot"
+                else:
+                    label = (f"⚠️ 历史不完整缓存 — {trace_count} traces / "
+                             f"{obs_count} obs（{reason}）")
+                    source_type = "incomplete_snapshot"
             else:
-                label = f"{type_badge} — {trace_count} traces，仅索引"
+                label = f"📦 索引缓存（仅索引） — {trace_count} traces"
                 source_type = "index_snapshot"
 
             total_mb = round(sizes["total_file_size_bytes"] / (1024 * 1024), 2)

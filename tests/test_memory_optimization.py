@@ -396,9 +396,9 @@ def test_load_sample_lookup_max_entries():
     app_path = Path(__file__).resolve().parent.parent / "app.py"
     source = app_path.read_text(encoding="utf-8")
 
-    # 检查 max_entries=2 存在
-    assert "max_entries=2" in source, "app.py 中应有 max_entries=2 配置"
-    print("[OK] max_entries=2 已配置")
+    # 检查 max_entries 存在（支持隔离路径后增加到 4）
+    assert "max_entries=4" in source, "app.py 中应有 max_entries=4 配置"
+    print("[OK] max_entries=4 已配置")
 
     # 检查 ttl=120 存在
     assert "ttl=120" in source, "app.py 中应有 ttl=120 配置"
