@@ -40,6 +40,194 @@ _EXCLUDE_PATTERNS = [
 
 MIN_CONTENT_LENGTH = 20  # 最少字符数
 
+# ── Query 校验常量 ──────────────────────────────────────────────
+
+# 中文查询长度限制（字符数）
+_QUERY_MIN_LEN_ZH = 3
+_QUERY_SOFT_MAX_LEN_ZH = 20  # 软上限：目标长度，不强制拒绝
+_QUERY_HARD_MAX_LEN_ZH = 30  # 硬上限：超过则拒绝
+
+# 英文查询长度限制（token 数，按空格分词近似）
+_QUERY_MAX_LEN_EN_TOKENS = 15
+
+# 禁止出现的问句/问答导向词
+_FORBIDDEN_QUESTION_WORDS = frozenset([
+    "什么", "为何", "为什么", "如何", "是否", "哪些", "请分析", "请说明",
+    "分别", "what", "why", "how", "whether",
+])
+
+# 禁止出现的标点
+_FORBIDDEN_PUNCTUATION = frozenset(["？", "?"])
+
+# 同 chunk 中独立知识点的并列模式（正则）
+_MULTI_CONCEPT_PATTERNS = [
+    re.compile(r"与|和|及|以及|并且|同时|另外|此外|还有"),  # 中文并列
+    re.compile(r"\band\b|\bor\b|\bas well as\b|\bin addition\b"),  # 英文并列
+    re.compile(r"[、，].*[、，]"),  # 多个顿号/逗号分隔的列表
+]
+
+
+def _count_chars(text):
+    """统计有效字符数（去除空格后）。"""
+    return len(text.replace(" ", "").replace("　", ""))
+
+
+def _is_mostly_chinese(text):
+    """判断文本是否主要为中文。"""
+    chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
+    return chinese_chars >= len(text) * 0.3
+
+
+def _is_mostly_english(text):
+    """判断文本是否主要为英文。"""
+    ascii_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    return ascii_chars >= len(text) * 0.5
+
+
+def validate_retrieval_query(query, query_style="semantic", target_label=""):
+    """Fail-closed 校验 retrieval_query 质量。
+
+    Rules:
+    1. 禁止问句词和问号
+    2. 中文查询 3-20 字，英文按 token 计
+    3. target_label 非空
+    4. 禁止多概念并列（disambiguating 除外，允许一个限定词）
+
+    Returns:
+        (ok, errors): ok=True 表示通过，errors 为错误列表
+    """
+    errors = []
+    query = (query or "").strip()
+
+    if not query:
+        return False, ["retrieval_query 为空"]
+
+    # target_label 校验
+    if not (target_label or "").strip():
+        errors.append("target_label 为空")
+
+    # 禁止问句词
+    query_lower = query.lower()
+    for word in _FORBIDDEN_QUESTION_WORDS:
+        if word in query_lower:
+            errors.append(f"包含禁止问句词「{word}」")
+            break  # 一个就够了
+
+    # 禁止问号
+    for punct in _FORBIDDEN_PUNCTUATION:
+        if punct in query:
+            errors.append(f"包含禁止标点「{punct}」")
+            break
+
+    # 长度校验
+    if _is_mostly_chinese(query):
+        char_count = _count_chars(query)
+        if char_count < _QUERY_MIN_LEN_ZH:
+            errors.append(f"中文查询过短（{char_count} 字，最少 {_QUERY_MIN_LEN_ZH} 字）")
+        elif char_count > _QUERY_HARD_MAX_LEN_ZH:
+            errors.append(f"中文查询过长（{char_count} 字，硬上限 {_QUERY_HARD_MAX_LEN_ZH} 字）")
+        # 注意：超过软上限(_QUERY_SOFT_MAX_LEN_ZH)但低于硬上限不拒绝
+        # 重点拒绝坏结构（问句、列表、多概念），而非单纯长度
+    elif _is_mostly_english(query):
+        token_count = len(query.split())
+        if token_count > _QUERY_MAX_LEN_EN_TOKENS:
+            errors.append(f"英文查询过长（{token_count} tokens，最多 {_QUERY_MAX_LEN_EN_TOKENS}）")
+
+    # 多概念并列检测（仅对 semantic 和 lexical 生效）
+    if query_style in ("semantic", "lexical"):
+        for pat in _MULTI_CONCEPT_PATTERNS:
+            # 对于 "与" 类并列，需要检测是否有多个独立概念
+            if pat.search(query):
+                # 允许 "与" 出现在专有名词中（如 "RAG 与传统问答" 可以是一个概念）
+                # 但禁止明显的多概念拼接，如 "A 与 B"、"A、B、C"
+                # 简单启发式：如果包含多个逗号/顿号分隔的项目，拒绝
+                items = re.split(r"[、，,]", query)
+                real_items = [it.strip() for it in items if it.strip() and len(it.strip()) >= 2]
+                if len(real_items) >= 3:
+                    errors.append(f"疑似多概念列表拼接（{len(real_items)} 项）")
+                    break
+
+    return len(errors) == 0, errors
+
+
+def validate_groundedness(query, content, allowed_synonyms=None):
+    """Groundedness 校验：query 中的关键实体必须在 content 中可找到。
+
+    Args:
+        query: retrieval_query
+        content: candidate chunk 的完整内容
+        allowed_synonyms: Phase 1 明确允许的等价同义表达 dict（可选）
+
+    Returns:
+        (ok, errors): ok=True 表示通过，errors 为错误列表
+    """
+    errors = []
+    query = (query or "").strip()
+    content = (content or "").strip()
+
+    if not query:
+        return False, ["retrieval_query 为空"]
+    if not content:
+        return False, ["content 为空"]
+
+    content_lower = content.lower()
+    allowed = allowed_synonyms or {}
+
+    # 提取 query 中的关键实体
+    # 英文术语：连续英文单词或缩写（≥2 字符）
+    en_terms = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,}", query)
+    # 数字/条款号
+    numbers = re.findall(r"\d+(?:\.\d+)*(?:\s*条|\s*款|\s*项|\s*条|\s*号)?", query)
+
+    # 中文：使用滑动窗口提取 2-4 字的中文子串
+    zh_chars = re.findall(r"[一-鿿]+", query)
+    zh_terms = []
+    for phrase in zh_chars:
+        if len(phrase) <= 2:
+            # 短词直接添加
+            zh_terms.append(phrase)
+        else:
+            # 提取所有 2-4 字的子串
+            for window in range(2, min(5, len(phrase) + 1)):
+                for i in range(len(phrase) - window + 1):
+                    zh_terms.append(phrase[i:i + window])
+
+    all_terms = zh_terms + en_terms + numbers
+
+    # 检查是否有至少一个关键实体在 content 中找到
+    found_count = 0
+    not_found_terms = []
+
+    for term in all_terms:
+        term_lower = term.lower()
+        # 在 content 中查找
+        if term_lower in content_lower:
+            found_count += 1
+            continue
+        # 在允许的同义词中查找
+        if term_lower in {k.lower() for k in allowed.keys()}:
+            found_count += 1
+            continue
+        # 检查是否是允许的同义表达的值
+        for syn_key, syn_val in allowed.items():
+            if isinstance(syn_val, str) and term_lower in syn_val.lower():
+                found_count += 1
+                break
+            elif isinstance(syn_val, list) and any(term_lower in sv.lower() for sv in syn_val):
+                found_count += 1
+                break
+        else:
+            # 术语在 content 中未找到
+            if len(term) > 2:
+                not_found_terms.append(term)
+
+    # 放宽要求：只要至少有一个关键实体在 content 中找到即可
+    # 但如果所有长实体（>2字符）都找不到，则拒绝
+    if found_count == 0 and not_found_terms:
+        errors.append(f"关键实体均未在 content 中找到: {', '.join(not_found_terms[:3])}")
+
+    return len(errors) == 0, errors
+
 
 def filter_candidate_chunks(catalog, duplicates=None):
     """从 Chunk Catalog 过滤候选 chunk。
@@ -363,11 +551,16 @@ def generate_chunk_exact_questions_multi_doc(
                 "requested": num,
                 "candidate_pool": pool_size,
                 "phase1_planned": 0,
-                "phase2_generated": 0,
-                "bound": 0,
+                "phase2_first_returned": 0,
+                "first_rejected": 0,
+                "retry_attempted": 0,
+                "retry_recovered": 0,
+                "final_bound": 0,
+                "binding_failed": 0,
                 "status": "insufficient_candidates",
                 "errors": [f"仅有 {pool_size} 个可用候选，不足 {num} 题"],
                 "query_style_counts": {},
+                "rejection_diagnostics": [],
             })
             continue
 
@@ -392,11 +585,16 @@ def generate_chunk_exact_questions_multi_doc(
                 "requested": num,
                 "candidate_pool": pool_size,
                 "phase1_planned": 0,
-                "phase2_generated": 0,
-                "bound": 0,
+                "phase2_first_returned": 0,
+                "first_rejected": 0,
+                "retry_attempted": 0,
+                "retry_recovered": 0,
+                "final_bound": 0,
+                "binding_failed": 0,
                 "status": "phase1_failed",
                 "errors": _phase1_critical_errors,
                 "query_style_counts": {},
+                "rejection_diagnostics": [],
             })
             continue
 
@@ -407,11 +605,16 @@ def generate_chunk_exact_questions_multi_doc(
                 "requested": num,
                 "candidate_pool": pool_size,
                 "phase1_planned": 0,
-                "phase2_generated": 0,
-                "bound": 0,
+                "phase2_first_returned": 0,
+                "first_rejected": 0,
+                "retry_attempted": 0,
+                "retry_recovered": 0,
+                "final_bound": 0,
+                "binding_failed": 0,
                 "status": "phase1_empty",
                 "errors": ["Phase 1 未返回任何规划项"],
                 "query_style_counts": {},
+                "rejection_diagnostics": [],
             })
             continue
 
@@ -425,22 +628,121 @@ def generate_chunk_exact_questions_multi_doc(
             api_key, base_url, model, timeout
         )
 
-        # ── 补充重试：Phase 2 少题时对缺失 candidate 重试一次 ──
-        if len(phase2_questions) < len(planned_items) and len(phase2_questions) > 0:
-            generated_cids = {q["candidate_id"] for q in phase2_questions}
-            missing_planned = [p for p in planned_items if p["candidate_id"] not in generated_cids]
-            if missing_planned:
-                retry_questions, retry_errors = _phase2_generate_document(
-                    doc_name, missing_planned, candidates_map,
-                    api_key, base_url, model, timeout
-                )
-                # 只补充缺失的 candidate_id
-                existing_cids = {q["candidate_id"] for q in phase2_questions}
-                for rq in retry_questions:
-                    if rq["candidate_id"] not in existing_cids:
-                        phase2_questions.append(rq)
-                        existing_cids.add(rq["candidate_id"])
-                phase2_errors.extend([f"[重试] {e}" for e in retry_errors])
+        # ── 统计首轮结果 ──
+        first_returned_count = len(phase2_questions)
+        passed_questions = [q for q in phase2_questions if q.get("validation_status") == "passed"]
+        rejected_questions = [q for q in phase2_questions if q.get("validation_status") != "passed"]
+        first_rejected_count = len(rejected_questions)
+
+        # 收集拒绝诊断
+        rejection_diagnostics = []
+        for rq in rejected_questions:
+            rejection_diagnostics.append({
+                "candidate_id": rq.get("candidate_id", ""),
+                "query": rq.get("retrieval_query", ""),
+                "errors": rq.get("validation_errors", []),
+            })
+
+        # ── 带错误反馈的重试：Phase 2 少题或校验失败时重试一次 ──
+        generated_cids = {q["candidate_id"] for q in passed_questions}
+        # 找出需要重试的候选：未生成的 + 校验失败的
+        retry_rejected = [q for q in rejected_questions if q.get("candidate_id") not in generated_cids]
+        # 补充完全未生成的候选
+        for p in planned_items:
+            cid = p["candidate_id"]
+            if cid not in generated_cids and not any(r["candidate_id"] == cid for r in retry_rejected):
+                retry_rejected.append({
+                    "candidate_id": cid,
+                    "retrieval_query": "",
+                    "validation_errors": ["未生成"],
+                    "target_fact": p.get("target_fact", ""),
+                    "retrieval_intent": p.get("retrieval_intent", ""),
+                    "target_label": p.get("target_label", ""),
+                    "allowed_modifiers": p.get("allowed_modifiers", []),
+                    "forbidden_concepts": p.get("forbidden_concepts", []),
+                    "query_style": p.get("query_style", "semantic"),
+                })
+
+        retry_attempted_count = len(retry_rejected)
+        retry_recovered_count = 0
+
+        if retry_rejected:
+            # 使用带错误反馈的重试提示
+            retry_text = _build_phase2_retry_text(retry_rejected, candidates_map)
+            retry_prompt = PHASE2_RETRY_PROMPT.replace("{doc_name}", doc_name).replace("{retry_items}", retry_text)
+
+            try:
+                retry_response = call_llm(retry_prompt, api_key, base_url, model, timeout=timeout)
+                retry_items = _parse_llm_response(retry_response)
+            except Exception as exc:
+                phase2_errors.append(f"[重试] 调用或解析失败: {exc}")
+                retry_items = []
+
+            # 校验重试结果
+            for item in retry_items:
+                cid = item.get("candidate_id", "")
+                if not cid or cid in generated_cids:
+                    continue
+                # 检查是否在重试列表中
+                retry_info = next((r for r in retry_rejected if r["candidate_id"] == cid), None)
+                if not retry_info:
+                    continue
+
+                candidate = candidates_map.get(cid)
+                if not candidate:
+                    continue
+
+                retrieval_query = (item.get("retrieval_query") or "").strip()
+                if not retrieval_query:
+                    continue
+
+                target_label = (item.get("target_label") or "").strip()
+
+                # 从 planned_items 获取元数据
+                planned = next((p for p in planned_items if p["candidate_id"] == cid), {})
+                query_style = planned.get("query_style", "semantic")
+
+                # 校验
+                query_ok, query_errors = validate_retrieval_query(retrieval_query, query_style, target_label)
+                content = candidate.get("content", "")
+                allowed_synonyms = {}
+                for term in planned.get("must_preserve_terms", []):
+                    allowed_synonyms[term.lower()] = term
+                for mod in planned.get("allowed_modifiers", []):
+                    allowed_synonyms[mod.lower()] = mod
+                ground_ok, ground_errors = validate_groundedness(retrieval_query, content, allowed_synonyms)
+
+                all_errors = query_errors + ground_errors
+                validation_status = "passed" if (query_ok and ground_ok) else "rejected"
+
+                if validation_status == "passed":
+                    passed_questions.append({
+                        "candidate_id": cid,
+                        "retrieval_query": retrieval_query,
+                        "target_label": target_label,
+                        "query_style": query_style,
+                        "target_fact": planned.get("target_fact", ""),
+                        "retrieval_intent": planned.get("retrieval_intent", ""),
+                        "allowed_modifiers": planned.get("allowed_modifiers", []),
+                        "forbidden_concepts": planned.get("forbidden_concepts", []),
+                        "validation_status": "passed",
+                        "validation_errors": [],
+                        "generation_plan": planned.get("plan", ""),
+                        "_candidate": candidate,
+                    })
+                    generated_cids.add(cid)
+                    retry_recovered_count += 1
+                else:
+                    # 重试仍失败，记录诊断
+                    rejection_diagnostics.append({
+                        "candidate_id": cid,
+                        "query": retrieval_query,
+                        "errors": all_errors,
+                        "retry": True,
+                    })
+
+        # 使用通过校验的题目替换原始列表
+        phase2_questions = passed_questions
 
         # 构建最终 question dicts（本地绑定）
         bound_questions = []
@@ -466,7 +768,7 @@ def generate_chunk_exact_questions_multi_doc(
                 "candidate_id": cid,
                 "expected_segment_id": candidate["segment_id"],
                 "expected_content_hash": candidate["content_hash"],
-                "expected_content": candidate.get("content", "")[:500],
+                "expected_content": candidate.get("content", ""),
                 "dataset_id": _dataset_id,
                 "document_id": _document_id,
                 "document_name": _document_name,
@@ -474,6 +776,12 @@ def generate_chunk_exact_questions_multi_doc(
                 "source_position": _position,
                 "source_label": f"doc:{_document_id[:8]} pos:{_position}",
                 "query_style": q_data.get("query_style", "semantic"),
+                "target_fact": q_data.get("target_fact", ""),
+                "retrieval_intent": q_data.get("retrieval_intent", ""),
+                "allowed_modifiers": q_data.get("allowed_modifiers", []),
+                "forbidden_concepts": q_data.get("forbidden_concepts", []),
+                "validation_status": q_data.get("validation_status", "passed"),
+                "validation_errors": q_data.get("validation_errors", []),
                 "generation_plan": q_data.get("generation_plan", ""),
                 "selection_seed": actual_seed,
             }
@@ -486,11 +794,16 @@ def generate_chunk_exact_questions_multi_doc(
             _style_counts[_s] = _style_counts.get(_s, 0) + 1
 
         # 判断是否 underfilled
+        _final_bound = len(bound_questions)
         _status = "ok"
         _doc_errors = list(phase2_errors)
-        if len(bound_questions) < num:
+        if _final_bound < num:
             _status = "underfilled"
-            _doc_errors.append(f"请求 {num} 题，实际绑定 {len(bound_questions)} 题")
+            _doc_errors.append(
+                f"请求 {num} 题，实际绑定 {_final_bound} 题"
+                f"（首轮返回 {first_returned_count}，校验拒绝 {first_rejected_count}，"
+                f"重试 {retry_attempted_count}，恢复 {retry_recovered_count}）"
+            )
 
         all_questions.extend(bound_questions)
         doc_stats.append({
@@ -499,11 +812,16 @@ def generate_chunk_exact_questions_multi_doc(
             "requested": num,
             "candidate_pool": pool_size,
             "phase1_planned": len(planned_items),
-            "phase2_generated": len(phase2_questions),
-            "bound": len(bound_questions),
+            "phase2_first_returned": first_returned_count,
+            "first_rejected": first_rejected_count,
+            "retry_attempted": retry_attempted_count,
+            "retry_recovered": retry_recovered_count,
+            "final_bound": _final_bound,
+            "binding_failed": 0,  # chunk_exact 不涉及 segment 绑定失败
             "status": _status,
             "errors": _doc_errors,
             "query_style_counts": _style_counts,
+            "rejection_diagnostics": rejection_diagnostics,
         })
 
     if not all_questions:
@@ -539,29 +857,70 @@ def generate_chunk_exact_questions_multi_doc(
 
 
 def get_multi_doc_stats_summary(doc_stats):
-    """生成多文档出题统计摘要（供 UI 显示）。"""
+    """生成多文档出题统计摘要（供 UI 显示）。
+
+    字段说明：
+    - requested: 请求题数
+    - phase1_planned: Phase 1 规划数
+    - phase2_first_returned: LLM 首轮返回数
+    - first_rejected: 首轮校验拒绝数
+    - retry_attempted: 进入重试的候选数
+    - retry_recovered: 重试后恢复的题数
+    - final_bound: 最终通过校验的题数
+    - binding_failed: segment 绑定失败数（chunk_exact 始终为 0）
+    """
     lines = []
+    total_requested = 0
+    total_bound = 0
+    total_rejected = 0
+    total_binding_failed = 0
+
     for s in doc_stats:
         name = s.get("document_name", "")[:15]
         status = s.get("status", "")
         req = s.get("requested", 0)
         pool = s.get("candidate_pool", 0)
         p1 = s.get("phase1_planned", 0)
-        p2 = s.get("phase2_generated", 0)
-        bound = s.get("bound", 0)
+        p2_first = s.get("phase2_first_returned", s.get("phase2_generated", 0))
+        first_rej = s.get("first_rejected", 0)
+        retry_att = s.get("retry_attempted", 0)
+        retry_rec = s.get("retry_recovered", 0)
+        final_bound = s.get("final_bound", s.get("bound", 0))
+        binding_fail = s.get("binding_failed", 0)
         styles = s.get("query_style_counts", {})
         style_str = " | ".join(f"{k}:{v}" for k, v in sorted(styles.items())) if styles else ""
 
+        total_requested += req
+        total_bound += final_bound
+        total_rejected += first_rej
+        total_binding_failed += binding_fail
+
         if status == "ok":
             style_note = f" [{style_str}]" if style_str else ""
-            lines.append(f"✅ {name}: {req}→池{pool}→计划{p1}→生成{p2}→绑定{bound}{style_note}")
+            lines.append(
+                f"✅ {name}: 请求{req}→池{pool}→计划{p1}→首轮{p2_first}"
+                f"→校验拒绝{first_rej}→重试{retry_att}/恢复{retry_rec}"
+                f"→最终绑定{final_bound}{style_note}"
+            )
         elif status == "underfilled":
             style_note = f" [{style_str}]" if style_str else ""
-            err = (s.get("errors") or [""])[-1][:30]
-            lines.append(f"⚠️ {name}: {req}→池{pool}→计划{p1}→生成{p2}→绑定{bound}{style_note} — {err}")
+            lines.append(
+                f"⚠️ {name}: 请求{req}→池{pool}→计划{p1}→首轮{p2_first}"
+                f"→校验拒绝{first_rej}→重试{retry_att}/恢复{retry_rec}"
+                f"→最终绑定{final_bound}{style_note}"
+            )
         else:
             err = (s.get("errors") or ["未知错误"])[0][:40]
             lines.append(f"❌ {name}: {status} — {err}")
+
+    # 全局摘要
+    lines.append("")
+    lines.append(
+        f"📊 合计: 请求{total_requested} → 最终绑定{total_bound}"
+        f" | 质量校验拒绝{total_rejected}"
+        f" | 绑定失败{total_binding_failed}"
+    )
+
     return "\n".join(lines)
 
 
@@ -721,6 +1080,14 @@ def _build_phase1_candidates_text(candidates, max_content_chars=200):
     return "\n\n".join(lines)
 
 
+PHASE1_JSON_REPAIR_PROMPT = """以下文本应为 JSON 数组但解析失败。请仅返回合法的 JSON 数组，保持原有内容不变，仅修复语法错误（如缺少逗号、引号不匹配、多余逗号、未闭合括号等）。
+
+原始文本：
+{raw_output}
+
+请直接输出修复后的 JSON 数组，不要添加其他文字。"""
+
+
 CHUNK_EXACT_PHASE1_PROMPT = """你是 RAG 检索评测出题规划专家。根据以下候选知识片段，筛选出有独立检索价值的片段，并为每个保留的片段规划结构化检索方案。
 
 **文档名称：** {doc_name}
@@ -743,6 +1110,55 @@ CHUNK_EXACT_PHASE1_PROMPT = """你是 RAG 检索评测出题规划专家。根�
 
 ---
 
+## 规划思路：从 target_fact 到 retrieval_intent
+
+**先提取 target_fact，再抽象出 retrieval_intent，最后确定 target_label。**
+
+1. **target_fact（证据事实锚点）**— 从 chunk 中提取的完整事实/规则/定义
+   - 可以包含完整事实细节（数值、名称、条件），用于 grounding 和校验
+   - 示例："买方依瑞典法律组建，供应商依中国法律组建"
+
+2. **retrieval_intent（用户检索意图）**— 用户一次独立的信息需求，即最终查询想找的"主题"
+   - 应为"对象 + 属性/规则/条件/范围/要求"等自然短语
+   - 不应复述 target_fact 的所有答案细节
+   - 示例："协议双方的注册地"
+   - 检验标准：如果用户在搜索引擎输入 retrieval_intent，能否期望找到包含 target_fact 的文档？
+
+3. **target_label（展示标签）**— 仅用于 UI 预览的 3-8 字短标签，不替代 retrieval_intent
+
+---
+
+## target_fact 提取规则
+
+- 必须是 chunk 中的一个独立知识点，不能是整个 chunk 的摘要
+- 不能把同 chunk 中的多个规则拼接在一起
+- 示例：
+  - ✅ "供应商需在协议终止后30天内归还客户数据"
+  - ✅ "ISO9001认证宽限期为6个月"
+  - ❌ "文件冲突时的优先顺序 框架协议的用途"（两个独立概念拼接）
+  - ❌ "IT服务需包含认证、会话管理、访问控制、加密、日志记录"（长列表复述）
+
+---
+
+## retrieval_intent 生成规则
+
+- 必须是自然的、面向用户的检索主题
+- 应为"对象 + 属性/规则/条件/范围/要求"等结构的自然短语
+- **禁止**将 target_fact 中的答案、数值、地点、动作结果直接平铺组合成检索词
+- **禁止**将无共同主题的多个规则合并为一个 retrieval_intent
+- **允许**同一信息字段下存在一组对应答案（如"协议双方的注册地"涵盖双方注册地）
+
+**正反例：**
+- target_fact："买方依瑞典法律组建，供应商依中国法律组建"
+  - ❌ 差："买方瑞典组建 供应商中国组建"（答案关键词直接拼接）
+  - ✅ 好："协议双方的注册地"（自然检索主题）
+
+- target_fact："业务合作伙伴不得与竞争者约定价格、折扣、销售条款或划分市场"
+  - ❌ 差："业务合作伙伴与竞争者合谋限定价格划分市场"（答案平铺）
+  - ✅ 好："业务合作伙伴的反垄断合规要求"（面向用户的检索主题）
+
+---
+
 ## query_style（查询风格）
 
 为每个保留的片段指定一种查询风格：
@@ -755,6 +1171,13 @@ CHUNK_EXACT_PHASE1_PROMPT = """你是 RAG 检索评测出题规划专家。根�
 
 ---
 
+## allowed_modifiers 与 forbidden_concepts
+
+- **allowed_modifiers** — 最多 2 个必要限定词，用于限定 target_fact 的范围。例如："认证宽限期" 的限定词可以是 "ISO9001"、"6个月"。
+- **forbidden_concepts** — 同 chunk 中但不应混入本题的其他知识点。Phase 2 生成查询时必须避免引入这些概念。
+
+---
+
 ## 输出格式（严格 JSON 数组）
 
 ```json
@@ -762,8 +1185,11 @@ CHUNK_EXACT_PHASE1_PROMPT = """你是 RAG 检索评测出题规划专家。根�
   {{
     "candidate_id": "候选ID",
     "query_style": "lexical | semantic | disambiguating",
-    "search_intent": "简短检索意图",
-    "target_label": "简短标签（3-10字）",
+    "target_fact": "完整的原子事实/规则/定义（证据锚点，可含完整细节）",
+    "retrieval_intent": "面向用户的自然检索主题（不含答案细节）",
+    "target_label": "简短标签（3-8字）",
+    "allowed_modifiers": ["限定词1", "限定词2"],
+    "forbidden_concepts": ["不应混入的知识点1", "不应混入的知识点2"],
     "must_preserve_terms": ["必须保留在查询中的术语"],
     "plan": "一句话说明该知识点的检索价值和出题策略"
   }},
@@ -774,8 +1200,11 @@ CHUNK_EXACT_PHASE1_PROMPT = """你是 RAG 检索评测出题规划专家。根�
 **字段说明：**
 - candidate_id: 必须是候选列表中的 ID，不得编造
 - query_style: 查询风格（lexical / semantic / disambiguating）
-- search_intent: 检索意图概述（非查询本体），用于 Phase 2 生成查询
-- target_label: 简短标签，概括查询指向的知识点
+- target_fact: 证据事实锚点，可包含完整事实细节，用于 grounding 和校验
+- retrieval_intent: 用户检索意图，面向用户的自然检索主题，是 Phase 2 生成 retrieval_query 的主要依据
+- target_label: 简短展示标签
+- allowed_modifiers: 最多 2 个必要限定词
+- forbidden_concepts: 同 chunk 中但不应混入本题的其他知识点
 - must_preserve_terms: 必须保留在最终查询中的术语列表（lexical 风格通常包含原文术语，semantic 风格可为空）
 - plan: 一句话说明出题策略
 
@@ -797,34 +1226,78 @@ CHUNK_EXACT_PHASE2_PROMPT = """你是 RAG 检索评测出题专家。根据以�
 
 ---
 
+## 核心原则
+
+retrieval_query 以 **retrieval_intent**（用户检索意图）为主要依据生成。
+
+- retrieval_intent 决定查询的"主题"和"方向"
+- target_fact 是证据锚点和校验边界，**不要求**在查询中覆盖其所有事实细节
+- allowed_modifiers、forbidden_concepts 是边界约束，用于防止偏移
+
+---
+
 ## 查询风格规则（必须严格遵从每个片段的 query_style）
 
 ### lexical（保留原术语）
 - 保留合同原文中的关键术语、法条编号、专有名词
 - 可以直接使用原文中的核心短语
 - 测试关键词/术语召回能力
+- 不允许复制长列表或整句
 
 ### semantic（同义改写）
-- 必须做自然的等价表达，不得照抄原文
+- 必须是自然的名词短语，不得照抄原文
 - 使用同义词、语序调整、概括性表述
 - 测试 embedding 的语义鲁棒性
+- 不必为了"语义改写"而让每一题大幅改写；自然即可
 
 ### disambiguating（区分性查询）
-- 保留核心概念，加上一个必要的限定词
+- 保留核心概念，加上区分相邻条款所需的一个限定条件
 - 限定词来自原文中使该条款区别于其他类似条款的修饰语
 - 测试相邻相似条款的区分能力
 
 ---
 
-## 通用规则
+## 核心规则
 
+- ✅ **retrieval_query 以 retrieval_intent 为主生成**
+- ✅ 短查询，中文通常 3-20 字；英文术语按 token 计，允许完整保留
+- ✅ 必须保留 must_preserve_terms 中列出的术语
+- ✅ 必须基于 target_fact 表达，不得偏离到 forbidden_concepts
 - ❌ **不得是问句** — 禁止出现问号（？/ ?）
-- ❌ **禁止问答或推理导向表达** — 不得包含"什么/为何/为什么/如何/是否/哪些/请分析/请说明/分别"等词
-- ❌ **不得把 target_label 拼进 query** — query 是检索意图，label 是展示标签
+- ❌ **禁止问答词** — 不得包含"什么/为何/为什么/如何/是否/哪些/请分析/请说明/分别"等词
+- ❌ **禁止照抄原文** — 不得照抄原文完整句、长列表或答案关键词串
+- ❌ **禁止多概念拼接** — 不得将"定义 + 义务"、"限制 + 管辖"等独立概念并列
+- ❌ **禁止答案平铺** — 不得将 target_fact 中的答案、数值、地点直接拼接成查询
 - ❌ **不得引入文中不存在的信息**
-- ✅ 短查询，通常不超过约 20 个汉字或 token；英文专有名词可完整保留
-- ✅ 允许中文、英文和双语合同术语
-- ✅ **必须保留 must_preserve_terms 中列出的术语**
+- ❌ **不得把 target_label 拼进 query** — query 是检索意图，label 是展示标签
+
+---
+
+## 正反例（强制风格约束）
+
+### 合同主体信息
+- target_fact：买方依瑞典法律组建，供应商依中国法律组建
+- retrieval_intent：协议双方的注册地
+- ❌ 差：买方瑞典组建 供应商中国组建
+- ✅ 好：协议双方的注册地
+
+### 通知条款
+- target_fact：电子邮件通知以自动回复或电子日志证明收悉时视为有效送达
+- retrieval_intent：电子邮件通知的有效送达条件
+- ❌ 差：电子邮件通知送达规则自动回复或系统日志记录
+- ✅ 好：电子邮件通知的有效送达条件
+
+### 文件条款
+- target_fact：合同文件条款冲突时，按文件清单排列顺序确定优先级
+- retrieval_intent：合同文件冲突的优先适用顺序
+- ❌ 差：协议文件不一致时优先顺序依据文件清单
+- ✅ 好：合同文件冲突的优先适用顺序
+
+### 反垄断条款
+- target_fact：业务合作伙伴不得与竞争者约定价格、折扣、销售条款或划分市场
+- retrieval_intent：业务合作伙伴的反垄断合规要求
+- ❌ 差：业务合作伙伴与竞争者合谋限定价格划分市场
+- ✅ 好：业务合作伙伴的反垄断合规要求
 
 ---
 
@@ -846,7 +1319,7 @@ CHUNK_EXACT_PHASE2_PROMPT = """你是 RAG 检索评测出题专家。根据以�
 
 
 def _build_phase2_candidates_text(planned_items, candidates_map, max_content_chars=300):
-    """构建 Phase 2 的候选片段文本（含 query_style、检索意图、must_preserve_terms）。"""
+    """构建 Phase 2 的候选片段文本（含 query_style、target_fact、retrieval_intent、allowed_modifiers、forbidden_concepts）。"""
     lines = []
     for i, item in enumerate(planned_items):
         cid = item.get("candidate_id", "")
@@ -858,16 +1331,25 @@ def _build_phase2_candidates_text(planned_items, candidates_map, max_content_cha
             tail = content[-(max_content_chars // 2):]
             content = f"{head}…{tail}"
         style = item.get("query_style", "semantic")
-        intent = item.get("search_intent", "")
+        target_fact = item.get("target_fact", "")
+        retrieval_intent = item.get("retrieval_intent", "")
         label = item.get("target_label", "")
         terms = item.get("must_preserve_terms", [])
         terms_str = ", ".join(terms) if terms else "（无特殊要求）"
+        modifiers = item.get("allowed_modifiers", [])
+        modifiers_str = ", ".join(modifiers) if modifiers else "（无限定词）"
+        forbidden = item.get("forbidden_concepts", [])
+        forbidden_str = ", ".join(forbidden) if forbidden else "（无禁止概念）"
         pos_str = f" (位置:{position})" if position else ""
+        intent_line = f"检索意图: {retrieval_intent}\n" if retrieval_intent else ""
         lines.append(
             f"候选 {i+1}{pos_str} — ID: {cid}\n"
             f"查询风格: {style}\n"
-            f"检索意图: {intent}\n"
+            f"目标事实（证据锚点）: {target_fact}\n"
+            f"{intent_line}"
             f"标签: {label}\n"
+            f"允许的限定词: {modifiers_str}\n"
+            f"禁止混入的概念: {forbidden_str}\n"
             f"必须保留的术语: {terms_str}\n"
             f"内容: {content}"
         )
@@ -880,8 +1362,9 @@ def _phase1_plan_document(doc_name, candidates, api_key, base_url, model,
 
     Returns:
         (planned_items, errors)
-        planned_items: list[dict]，每项含 candidate_id, query_style, search_intent,
-                        target_label, must_preserve_terms, plan
+        planned_items: list[dict]，每项含 candidate_id, query_style, target_fact,
+                        retrieval_intent, target_label, allowed_modifiers,
+                        forbidden_concepts, must_preserve_terms, plan
         errors: list[str]
     """
     if not candidates:
@@ -901,8 +1384,17 @@ def _phase1_plan_document(doc_name, candidates, api_key, base_url, model,
 
     try:
         items = _parse_llm_response(response_text)
-    except ValueError as exc:
-        return [], [f"Phase 1 解析失败: {exc}"]
+    except ValueError as parse_exc:
+        # JSON 解析失败时，尝试一次修复重试
+        repair_prompt = PHASE1_JSON_REPAIR_PROMPT.replace("{raw_output}", response_text[:3000])
+        try:
+            repaired_text = call_llm(repair_prompt, api_key, base_url, model, timeout=timeout)
+            items = _parse_llm_response(repaired_text)
+        except Exception as repair_exc:
+            return [], [f"Phase 1 解析失败（修复重试也失败）: {parse_exc}"]
+
+    # 构建候选索引（用于 groundedness 校验）
+    candidates_by_id = {c["segment_id"]: c for c in candidates}
 
     # 校验 candidate_id 并去重
     candidate_ids = {c["segment_id"] for c in candidates}
@@ -927,11 +1419,49 @@ def _phase1_plan_document(doc_name, candidates, api_key, base_url, model,
         if style not in ("lexical", "semantic", "disambiguating"):
             style = "semantic"
 
+        # 提取并校验 target_fact
+        target_fact = (item.get("target_fact") or "").strip()
+        if not target_fact:
+            # 回退：从 search_intent 提取
+            target_fact = (item.get("search_intent") or "").strip()
+            if target_fact:
+                errors.append(f"Phase 1 candidate_id '{cid}' 缺少 target_fact，使用 search_intent 回退")
+            else:
+                errors.append(f"Phase 1 candidate_id '{cid}' 缺少 target_fact（已跳过）")
+                continue
+
+        # 校验 target_label
+        target_label = (item.get("target_label") or "").strip()
+        if not target_label:
+            errors.append(f"Phase 1 candidate_id '{cid}' 缺少 target_label（已跳过）")
+            continue
+
+        # 提取 retrieval_intent（可选，兼容历史数据）
+        retrieval_intent = (item.get("retrieval_intent") or "").strip()
+        # 回退：若缺少 retrieval_intent 但有 search_intent，使用 search_intent
+        if not retrieval_intent:
+            retrieval_intent = (item.get("search_intent") or "").strip()
+
+        # 提取 allowed_modifiers（最多 2 个）
+        allowed_modifiers = item.get("allowed_modifiers", [])
+        if not isinstance(allowed_modifiers, list):
+            allowed_modifiers = []
+        allowed_modifiers = [str(m).strip() for m in allowed_modifiers if str(m).strip()][:2]
+
+        # 提取 forbidden_concepts
+        forbidden_concepts = item.get("forbidden_concepts", [])
+        if not isinstance(forbidden_concepts, list):
+            forbidden_concepts = []
+        forbidden_concepts = [str(f).strip() for f in forbidden_concepts if str(f).strip()]
+
         valid_items.append({
             "candidate_id": cid,
             "query_style": style,
-            "search_intent": item.get("search_intent", ""),
-            "target_label": item.get("target_label", ""),
+            "target_fact": target_fact,
+            "retrieval_intent": retrieval_intent,
+            "target_label": target_label,
+            "allowed_modifiers": allowed_modifiers,
+            "forbidden_concepts": forbidden_concepts,
             "must_preserve_terms": item.get("must_preserve_terms", []),
             "plan": item.get("plan", ""),
         })
@@ -942,13 +1472,91 @@ def _phase1_plan_document(doc_name, candidates, api_key, base_url, model,
     return valid_items, errors
 
 
+PHASE2_RETRY_PROMPT = """你是 RAG 检索评测出题专家。以下候选的检索查询未通过质量校验，请根据拒绝原因修正。
+
+**文档名称：** {doc_name}
+
+**需要修正的候选：**
+{retry_items}
+
+---
+
+## 修正要求
+
+- retrieval_query 以 retrieval_intent（检索意图）为主生成，不要照抄 target_fact 的答案细节
+- 每个候选只修正其 retrieval_query，不要改变 candidate_id 或 target_label
+- 严格遵守 target_fact、allowed_modifiers、forbidden_concepts 的边界约束
+- 不得出现问句词（什么/为何/为什么/如何/是否/哪些）或问号
+- 不得多概念拼接、长列表复述或答案关键词平铺
+- 中文查询目标 3-20 字，但允许原子事实需要的稍长短语（不超过 30 字）
+- 只修正被拒绝的候选，不要添加新候选
+
+---
+
+## 输出格式（严格 JSON 数组）
+
+```json
+[
+  {{"candidate_id": "候选ID", "retrieval_query": "修正后的短检索查询", "target_label": "简短标签"}},
+  ...
+]
+```
+
+请直接输出 JSON 数组，不要添加其他文字。"""
+
+
+def _build_phase2_retry_text(rejected_items, candidates_map, max_content_chars=200):
+    """构建 Phase 2 重试提示文本（含拒绝原因和上下文）。
+
+    Args:
+        rejected_items: 被拒绝的 Phase 2 结果列表（含 validation_errors）
+        candidates_map: {candidate_id: candidate_dict}
+        max_content_chars: 内容摘要最大字符数
+
+    Returns:
+        str: 格式化的重试文本
+    """
+    lines = []
+    for i, item in enumerate(rejected_items):
+        cid = item.get("candidate_id", "")
+        c = candidates_map.get(cid, {})
+        content = c.get("content", "")
+        if len(content) > max_content_chars:
+            content = content[:max_content_chars] + "..."
+        rejected_query = item.get("retrieval_query", "")
+        errors = item.get("validation_errors", [])
+        errors_str = "; ".join(errors) if errors else "未知原因"
+        target_fact = item.get("target_fact", "")
+        target_label = item.get("target_label", "")
+        modifiers = item.get("allowed_modifiers", [])
+        modifiers_str = ", ".join(modifiers) if modifiers else "（无限定词）"
+        forbidden = item.get("forbidden_concepts", [])
+        forbidden_str = ", ".join(forbidden) if forbidden else "（无禁止概念）"
+
+        retrieval_intent = item.get("retrieval_intent", "")
+        intent_line = f"检索意图: {retrieval_intent}\n" if retrieval_intent else ""
+
+        lines.append(
+            f"候选 {i+1} — ID: {cid}\n"
+            f"上次生成: {rejected_query}\n"
+            f"拒绝原因: {errors_str}\n"
+            f"目标事实（证据锚点）: {target_fact}\n"
+            f"{intent_line}"
+            f"标签: {target_label}\n"
+            f"允许的限定词: {modifiers_str}\n"
+            f"禁止混入的概念: {forbidden_str}\n"
+            f"内容: {content}"
+        )
+    return "\n\n".join(lines)
+
+
 def _phase2_generate_document(doc_name, planned_items, candidates_map,
                                api_key, base_url, model, timeout=60):
     """Phase 2: 为单个文档生成检索查询。
 
     Args:
         doc_name: 文档名称
-        planned_items: Phase 1 输出的规划列表（含 query_style, must_preserve_terms）
+        planned_items: Phase 1 输出的规划列表（含 query_style, target_fact, allowed_modifiers, forbidden_concepts）
         candidates_map: {candidate_id: candidate_dict}
         api_key, base_url, model: LLM 配置
         timeout: 超时秒数
@@ -956,7 +1564,8 @@ def _phase2_generate_document(doc_name, planned_items, candidates_map,
     Returns:
         (questions, errors)
         questions: list[dict]，每项含 candidate_id, retrieval_query, target_label,
-                   query_style, generation_plan, _candidate
+                   query_style, target_fact, allowed_modifiers, forbidden_concepts,
+                   validation_status, validation_errors, generation_plan, _candidate
         errors: list[str]
     """
     if not planned_items:
@@ -983,7 +1592,7 @@ def _phase2_generate_document(doc_name, planned_items, candidates_map,
         if cid:
             planned_by_id[cid] = p
 
-    # 校验并构建 question dicts
+    # 校验并构建 question dicts（含 fail-closed + groundedness 校验）
     questions = []
     seen_cids = set()
     errors = []
@@ -1014,11 +1623,47 @@ def _phase2_generate_document(doc_name, planned_items, candidates_map,
 
         # 从 Phase 1 规划中继承元数据
         planned = planned_by_id[cid]
+        query_style = planned.get("query_style", "semantic")
+
+        # ── Fail-closed 校验 ──
+        query_ok, query_errors = validate_retrieval_query(
+            retrieval_query, query_style, target_label
+        )
+
+        # ── Groundedness 校验 ──
+        content = candidate.get("content", "")
+        # 构建允许的同义词映射（从 Phase 1 的 must_preserve_terms 和 allowed_modifiers）
+        allowed_synonyms = {}
+        for term in planned.get("must_preserve_terms", []):
+            allowed_synonyms[term.lower()] = term
+        for mod in planned.get("allowed_modifiers", []):
+            allowed_synonyms[mod.lower()] = mod
+
+        ground_ok, ground_errors = validate_groundedness(
+            retrieval_query, content, allowed_synonyms
+        )
+
+        # 合并校验结果
+        all_errors = query_errors + ground_errors
+        validation_status = "passed" if (query_ok and ground_ok) else "rejected"
+        validation_errors = all_errors
+
+        if validation_status == "rejected":
+            errors.append(f"candidate_id '{cid}' 校验失败: {'; '.join(all_errors)}")
+            # 标记为 rejected 但仍加入（由调用方决定是否使用）
+            # 调用方会通过 validation_status 过滤
+
         questions.append({
             "candidate_id": cid,
             "retrieval_query": retrieval_query,
             "target_label": target_label,
-            "query_style": planned.get("query_style", "semantic"),
+            "query_style": query_style,
+            "target_fact": planned.get("target_fact", ""),
+            "retrieval_intent": planned.get("retrieval_intent", ""),
+            "allowed_modifiers": planned.get("allowed_modifiers", []),
+            "forbidden_concepts": planned.get("forbidden_concepts", []),
+            "validation_status": validation_status,
+            "validation_errors": validation_errors,
             "generation_plan": planned.get("plan", ""),
             "_candidate": candidate,
         })
@@ -1172,7 +1817,7 @@ def generate_chunk_exact_questions(
                 "candidate_id": cid,
                 "expected_segment_id": candidate["segment_id"],
                 "expected_content_hash": candidate["content_hash"],
-                "expected_content": candidate.get("content", "")[:500],
+                "expected_content": candidate.get("content", ""),
                 "dataset_id": _dataset_id,
                 "document_id": _document_id,
                 "document_name": candidate.get("document_name", ""),
@@ -1203,7 +1848,8 @@ def generate_chunk_exact_questions(
 def save_chunk_exact_questions(questions, question_set_name=None,
                                dataset_id="", document_id="", snapshot_id="",
                                selection_mode="manual", selected_document_ids=None,
-                               random_seed=None, doc_question_counts=None):
+                               random_seed=None, doc_question_counts=None,
+                               generation_diagnostics=None):
     """保存 chunk_exact 题集。
 
     复用 question_generator.save_questions()，写入 chunk_exact 元数据。
@@ -1218,6 +1864,7 @@ def save_chunk_exact_questions(questions, question_set_name=None,
         selected_document_ids: 选中的文档 ID 列表
         random_seed: 随机种子
         doc_question_counts: dict[doc_id -> question_count]，多文档各文档题数
+        generation_diagnostics: 生成诊断信息（含拒绝详情），写入 manifest
     """
     if not question_set_name:
         ts = datetime.now().strftime("%m%d_%H%M")
@@ -1251,6 +1898,8 @@ def save_chunk_exact_questions(questions, question_set_name=None,
             manifest["doc_question_counts"] = doc_question_counts
         if random_seed is not None:
             manifest["random_seed"] = random_seed
+        if generation_diagnostics:
+            manifest["generation_diagnostics"] = generation_diagnostics
         # 每题的 expected_segment_id 和 expected_content_hash 已在 question dict 中
         manifest_path.write_text(_json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

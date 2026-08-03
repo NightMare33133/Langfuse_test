@@ -100,6 +100,178 @@ def find_latest_processed(project_id: str = "") -> tuple[Path | None, Path | Non
     return None, None
 
 
+# ── Processed Run Index ──────────────────────────────────────
+
+RUN_INDEX_PATH = PROCESSED_DIR / "processed_run_index.json"
+
+
+def _load_run_index() -> dict:
+    """加载 processed run index。"""
+    if not RUN_INDEX_PATH.exists():
+        return {}
+    try:
+        return json.loads(RUN_INDEX_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_run_index(index: dict):
+    """原子写入 processed run index。"""
+    RUN_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RUN_INDEX_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(RUN_INDEX_PATH)
+
+
+def update_run_index(run_id: str, processed_path: str, summary_path: str,
+                     project_id: str = "", source_type: str = "",
+                     fingerprint: str = ""):
+    """更新 processed run index 中的单个 run_id 条目。"""
+    if not run_id:
+        return
+    index = _load_run_index()
+    from datetime import datetime, timezone
+    index[run_id] = {
+        "processed_path": processed_path,
+        "summary_path": summary_path,
+        "langfuse_project_id": project_id,
+        "source_type": source_type,
+        "fingerprint": fingerprint,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_run_index(index)
+
+
+def find_processed_for_run(run_id: str) -> str:
+    """通过 run_id 查找 processed 文件路径。
+
+    优先级：
+    1. processed_run_index.json 中的精确映射
+    2. 扫描隔离目录回填 index
+    3. 兼容旧全局 langfuse_samples.jsonl
+
+    Returns:
+        processed 文件路径字符串，找不到返回旧全局路径。
+    """
+    # 1. 精确查找
+    index = _load_run_index()
+    if run_id in index:
+        p = index[run_id].get("processed_path", "")
+        if p and Path(p).exists():
+            return p
+
+    # 2. 扫描隔离目录回填
+    _backfill_run_index_for_run(run_id)
+    index = _load_run_index()
+    if run_id in index:
+        p = index[run_id].get("processed_path", "")
+        if p and Path(p).exists():
+            return p
+
+    # 3. 兼容旧全局
+    global_p = PROCESSED_DIR / "langfuse_samples.jsonl"
+    return str(global_p)
+
+
+def _backfill_run_index_for_run(run_id: str):
+    """扫描隔离目录，为指定 run_id 回填 index。"""
+    projects_dir = PROCESSED_DIR / "langfuse_projects"
+    if not projects_dir.exists():
+        return
+
+    index = _load_run_index()
+    if run_id in index:
+        return  # 已有
+
+    for proj_dir in projects_dir.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for subdir in proj_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            samples_file = subdir / "samples.jsonl"
+            if not samples_file.exists():
+                continue
+            try:
+                with samples_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        # 检查 run_id 或 user_id 中的 run_id
+                        sample_run_id = obj.get("run_id", "")
+                        if not sample_run_id:
+                            user_id = obj.get("user_id", "")
+                            if user_id.startswith("rag_eval:"):
+                                parts = user_id.split(":", 2)
+                                if len(parts) == 3:
+                                    sample_run_id = parts[1]
+                        if sample_run_id == run_id:
+                            summary_file = subdir / "summary.json"
+                            index[run_id] = {
+                                "processed_path": str(samples_file),
+                                "summary_path": str(summary_file) if summary_file.exists() else "",
+                                "langfuse_project_id": proj_dir.name,
+                                "source_type": subdir.name,
+                                "fingerprint": "",
+                                "updated_at": "",
+                            }
+                            _save_run_index(index)
+                            return
+            except (json.JSONDecodeError, IOError):
+                continue
+
+
+def backfill_run_index_all():
+    """全量回填 processed run index（扫描所有隔离目录）。"""
+    projects_dir = PROCESSED_DIR / "langfuse_projects"
+    if not projects_dir.exists():
+        return 0
+
+    index = _load_run_index()
+    added = 0
+
+    for proj_dir in projects_dir.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        for subdir in proj_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            samples_file = subdir / "samples.jsonl"
+            if not samples_file.exists():
+                continue
+            try:
+                with samples_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        sample_run_id = obj.get("run_id", "")
+                        if not sample_run_id:
+                            user_id = obj.get("user_id", "")
+                            if user_id.startswith("rag_eval:"):
+                                parts = user_id.split(":", 2)
+                                if len(parts) == 3:
+                                    sample_run_id = parts[1]
+                        if sample_run_id and sample_run_id not in index:
+                            summary_file = subdir / "summary.json"
+                            index[sample_run_id] = {
+                                "processed_path": str(samples_file),
+                                "summary_path": str(summary_file) if summary_file.exists() else "",
+                                "langfuse_project_id": proj_dir.name,
+                                "source_type": subdir.name,
+                                "fingerprint": "",
+                                "updated_at": "",
+                            }
+                            added += 1
+            except (json.JSONDecodeError, IOError):
+                continue
+
+    if added > 0:
+        _save_run_index(index)
+    return added
+
+
 # ── 项目识别 ─────────────────────────────────────────────────
 
 

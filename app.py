@@ -1898,14 +1898,16 @@ with tab_kb:
                                             _gen_status.empty()
 
                                             # ── 成功摘要 ──
-                                            _total_requested = sum(s.get("phase1_planned", 0) for s in ce_doc_stats if s.get("status") == "ok")
-                                            _total_generated = len(ce_questions)
-                                            _total_skipped = _total_gen - _total_generated
+                                            _total_requested = sum(s.get("requested", 0) for s in ce_doc_stats)
+                                            _total_final_bound = sum(s.get("final_bound", s.get("bound", 0)) for s in ce_doc_stats)
+                                            _total_first_rejected = sum(s.get("first_rejected", 0) for s in ce_doc_stats)
+                                            _total_binding_failed = sum(s.get("binding_failed", 0) for s in ce_doc_stats)
                                             st.success(
                                                 f"chunk_exact 题集已生成！\n\n"
                                                 f"- **题集 ID:** `{ce_set_id}`\n"
-                                                f"- **请求题数:** {_total_gen} → **实际生成:** {_total_generated} → **绑定通过:** {_bind_ok}\n"
-                                                f"- **跳过/失败:** {_total_skipped}（含绑定失败 {_bind_fail}）\n"
+                                                f"- **请求题数:** {_total_requested} → **最终绑定:** {_total_final_bound} → **绑定通过:** {_bind_ok}\n"
+                                                f"- **质量校验拒绝:** {_total_first_rejected}（不等于绑定失败）\n"
+                                                f"- **绑定失败:** {_total_binding_failed}\n"
                                                 f"- **文件:** `{ce_filename}`\n"
                                                 f"- **文档:** {_n_docs} 份"
                                             )
@@ -1918,20 +1920,33 @@ with tab_kb:
                                                     _s_req = _s.get("requested", 0)
                                                     _s_pool = _s.get("candidate_pool", 0)
                                                     _s_p1 = _s.get("phase1_planned", 0)
-                                                    _s_p2 = _s.get("phase2_generated", 0)
-                                                    _s_bound = _s.get("bound", 0)
+                                                    _s_p2_first = _s.get("phase2_first_returned", _s.get("phase2_generated", 0))
+                                                    _s_first_rej = _s.get("first_rejected", 0)
+                                                    _s_retry_att = _s.get("retry_attempted", 0)
+                                                    _s_retry_rec = _s.get("retry_recovered", 0)
+                                                    _s_final = _s.get("final_bound", _s.get("bound", 0))
+                                                    _s_bind_fail = _s.get("binding_failed", 0)
                                                     _s_styles = _s.get("query_style_counts", {})
                                                     _style_str = " | ".join(f"{k}:{v}" for k, v in sorted(_s_styles.items())) if _s_styles else ""
 
                                                     if _s_status == "ok":
                                                         _icon = "✅"
-                                                        _detail = f"请求{_s_req}→池{_s_pool}→计划{_s_p1}→生成{_s_p2}→绑定{_s_bound}"
+                                                        _detail = (
+                                                            f"请求{_s_req}→池{_s_pool}→计划{_s_p1}"
+                                                            f"→首轮{_s_p2_first}→校验拒绝{_s_first_rej}"
+                                                            f"→重试{_s_retry_att}/恢复{_s_retry_rec}"
+                                                            f"→最终绑定{_s_final}"
+                                                        )
                                                         if _style_str:
                                                             _detail += f" [{_style_str}]"
                                                     elif _s_status == "underfilled":
                                                         _icon = "⚠️"
-                                                        _err = (_s.get("errors") or [""])[-1][:40]
-                                                        _detail = f"请求{_s_req}→池{_s_pool}→计划{_s_p1}→生成{_s_p2}→绑定{_s_bound} — {_err}"
+                                                        _detail = (
+                                                            f"请求{_s_req}→池{_s_pool}→计划{_s_p1}"
+                                                            f"→首轮{_s_p2_first}→校验拒绝{_s_first_rej}"
+                                                            f"→重试{_s_retry_att}/恢复{_s_retry_rec}"
+                                                            f"→最终绑定{_s_final}"
+                                                        )
                                                         if _style_str:
                                                             _detail += f" [{_style_str}]"
                                                     elif _s_status == "insufficient_candidates":
@@ -1955,6 +1970,21 @@ with tab_kb:
 
                                                     st.markdown(f"{_icon} **{_s_name}** — {_detail}")
 
+                                                # 拒绝诊断
+                                                _all_diag = []
+                                                for _s in ce_doc_stats:
+                                                    for _d in _s.get("rejection_diagnostics", []):
+                                                        _d["doc"] = _s.get("document_name", "")[:10]
+                                                        _all_diag.append(_d)
+                                                if _all_diag:
+                                                    with st.expander(f"🔍 校验拒绝详情（{len(_all_diag)} 条）", expanded=False):
+                                                        for _d in _all_diag[:20]:
+                                                            _retry_tag = " [重试]" if _d.get("retry") else ""
+                                                            st.markdown(
+                                                                f"- **{_d.get('doc', '')}** / `{_d.get('candidate_id', '')[:12]}`{_retry_tag}: "
+                                                                f"查询=`{_d.get('query', '')[:30]}` — {'; '.join(_d.get('errors', [])[:2])}"
+                                                            )
+
                                             # 显示实际种子
                                             st.caption(f"🎲 实际随机种子：{_actual_seed}（可用于复现本次出题）")
 
@@ -1968,10 +1998,15 @@ with tab_kb:
                                                     doc_label = _dnm.get(doc_id, doc_id[:8] + "...")
                                                     _qstyle = q.get("query_style", "")
                                                     _style_badge = f" `{_qstyle}`" if _qstyle else ""
+                                                    _intent = q.get("retrieval_intent", "")
+                                                    _intent_line = f"\n  ↳ 检索意图: {_intent}" if _intent else ""
+                                                    _fact = q.get("target_fact", "")
+                                                    _fact_line = f"\n  ↳ 证据锚点: {_fact}" if _fact else ""
                                                     st.markdown(
                                                         f"**{i+1}.** {q.get('retrieval_query', '')} "
                                                         f"(`{q.get('target_label', '')}`{_style_badge}) "
                                                         f"→ [{doc_label}] segment: `{seg_short}` pos:{pos}"
+                                                        f"{_intent_line}{_fact_line}"
                                                     )
 
                                 except Exception as exc:
@@ -2297,10 +2332,15 @@ with tab_kb:
                                                             seg_id = q.get("expected_segment_id", "")
                                                             seg_short = seg_id[:12] + "..." if len(str(seg_id)) > 12 else seg_id
                                                             pos = q.get("source_position", "")
+                                                            _intent = q.get("retrieval_intent", "")
+                                                            _intent_line = f"\n  ↳ 检索意图: {_intent}" if _intent else ""
+                                                            _fact = q.get("target_fact", "")
+                                                            _fact_line = f"\n  ↳ 证据锚点: {_fact}" if _fact else ""
                                                             st.markdown(
                                                                 f"**{i+1}.** {q.get('retrieval_query', '')} "
                                                                 f"(`{q.get('target_label', '')}`) "
                                                                 f"→ segment: `{seg_short}` pos:{pos}"
+                                                                f"{_intent_line}{_fact_line}"
                                                             )
 
                                             except Exception as exc:
@@ -3764,8 +3804,17 @@ PISP和AISP的区别?
                                                 f" | {pos_str} | 标签: {target}"
                                             )
                                             if expected_content:
-                                                with st.expander("预期 Chunk 证据", expanded=False):
-                                                    st.text(expected_content[:500])
+                                                _ec_len = len(expected_content)
+                                                _ec_label = f"预期 Chunk 证据（{_ec_len:,} 字符）"
+                                                # 检测历史 500 字符截断
+                                                _is_legacy_truncated = (_ec_len == 500)
+                                                with st.expander(_ec_label, expanded=False):
+                                                    if _is_legacy_truncated:
+                                                        st.warning(
+                                                            "⚠️ 历史题集仅保存了前 500 字符的预览；"
+                                                            "机器判定仍基于 segment_id/content_hash。"
+                                                        )
+                                                    st.text(expected_content)
                                     elif qm == MODE_RETRIEVAL:
                                         mode_badge = "🔍 "
                                         if ref:
@@ -4713,6 +4762,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                 get_current_eval_cache, update_eval_cache,
                 _find_snapshot_references,
                 get_processed_paths, find_latest_processed,
+                find_processed_for_run, update_run_index, backfill_run_index_all,
                 PROJECTS_DIR, PROCESSED_DIR as _LP_PROCESSED_DIR,
             )
 
@@ -5368,6 +5418,27 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         # 确保每条 sample 有真实 trace_id（非 batch_qa_*）
                         # trace_id 由 parser 从原始数据提取，此处不覆盖
                     full_summary = save_results(samples, summary, output_path, summary_path)
+
+                    # ── 更新 processed run index ──
+                    _run_ids_seen = set()
+                    for _s in samples:
+                        _rid = _s.get("run_id", "")
+                        if not _rid:
+                            _uid = _s.get("user_id", "")
+                            if _uid.startswith("rag_eval:"):
+                                _parts = _uid.split(":", 2)
+                                if len(_parts) == 3:
+                                    _rid = _parts[1]
+                        if _rid and _rid not in _run_ids_seen:
+                            _run_ids_seen.add(_rid)
+                            update_run_index(
+                                _rid,
+                                str(output_path),
+                                str(summary_path),
+                                project_id=_src_pid,
+                                source_type=source_type or "",
+                                fingerprint=full_summary.get("source_file_fingerprint", ""),
+                            )
 
                     for _s in samples:
                         _s.pop("observations", None)
@@ -7630,7 +7701,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 rid,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=_resolve_processed_path()[0],
+                processed_file=find_processed_for_run(rid),
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=True,
             )
@@ -8172,7 +8243,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 run["run_id"],
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=_resolve_processed_path()[0],
+                processed_file=find_processed_for_run(run["run_id"]),
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=False,
             )
@@ -8201,7 +8272,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 _rid,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=_resolve_processed_path()[0],
+                processed_file=find_processed_for_run(_rid),
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=False,
             )
@@ -8235,7 +8306,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 run_id,
                 batch_dir=str(BATCH_DIR),
                 raw_dir=str(RAW_DIR),
-                processed_file=_resolve_processed_path()[0],
+                processed_file=find_processed_for_run(run_id),
                 judged_file=str(JUDGED_FILE),
                 include_judge_results=True,
             )
@@ -8935,7 +9006,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         rid,
                         batch_dir=str(BATCH_DIR),
                         raw_dir=str(RAW_DIR),
-                        processed_file=_resolve_processed_path()[0],
+                        processed_file=find_processed_for_run(rid),
                         judged_file=str(JUDGED_FILE),
                         include_judge_results=True,
                     )

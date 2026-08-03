@@ -2138,3 +2138,182 @@ class TestCurrentCacheWorkflow:
                 assert s == current_dir / "samples.jsonl"
             finally:
                 langfuse_project.PROCESSED_DIR = old
+
+
+class TestProcessedRunIndex:
+    """测试 processed run index 机制。"""
+
+    def test_update_and_find_run_index(self):
+        """写入 index 后能按 run_id 找到 processed 文件。"""
+        import tempfile
+        from langfuse_project import (
+            update_run_index, find_processed_for_run,
+            _load_run_index, _save_run_index, RUN_INDEX_PATH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 创建隔离 processed 文件
+            proj_dir = Path(tmpdir) / "langfuse_projects" / "proj_x" / "current"
+            proj_dir.mkdir(parents=True)
+            samples_file = proj_dir / "samples.jsonl"
+            samples_file.write_text('{"trace_id": "t1", "run_id": "run_001"}\n')
+
+            import langfuse_project
+            old_processed = langfuse_project.PROCESSED_DIR
+            old_index = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "processed_run_index.json"
+
+                update_run_index(
+                    "run_001", str(samples_file), "",
+                    project_id="proj_x", source_type="current_cache",
+                )
+
+                result = find_processed_for_run("run_001")
+                assert result == str(samples_file)
+            finally:
+                langfuse_project.PROCESSED_DIR = old_processed
+                langfuse_project.RUN_INDEX_PATH = old_index
+
+    def test_run_index_isolation(self):
+        """两个 project 的 run 不串。"""
+        import tempfile
+        from langfuse_project import update_run_index, find_processed_for_run
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f1 = Path(tmpdir) / "proj_a" / "samples.jsonl"
+            f2 = Path(tmpdir) / "proj_b" / "samples.jsonl"
+            f1.parent.mkdir(parents=True)
+            f2.parent.mkdir(parents=True)
+            f1.write_text('{"run_id": "run_a"}\n')
+            f2.write_text('{"run_id": "run_b"}\n')
+
+            import langfuse_project
+            old = langfuse_project.PROCESSED_DIR
+            old_idx = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "index.json"
+
+                update_run_index("run_a", str(f1), "", project_id="proj_a")
+                update_run_index("run_b", str(f2), "", project_id="proj_b")
+
+                assert find_processed_for_run("run_a") == str(f1)
+                assert find_processed_for_run("run_b") == str(f2)
+            finally:
+                langfuse_project.PROCESSED_DIR = old
+                langfuse_project.RUN_INDEX_PATH = old_idx
+
+    def test_backfill_run_index_from_isolated_files(self):
+        """index 缺失时自动扫描隔离目录回填。"""
+        import tempfile
+        from langfuse_project import find_processed_for_run
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proj_dir = Path(tmpdir) / "langfuse_projects" / "proj_z" / "current"
+            proj_dir.mkdir(parents=True)
+            samples_file = proj_dir / "samples.jsonl"
+            samples_file.write_text(
+                '{"trace_id": "t1", "run_id": "run_backfill"}\n'
+            )
+
+            import langfuse_project
+            old = langfuse_project.PROCESSED_DIR
+            old_idx = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "index.json"
+
+                # index 为空，应自动回填
+                result = find_processed_for_run("run_backfill")
+                assert result == str(samples_file)
+
+                # 验证 index 已写入
+                from langfuse_project import _load_run_index
+                idx = _load_run_index()
+                assert "run_backfill" in idx
+                assert idx["run_backfill"]["langfuse_project_id"] == "proj_z"
+            finally:
+                langfuse_project.PROCESSED_DIR = old
+                langfuse_project.RUN_INDEX_PATH = old_idx
+
+    def test_legacy_fallback_when_no_index(self):
+        """index 和隔离目录都没有时，回退到旧全局文件。"""
+        import tempfile
+        from langfuse_project import find_processed_for_run
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_file = Path(tmpdir) / "langfuse_samples.jsonl"
+            global_file.write_text('{"run_id": "run_old"}\n')
+
+            import langfuse_project
+            old = langfuse_project.PROCESSED_DIR
+            old_idx = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "index.json"
+
+                result = find_processed_for_run("run_nonexistent")
+                assert result == str(global_file)
+            finally:
+                langfuse_project.PROCESSED_DIR = old
+                langfuse_project.RUN_INDEX_PATH = old_idx
+
+    def test_backfill_run_index_all(self):
+        """全量回填扫描所有隔离目录。"""
+        import tempfile
+        from langfuse_project import backfill_run_index_all, _load_run_index
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 创建两个 project 的隔离文件
+            for pid, rid in [("p1", "run_1"), ("p2", "run_2")]:
+                d = Path(tmpdir) / "langfuse_projects" / pid / "current"
+                d.mkdir(parents=True)
+                (d / "samples.jsonl").write_text(f'{{"run_id": "{rid}"}}\n')
+
+            import langfuse_project
+            old = langfuse_project.PROCESSED_DIR
+            old_idx = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "index.json"
+
+                added = backfill_run_index_all()
+                assert added == 2
+
+                idx = _load_run_index()
+                assert "run_1" in idx
+                assert "run_2" in idx
+                assert idx["run_1"]["langfuse_project_id"] == "p1"
+                assert idx["run_2"]["langfuse_project_id"] == "p2"
+            finally:
+                langfuse_project.PROCESSED_DIR = old
+                langfuse_project.RUN_INDEX_PATH = old_idx
+
+    def test_index_not_written_with_api_keys(self):
+        """index 中不包含 API key。"""
+        import tempfile
+        from langfuse_project import update_run_index, _load_run_index
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import langfuse_project
+            old = langfuse_project.PROCESSED_DIR
+            old_idx = langfuse_project.RUN_INDEX_PATH
+            try:
+                langfuse_project.PROCESSED_DIR = Path(tmpdir)
+                langfuse_project.RUN_INDEX_PATH = Path(tmpdir) / "index.json"
+
+                update_run_index("run_test", "/path/samples.jsonl", "/path/summary.json",
+                                 project_id="proj_test")
+
+                idx = _load_run_index()
+                entry = idx["run_test"]
+                content = json.dumps(entry)
+                assert "api_key" not in content.lower()
+                assert "secret" not in content.lower()
+                assert "pk-" not in content
+                assert "sk-" not in content
+            finally:
+                langfuse_project.PROCESSED_DIR = old
+                langfuse_project.RUN_INDEX_PATH = old_idx
