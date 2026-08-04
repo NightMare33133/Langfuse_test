@@ -13,12 +13,14 @@
 - API Key 不写入任何输出文件
 """
 
+import copy
 import hashlib
 import json
 import math
 import random
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from judge import call_llm
@@ -470,12 +472,281 @@ def validate_multi_doc_config(doc_configs):
     return len(errors) == 0, errors
 
 
+def _generate_single_doc(
+    doc_idx, dc, api_key, base_url, model,
+    dataset_id, snapshot_id, actual_seed, timeout,
+    phase_callback=None,
+):
+    """为单个文档执行完整的两阶段生成流程（Phase 1 → Phase 2 → retry）。
+
+    此函数是线程安全的，不修改任何共享状态。候选数据通过深拷贝隔离。
+
+    Args:
+        doc_idx: 文档在原始列表中的索引（用于排序）
+        dc: 单个文档配置 dict
+        api_key, base_url, model: LLM 配置
+        dataset_id, snapshot_id, actual_seed: 生成参数
+        timeout: LLM 调用超时
+        phase_callback: (doc_idx, phase, message) 线程安全的阶段回调
+
+    Returns:
+        (doc_idx, questions, stat)
+        doc_idx: 原始索引（用于结果排序）
+        questions: 该文档生成的 question list
+        stat: 该文档的统计 dict
+    """
+    doc_id = dc["document_id"]
+    doc_name = dc.get("document_name", doc_id[:12])
+    # 深拷贝候选数据，避免跨 worker 共享或原地修改
+    candidates = copy.deepcopy(dc["candidates"])
+    num = dc["num_questions"]
+
+    def _emit(phase, msg):
+        if phase_callback:
+            phase_callback(doc_idx, phase, msg)
+
+    # ── 抽取候选池 ──
+    pool, pool_size, pool_capped = sample_candidate_pool(
+        candidates, num, doc_id, actual_seed
+    )
+
+    # 标记来源文档
+    for s in pool:
+        s["_source_document_id"] = doc_id
+        s["_source_document_name"] = doc_name
+
+    if pool_capped and pool_size < num:
+        return doc_idx, [], {
+            "document_id": doc_id,
+            "document_name": doc_name,
+            "requested": num,
+            "candidate_pool": pool_size,
+            "phase1_planned": 0, "phase2_first_returned": 0,
+            "first_rejected": 0, "retry_attempted": 0, "retry_recovered": 0,
+            "final_bound": 0, "binding_failed": 0,
+            "status": "insufficient_candidates",
+            "errors": [f"仅有 {pool_size} 个可用候选，不足 {num} 题"],
+            "query_style_counts": {}, "rejection_diagnostics": [],
+        }
+
+    candidates_map = {c["segment_id"]: c for c in pool}
+
+    # ── Phase 1: 规划 ──
+    _emit("phase1", f"{doc_name[:12]}… Phase 1: 规划中（候选池 {pool_size}）")
+
+    planned_items, phase1_errors = _phase1_plan_document(
+        doc_name, pool, api_key, base_url, model, num, timeout
+    )
+
+    _phase1_critical_errors = [e for e in phase1_errors if "LLM 调用失败" in e or "解析失败" in e]
+    if _phase1_critical_errors and not planned_items:
+        return doc_idx, [], {
+            "document_id": doc_id, "document_name": doc_name,
+            "requested": num, "candidate_pool": pool_size,
+            "phase1_planned": 0, "phase2_first_returned": 0,
+            "first_rejected": 0, "retry_attempted": 0, "retry_recovered": 0,
+            "final_bound": 0, "binding_failed": 0,
+            "status": "phase1_failed", "errors": _phase1_critical_errors,
+            "query_style_counts": {}, "rejection_diagnostics": [],
+        }
+
+    if not planned_items:
+        return doc_idx, [], {
+            "document_id": doc_id, "document_name": doc_name,
+            "requested": num, "candidate_pool": pool_size,
+            "phase1_planned": 0, "phase2_first_returned": 0,
+            "first_rejected": 0, "retry_attempted": 0, "retry_recovered": 0,
+            "final_bound": 0, "binding_failed": 0,
+            "status": "phase1_empty", "errors": ["Phase 1 未返回任何规划项"],
+            "query_style_counts": {}, "rejection_diagnostics": [],
+        }
+
+    # ── Phase 2: 生成查询 ──
+    _emit("phase2", f"{doc_name[:12]}… Phase 2: 生成查询（{len(planned_items)} 项）")
+
+    phase2_questions, phase2_errors = _phase2_generate_document(
+        doc_name, planned_items, candidates_map,
+        api_key, base_url, model, timeout
+    )
+
+    # ── 统计首轮结果 ──
+    first_returned_count = len(phase2_questions)
+    passed_questions = [q for q in phase2_questions if q.get("validation_status") == "passed"]
+    rejected_questions = [q for q in phase2_questions if q.get("validation_status") != "passed"]
+    first_rejected_count = len(rejected_questions)
+
+    rejection_diagnostics = []
+    for rq in rejected_questions:
+        rejection_diagnostics.append({
+            "candidate_id": rq.get("candidate_id", ""),
+            "query": rq.get("retrieval_query", ""),
+            "errors": rq.get("validation_errors", []),
+        })
+
+    # ── 带错误反馈的重试 ──
+    generated_cids = {q["candidate_id"] for q in passed_questions}
+    retry_rejected = [q for q in rejected_questions if q.get("candidate_id") not in generated_cids]
+    for p in planned_items:
+        cid = p["candidate_id"]
+        if cid not in generated_cids and not any(r["candidate_id"] == cid for r in retry_rejected):
+            retry_rejected.append({
+                "candidate_id": cid, "retrieval_query": "",
+                "validation_errors": ["未生成"],
+                "target_fact": p.get("target_fact", ""),
+                "retrieval_intent": p.get("retrieval_intent", ""),
+                "target_label": p.get("target_label", ""),
+                "allowed_modifiers": p.get("allowed_modifiers", []),
+                "forbidden_concepts": p.get("forbidden_concepts", []),
+                "query_style": p.get("query_style", "semantic"),
+            })
+
+    retry_attempted_count = len(retry_rejected)
+    retry_recovered_count = 0
+
+    if retry_rejected:
+        _emit("retry", f"{doc_name[:12]}… 重试 {retry_attempted_count} 项")
+
+        retry_text = _build_phase2_retry_text(retry_rejected, candidates_map)
+        retry_prompt = PHASE2_RETRY_PROMPT.replace("{doc_name}", doc_name).replace("{retry_items}", retry_text)
+
+        try:
+            retry_response = call_llm(retry_prompt, api_key, base_url, model, timeout=timeout)
+            retry_items = _parse_llm_response(retry_response)
+        except Exception as exc:
+            phase2_errors.append(f"[重试] 调用或解析失败: {exc}")
+            retry_items = []
+
+        for item in retry_items:
+            cid = item.get("candidate_id", "")
+            if not cid or cid in generated_cids:
+                continue
+            retry_info = next((r for r in retry_rejected if r["candidate_id"] == cid), None)
+            if not retry_info:
+                continue
+            candidate = candidates_map.get(cid)
+            if not candidate:
+                continue
+            retrieval_query = (item.get("retrieval_query") or "").strip()
+            if not retrieval_query:
+                continue
+            target_label = (item.get("target_label") or "").strip()
+            planned = next((p for p in planned_items if p["candidate_id"] == cid), {})
+            query_style = planned.get("query_style", "semantic")
+
+            query_ok, query_errors = validate_retrieval_query(retrieval_query, query_style, target_label)
+            content = candidate.get("content", "")
+            allowed_synonyms = {}
+            for term in planned.get("must_preserve_terms", []):
+                allowed_synonyms[term.lower()] = term
+            for mod in planned.get("allowed_modifiers", []):
+                allowed_synonyms[mod.lower()] = mod
+            ground_ok, ground_errors = validate_groundedness(retrieval_query, content, allowed_synonyms)
+
+            all_errors = query_errors + ground_errors
+            validation_status = "passed" if (query_ok and ground_ok) else "rejected"
+
+            if validation_status == "passed":
+                passed_questions.append({
+                    "candidate_id": cid, "retrieval_query": retrieval_query,
+                    "target_label": target_label, "query_style": query_style,
+                    "target_fact": planned.get("target_fact", ""),
+                    "retrieval_intent": planned.get("retrieval_intent", ""),
+                    "allowed_modifiers": planned.get("allowed_modifiers", []),
+                    "forbidden_concepts": planned.get("forbidden_concepts", []),
+                    "validation_status": "passed", "validation_errors": [],
+                    "generation_plan": planned.get("plan", ""),
+                    "_candidate": candidate,
+                })
+                generated_cids.add(cid)
+                retry_recovered_count += 1
+            else:
+                rejection_diagnostics.append({
+                    "candidate_id": cid, "query": retrieval_query,
+                    "errors": all_errors, "retry": True,
+                })
+
+    phase2_questions = passed_questions
+
+    # 构建最终 question dicts
+    bound_questions = []
+    for q_data in phase2_questions:
+        candidate = q_data.get("_candidate")
+        if not candidate:
+            continue
+        _dataset_id = dataset_id or candidate.get("dataset_id", "")
+        _document_id = candidate.get("_source_document_id", candidate.get("document_id", ""))
+        _document_name = candidate.get("_source_document_name", candidate.get("document_name", ""))
+        _position = candidate.get("position", "")
+        cid = q_data["candidate_id"]
+
+        q = {
+            "question": q_data["retrieval_query"],
+            "retrieval_query": q_data["retrieval_query"],
+            "question_mode": "chunk_exact",
+            "evaluation_type": "chunk_exact",
+            "question_id": f"ce_{snapshot_id}_{cid}",
+            "target_label": q_data["target_label"],
+            "candidate_id": cid,
+            "expected_segment_id": candidate["segment_id"],
+            "expected_content_hash": candidate["content_hash"],
+            "expected_content": candidate.get("content", ""),
+            "dataset_id": _dataset_id,
+            "document_id": _document_id,
+            "document_name": _document_name,
+            "snapshot_id": snapshot_id,
+            "source_position": _position,
+            "source_label": f"doc:{_document_id[:8]} pos:{_position}",
+            "query_style": q_data.get("query_style", "semantic"),
+            "target_fact": q_data.get("target_fact", ""),
+            "retrieval_intent": q_data.get("retrieval_intent", ""),
+            "allowed_modifiers": q_data.get("allowed_modifiers", []),
+            "forbidden_concepts": q_data.get("forbidden_concepts", []),
+            "validation_status": q_data.get("validation_status", "passed"),
+            "validation_errors": q_data.get("validation_errors", []),
+            "generation_plan": q_data.get("generation_plan", ""),
+            "selection_seed": actual_seed,
+        }
+        bound_questions.append(q)
+
+    _style_counts = {}
+    for q in bound_questions:
+        _s = q.get("query_style", "semantic")
+        _style_counts[_s] = _style_counts.get(_s, 0) + 1
+
+    _final_bound = len(bound_questions)
+    _status = "ok"
+    _doc_errors = list(phase2_errors)
+    if _final_bound < num:
+        _status = "underfilled"
+        _doc_errors.append(
+            f"请求 {num} 题，实际绑定 {_final_bound} 题"
+            f"（首轮返回 {first_returned_count}，校验拒绝 {first_rejected_count}，"
+            f"重试 {retry_attempted_count}，恢复 {retry_recovered_count}）"
+        )
+
+    _emit("completed", f"{doc_name[:12]}… 完成: {_final_bound} 题")
+
+    return doc_idx, bound_questions, {
+        "document_id": doc_id, "document_name": doc_name,
+        "requested": num, "candidate_pool": pool_size,
+        "phase1_planned": len(planned_items),
+        "phase2_first_returned": first_returned_count,
+        "first_rejected": first_rejected_count,
+        "retry_attempted": retry_attempted_count,
+        "retry_recovered": retry_recovered_count,
+        "final_bound": _final_bound, "binding_failed": 0,
+        "status": _status, "errors": _doc_errors,
+        "query_style_counts": _style_counts,
+        "rejection_diagnostics": rejection_diagnostics,
+    }
+
+
 def generate_chunk_exact_questions_multi_doc(
     doc_configs, api_key, base_url, model,
     dataset_id="", snapshot_id="", master_seed=0,
-    timeout=60, progress_callback=None,
+    timeout=60, progress_callback=None, max_workers=2,
 ):
-    """从多个文档的候选 chunk 联合生成 chunk_exact 题集（两阶段流程）。
+    """从多个文档的候选 chunk 联合生成 chunk_exact 题集（两阶段流程，受控并发）。
 
     Phase 1: 按文档调用 LLM 做出题规划（筛选 + query_style + 检索方案）
     Phase 2: 按文档调用 LLM 生成短检索查询（遵从 query_style）
@@ -494,6 +765,7 @@ def generate_chunk_exact_questions_multi_doc(
         master_seed: 用户主种子（0 表示随机生成）
         timeout: LLM 调用超时
         progress_callback: 进度回调 (done, total, message)
+        max_workers: 文档级并发数（1=串行，2-3=受控并发）
 
     Returns:
         (questions, doc_stats, actual_seed)
@@ -511,7 +783,6 @@ def generate_chunk_exact_questions_multi_doc(
     if not snapshot_id:
         snapshot_id = f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
-    # 确定主种子：用户指定或随机生成
     if master_seed and master_seed > 0:
         actual_seed = master_seed
     else:
@@ -520,312 +791,108 @@ def generate_chunk_exact_questions_multi_doc(
     total_questions = sum(dc["num_questions"] for dc in active_configs)
     total_docs = len(active_configs)
 
-    if progress_callback:
-        progress_callback(0, total_docs * 2,
-                          f"准备从 {total_docs} 个文档生成 {total_questions} 道题（两阶段）...")
+    # ── 进度上报（串行模式用） ──
+    _completed_docs = [0]  # 用列表以便闭包修改
+    _doc_phases = {}  # doc_idx -> current_phase
 
-    all_questions = []
-    doc_stats = []  # 每文档的统计信息
-
-    for doc_idx, dc in enumerate(active_configs):
-        doc_id = dc["document_id"]
-        doc_name = dc.get("document_name", doc_id[:12])
-        candidates = dc["candidates"]
-        num = dc["num_questions"]
-
-        # ── 抽取候选池（比 N 大，给 Phase 1 筛选空间） ──
-        pool, pool_size, pool_capped = sample_candidate_pool(
-            candidates, num, doc_id, actual_seed
-        )
-
-        # 标记来源文档
-        for s in pool:
-            s["_source_document_id"] = doc_id
-            s["_source_document_name"] = doc_name
-
-        if pool_capped and pool_size < num:
-            # 可用候选不足 N，fail-closed
-            doc_stats.append({
-                "document_id": doc_id,
-                "document_name": doc_name,
-                "requested": num,
-                "candidate_pool": pool_size,
-                "phase1_planned": 0,
-                "phase2_first_returned": 0,
-                "first_rejected": 0,
-                "retry_attempted": 0,
-                "retry_recovered": 0,
-                "final_bound": 0,
-                "binding_failed": 0,
-                "status": "insufficient_candidates",
-                "errors": [f"仅有 {pool_size} 个可用候选，不足 {num} 题"],
-                "query_style_counts": {},
-                "rejection_diagnostics": [],
-            })
-            continue
-
-        # 构建候选索引
-        candidates_map = {c["segment_id"]: c for c in pool}
-
-        # ── Phase 1: 规划 ──
+    def _serial_phase_callback(doc_idx, phase, message):
+        """串行模式下的阶段回调，直接调用 progress_callback（主线程安全）。"""
+        _doc_phases[doc_idx] = phase
+        if phase in ("completed", "failed"):
+            _completed_docs[0] += 1
         if progress_callback:
-            progress_callback(doc_idx * 2, total_docs * 2,
-                              f"[{doc_idx+1}/{total_docs}] {doc_name[:12]}… Phase 1: 规划中（候选池 {pool_size}）...")
-
-        planned_items, phase1_errors = _phase1_plan_document(
-            doc_name, pool, api_key, base_url, model, num, timeout
-        )
-
-        # 只有 LLM 调用失败或解析失败才视为 phase1_failed
-        _phase1_critical_errors = [e for e in phase1_errors if "LLM 调用失败" in e or "解析失败" in e]
-        if _phase1_critical_errors and not planned_items:
-            doc_stats.append({
-                "document_id": doc_id,
-                "document_name": doc_name,
-                "requested": num,
-                "candidate_pool": pool_size,
-                "phase1_planned": 0,
-                "phase2_first_returned": 0,
-                "first_rejected": 0,
-                "retry_attempted": 0,
-                "retry_recovered": 0,
-                "final_bound": 0,
-                "binding_failed": 0,
-                "status": "phase1_failed",
-                "errors": _phase1_critical_errors,
-                "query_style_counts": {},
-                "rejection_diagnostics": [],
-            })
-            continue
-
-        if not planned_items:
-            doc_stats.append({
-                "document_id": doc_id,
-                "document_name": doc_name,
-                "requested": num,
-                "candidate_pool": pool_size,
-                "phase1_planned": 0,
-                "phase2_first_returned": 0,
-                "first_rejected": 0,
-                "retry_attempted": 0,
-                "retry_recovered": 0,
-                "final_bound": 0,
-                "binding_failed": 0,
-                "status": "phase1_empty",
-                "errors": ["Phase 1 未返回任何规划项"],
-                "query_style_counts": {},
-                "rejection_diagnostics": [],
-            })
-            continue
-
-        # ── Phase 2: 生成查询 ──
-        if progress_callback:
-            progress_callback(doc_idx * 2 + 1, total_docs * 2,
-                              f"[{doc_idx+1}/{total_docs}] {doc_name[:12]}… Phase 2: 生成查询（{len(planned_items)} 项）...")
-
-        phase2_questions, phase2_errors = _phase2_generate_document(
-            doc_name, planned_items, candidates_map,
-            api_key, base_url, model, timeout
-        )
-
-        # ── 统计首轮结果 ──
-        first_returned_count = len(phase2_questions)
-        passed_questions = [q for q in phase2_questions if q.get("validation_status") == "passed"]
-        rejected_questions = [q for q in phase2_questions if q.get("validation_status") != "passed"]
-        first_rejected_count = len(rejected_questions)
-
-        # 收集拒绝诊断
-        rejection_diagnostics = []
-        for rq in rejected_questions:
-            rejection_diagnostics.append({
-                "candidate_id": rq.get("candidate_id", ""),
-                "query": rq.get("retrieval_query", ""),
-                "errors": rq.get("validation_errors", []),
-            })
-
-        # ── 带错误反馈的重试：Phase 2 少题或校验失败时重试一次 ──
-        generated_cids = {q["candidate_id"] for q in passed_questions}
-        # 找出需要重试的候选：未生成的 + 校验失败的
-        retry_rejected = [q for q in rejected_questions if q.get("candidate_id") not in generated_cids]
-        # 补充完全未生成的候选
-        for p in planned_items:
-            cid = p["candidate_id"]
-            if cid not in generated_cids and not any(r["candidate_id"] == cid for r in retry_rejected):
-                retry_rejected.append({
-                    "candidate_id": cid,
-                    "retrieval_query": "",
-                    "validation_errors": ["未生成"],
-                    "target_fact": p.get("target_fact", ""),
-                    "retrieval_intent": p.get("retrieval_intent", ""),
-                    "target_label": p.get("target_label", ""),
-                    "allowed_modifiers": p.get("allowed_modifiers", []),
-                    "forbidden_concepts": p.get("forbidden_concepts", []),
-                    "query_style": p.get("query_style", "semantic"),
-                })
-
-        retry_attempted_count = len(retry_rejected)
-        retry_recovered_count = 0
-
-        if retry_rejected:
-            # 使用带错误反馈的重试提示
-            retry_text = _build_phase2_retry_text(retry_rejected, candidates_map)
-            retry_prompt = PHASE2_RETRY_PROMPT.replace("{doc_name}", doc_name).replace("{retry_items}", retry_text)
-
-            try:
-                retry_response = call_llm(retry_prompt, api_key, base_url, model, timeout=timeout)
-                retry_items = _parse_llm_response(retry_response)
-            except Exception as exc:
-                phase2_errors.append(f"[重试] 调用或解析失败: {exc}")
-                retry_items = []
-
-            # 校验重试结果
-            for item in retry_items:
-                cid = item.get("candidate_id", "")
-                if not cid or cid in generated_cids:
-                    continue
-                # 检查是否在重试列表中
-                retry_info = next((r for r in retry_rejected if r["candidate_id"] == cid), None)
-                if not retry_info:
-                    continue
-
-                candidate = candidates_map.get(cid)
-                if not candidate:
-                    continue
-
-                retrieval_query = (item.get("retrieval_query") or "").strip()
-                if not retrieval_query:
-                    continue
-
-                target_label = (item.get("target_label") or "").strip()
-
-                # 从 planned_items 获取元数据
-                planned = next((p for p in planned_items if p["candidate_id"] == cid), {})
-                query_style = planned.get("query_style", "semantic")
-
-                # 校验
-                query_ok, query_errors = validate_retrieval_query(retrieval_query, query_style, target_label)
-                content = candidate.get("content", "")
-                allowed_synonyms = {}
-                for term in planned.get("must_preserve_terms", []):
-                    allowed_synonyms[term.lower()] = term
-                for mod in planned.get("allowed_modifiers", []):
-                    allowed_synonyms[mod.lower()] = mod
-                ground_ok, ground_errors = validate_groundedness(retrieval_query, content, allowed_synonyms)
-
-                all_errors = query_errors + ground_errors
-                validation_status = "passed" if (query_ok and ground_ok) else "rejected"
-
-                if validation_status == "passed":
-                    passed_questions.append({
-                        "candidate_id": cid,
-                        "retrieval_query": retrieval_query,
-                        "target_label": target_label,
-                        "query_style": query_style,
-                        "target_fact": planned.get("target_fact", ""),
-                        "retrieval_intent": planned.get("retrieval_intent", ""),
-                        "allowed_modifiers": planned.get("allowed_modifiers", []),
-                        "forbidden_concepts": planned.get("forbidden_concepts", []),
-                        "validation_status": "passed",
-                        "validation_errors": [],
-                        "generation_plan": planned.get("plan", ""),
-                        "_candidate": candidate,
-                    })
-                    generated_cids.add(cid)
-                    retry_recovered_count += 1
-                else:
-                    # 重试仍失败，记录诊断
-                    rejection_diagnostics.append({
-                        "candidate_id": cid,
-                        "query": retrieval_query,
-                        "errors": all_errors,
-                        "retry": True,
-                    })
-
-        # 使用通过校验的题目替换原始列表
-        phase2_questions = passed_questions
-
-        # 构建最终 question dicts（本地绑定）
-        bound_questions = []
-        for q_data in phase2_questions:
-            candidate = q_data.get("_candidate")
-            if not candidate:
-                continue
-            _dataset_id = dataset_id or candidate.get("dataset_id", "")
-            _document_id = candidate.get("_source_document_id",
-                                          candidate.get("document_id", ""))
-            _document_name = candidate.get("_source_document_name",
-                                            candidate.get("document_name", ""))
-            _position = candidate.get("position", "")
-            cid = q_data["candidate_id"]
-
-            q = {
-                "question": q_data["retrieval_query"],
-                "retrieval_query": q_data["retrieval_query"],
-                "question_mode": "chunk_exact",
-                "evaluation_type": "chunk_exact",
-                "question_id": f"ce_{snapshot_id}_{cid}",
-                "target_label": q_data["target_label"],
-                "candidate_id": cid,
-                "expected_segment_id": candidate["segment_id"],
-                "expected_content_hash": candidate["content_hash"],
-                "expected_content": candidate.get("content", ""),
-                "dataset_id": _dataset_id,
-                "document_id": _document_id,
-                "document_name": _document_name,
-                "snapshot_id": snapshot_id,
-                "source_position": _position,
-                "source_label": f"doc:{_document_id[:8]} pos:{_position}",
-                "query_style": q_data.get("query_style", "semantic"),
-                "target_fact": q_data.get("target_fact", ""),
-                "retrieval_intent": q_data.get("retrieval_intent", ""),
-                "allowed_modifiers": q_data.get("allowed_modifiers", []),
-                "forbidden_concepts": q_data.get("forbidden_concepts", []),
-                "validation_status": q_data.get("validation_status", "passed"),
-                "validation_errors": q_data.get("validation_errors", []),
-                "generation_plan": q_data.get("generation_plan", ""),
-                "selection_seed": actual_seed,
-            }
-            bound_questions.append(q)
-
-        # 统计 query_style 分布
-        _style_counts = {}
-        for q in bound_questions:
-            _s = q.get("query_style", "semantic")
-            _style_counts[_s] = _style_counts.get(_s, 0) + 1
-
-        # 判断是否 underfilled
-        _final_bound = len(bound_questions)
-        _status = "ok"
-        _doc_errors = list(phase2_errors)
-        if _final_bound < num:
-            _status = "underfilled"
-            _doc_errors.append(
-                f"请求 {num} 题，实际绑定 {_final_bound} 题"
-                f"（首轮返回 {first_returned_count}，校验拒绝 {first_rejected_count}，"
-                f"重试 {retry_attempted_count}，恢复 {retry_recovered_count}）"
+            # 构建概览消息
+            active_phases = []
+            for di in range(total_docs):
+                p = _doc_phases.get(di, "queued")
+                name = active_configs[di].get("document_name", "")[:8]
+                active_phases.append(f"{name}:{p}")
+            overview = " | ".join(active_phases)
+            progress_callback(
+                _completed_docs[0], total_docs,
+                f"[{_completed_docs[0]}/{total_docs}] {overview}",
             )
 
-        all_questions.extend(bound_questions)
-        doc_stats.append({
-            "document_id": doc_id,
-            "document_name": doc_name,
-            "requested": num,
-            "candidate_pool": pool_size,
-            "phase1_planned": len(planned_items),
-            "phase2_first_returned": first_returned_count,
-            "first_rejected": first_rejected_count,
-            "retry_attempted": retry_attempted_count,
-            "retry_recovered": retry_recovered_count,
-            "final_bound": _final_bound,
-            "binding_failed": 0,  # chunk_exact 不涉及 segment 绑定失败
-            "status": _status,
-            "errors": _doc_errors,
-            "query_style_counts": _style_counts,
-            "rejection_diagnostics": rejection_diagnostics,
-        })
+    # ── 并发执行 ──
+    max_workers = max(1, min(max_workers, total_docs))
+    results = [None] * total_docs  # 按原始索引存放
+
+    if max_workers <= 1 or total_docs <= 1:
+        # 串行模式 — phase_callback 直接在主线程调用 Streamlit UI，安全
+        for doc_idx, dc in enumerate(active_configs):
+            try:
+                idx, questions, stat = _generate_single_doc(
+                    doc_idx, dc, api_key, base_url, model,
+                    dataset_id, snapshot_id, actual_seed, timeout,
+                    phase_callback=_serial_phase_callback,
+                )
+                results[idx] = (questions, stat)
+            except Exception as exc:
+                doc_name = dc.get("document_name", dc["document_id"][:12])
+                exc_type = type(exc).__name__
+                results[doc_idx] = ([], {
+                    "document_id": dc["document_id"],
+                    "document_name": doc_name,
+                    "requested": dc["num_questions"],
+                    "candidate_pool": 0,
+                    "phase1_planned": 0, "phase2_first_returned": 0,
+                    "first_rejected": 0, "retry_attempted": 0, "retry_recovered": 0,
+                    "final_bound": 0, "binding_failed": 0,
+                    "status": "worker_exception",
+                    "errors": [f"Worker 异常 [{exc_type}]: {repr(exc)[:200]}"],
+                    "query_style_counts": {}, "rejection_diagnostics": [],
+                })
+    else:
+        # 并发模式 — phase_callback=None，禁止 worker 线程调用 Streamlit UI
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {}
+            for doc_idx, dc in enumerate(active_configs):
+                future = executor.submit(
+                    _generate_single_doc,
+                    doc_idx, dc, api_key, base_url, model,
+                    dataset_id, snapshot_id, actual_seed, timeout,
+                    phase_callback=None,  # worker 线程不调用任何回调
+                )
+                future_to_idx[future] = doc_idx
+
+            for future in as_completed(future_to_idx):
+                doc_idx = future_to_idx[future]
+                dc = active_configs[doc_idx]
+                doc_name = dc.get("document_name", dc["document_id"][:12])
+                try:
+                    idx, questions, stat = future.result()
+                    results[idx] = (questions, stat)
+                except Exception as exc:
+                    exc_type = type(exc).__name__
+                    results[doc_idx] = ([], {
+                        "document_id": dc["document_id"],
+                        "document_name": doc_name,
+                        "requested": dc["num_questions"],
+                        "candidate_pool": 0,
+                        "phase1_planned": 0, "phase2_first_returned": 0,
+                        "first_rejected": 0, "retry_attempted": 0, "retry_recovered": 0,
+                        "final_bound": 0, "binding_failed": 0,
+                        "status": "worker_exception",
+                        "errors": [f"Worker 异常 [{exc_type}]: {repr(exc)[:200]}"],
+                        "query_style_counts": {}, "rejection_diagnostics": [],
+                    })
+                # 主线程汇报进度（安全调用 Streamlit UI）
+                if progress_callback:
+                    _done = sum(1 for r in results if r is not None)
+                    progress_callback(
+                        _done, total_docs,
+                        f"完成 {_done}/{total_docs} 文档：{doc_name}",
+                    )
+
+    # ── 按原始顺序合并结果 ──
+    all_questions = []
+    doc_stats = []
+    for doc_idx in range(total_docs):
+        questions, stat = results[doc_idx]
+        all_questions.extend(questions)
+        doc_stats.append(stat)
 
     if not all_questions:
-        # 构建详细错误信息
         failed_docs = [s for s in doc_stats if s["status"] not in ("ok", "underfilled")]
         if failed_docs:
             detail = "; ".join(
@@ -850,7 +917,7 @@ def generate_chunk_exact_questions_multi_doc(
 
     if progress_callback:
         success_count = sum(1 for s in doc_stats if s["status"] in ("ok", "underfilled"))
-        progress_callback(total_docs * 2, total_docs * 2,
+        progress_callback(total_docs, total_docs,
                           f"生成完成: {len(all_questions)} 道题（{success_count}/{total_docs} 文档成功）")
 
     return all_questions, doc_stats, actual_seed

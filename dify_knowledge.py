@@ -382,9 +382,9 @@ def detect_duplicates(catalog: list[dict]) -> dict[str, list[dict]]:
 # ── 导出 ─────────────────────────────────────────────────────
 
 
-# 导出的列顺序（与需求文档一致）
+# 导出的列顺序（含 document_name，便于按文档出题）
 _EXPORT_COLUMNS = [
-    "segment_id", "position", "document_id", "dataset_id",
+    "segment_id", "position", "document_id", "document_name", "dataset_id",
     "content", "index_node_id", "index_node_hash",
     "tokens", "word_count", "enabled", "status", "content_hash",
 ]
@@ -402,5 +402,204 @@ def export_catalog_csv(catalog: list[dict]) -> bytes:
     writer = csv.DictWriter(output, fieldnames=_EXPORT_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for entry in catalog:
+        writer.writerow(entry)
+    return output.getvalue().encode("utf-8-sig")
+
+
+# ── 全知识库 Catalog ──────────────────────────────────────────
+
+
+def build_full_kb_catalog(
+    api_key: str,
+    base_url: str,
+    dataset_id: str,
+    dataset_name: str = "",
+    progress_callback=None,
+    timeout: int = 30,
+) -> dict:
+    """构建当前知识库全部文档的 chunk catalog。
+
+    对每个文档自动分页拉取全部 segments，单文档失败不中断整体流程。
+
+    Args:
+        api_key: Dify 知识库 API Key（dataset- 开头）
+        base_url: Dify 知识库 API Base URL
+        dataset_id: 知识库 ID
+        dataset_name: 知识库名称（可选，记入 metadata 和每条记录）
+        progress_callback: 进度回调 fn(current_doc_idx, total_docs, doc_name, chunk_count)
+        timeout: 每次 API 请求超时秒数
+
+    Returns:
+        dict: {
+            "catalog": list[dict],       # 全部 chunk 记录
+            "metadata": dict,            # 导出元数据
+            "doc_stats": list[dict],     # 每文档统计
+        }
+    """
+    from datetime import datetime, timezone
+
+    # 1. 拉取全部文档（自动分页）
+    all_docs = list_all_documents(api_key, base_url, dataset_id, timeout=timeout)
+
+    doc_stats = []
+    full_catalog = []
+    exported_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    total_docs = len(all_docs)
+
+    for idx, doc in enumerate(all_docs):
+        doc_id = doc.get("id", "")
+        doc_name = doc.get("name", "未命名")
+        # Dify 文档列表 API 使用 indexing_status 表示处理状态
+        doc_indexing_status = doc.get("indexing_status", "")
+        doc_enabled = doc.get("enabled", True)
+        doc_archived = doc.get("archived", False)
+        doc_status = doc.get("status", "")  # 保留用于诊断展示
+
+        if not doc_id:
+            skipped_count += 1
+            doc_stats.append({
+                "document_id": "",
+                "document_name": doc_name,
+                "status": "skipped",
+                "reason": "缺少 document_id",
+                "chunk_count": 0,
+                "api_fields": {},
+            })
+            continue
+
+        # 构建 API 字段摘要（用于诊断展示）
+        api_fields = {
+            "indexing_status": doc_indexing_status,
+            "enabled": doc_enabled,
+            "archived": doc_archived,
+            "status": doc_status,
+        }
+
+        # 跳过已归档文档
+        if doc_archived:
+            skipped_count += 1
+            doc_stats.append({
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "status": "skipped",
+                "reason": f"已归档 (archived=true)",
+                "chunk_count": 0,
+                "api_fields": api_fields,
+            })
+            if progress_callback:
+                progress_callback(idx + 1, total_docs, doc_name, 0)
+            continue
+
+        # 跳过明确处理失败的文档
+        if doc_indexing_status == "error":
+            skipped_count += 1
+            doc_stats.append({
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "status": "skipped",
+                "reason": f"处理失败 (indexing_status=error)",
+                "chunk_count": 0,
+                "api_fields": api_fields,
+            })
+            if progress_callback:
+                progress_callback(idx + 1, total_docs, doc_name, 0)
+            continue
+
+        # 跳过仍在处理中的文档
+        if doc_indexing_status and doc_indexing_status not in ("completed", "waiting"):
+            skipped_count += 1
+            doc_stats.append({
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "status": "skipped",
+                "reason": f"处理中 (indexing_status={doc_indexing_status})",
+                "chunk_count": 0,
+                "api_fields": api_fields,
+            })
+            if progress_callback:
+                progress_callback(idx + 1, total_docs, doc_name, 0)
+            continue
+
+        # 2. 对该文档分页拉取全部 segments
+        try:
+            all_segs = list_all_segments(
+                api_key, base_url, dataset_id, doc_id,
+                status_filter="", timeout=timeout,
+            )
+            doc_catalog = build_chunk_catalog(
+                all_segs, dataset_id, doc_id, doc_name,
+            )
+            # 确保每条记录都有 document_name
+            for entry in doc_catalog:
+                if not entry.get("document_name"):
+                    entry["document_name"] = doc_name
+
+            chunk_count = len(doc_catalog)
+            full_catalog.extend(doc_catalog)
+            exported_count += 1
+            doc_stats.append({
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "status": "ok",
+                "reason": "" if chunk_count > 0 else "chunks API 返回空列表（文档可能无内容或分页异常）",
+                "chunk_count": chunk_count,
+                "api_fields": api_fields,
+            })
+            if progress_callback:
+                progress_callback(idx + 1, total_docs, doc_name, chunk_count)
+
+        except Exception as exc:
+            failed_count += 1
+            error_msg = str(exc)[:120]
+            doc_stats.append({
+                "document_id": doc_id,
+                "document_name": doc_name,
+                "status": "error",
+                "reason": error_msg,
+                "chunk_count": 0,
+                "api_fields": api_fields,
+            })
+            if progress_callback:
+                progress_callback(idx + 1, total_docs, doc_name, 0)
+
+    metadata = {
+        "export_type": "full_knowledge_base",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "dataset_id": dataset_id,
+        "dataset_name": dataset_name,
+        "total_documents": total_docs,
+        "exported_documents": exported_count,
+        "skipped_documents": skipped_count,
+        "failed_documents": failed_count,
+        "total_chunks": len(full_catalog),
+        "schema_version": "1.0",
+    }
+
+    return {
+        "catalog": full_catalog,
+        "metadata": metadata,
+        "doc_stats": doc_stats,
+    }
+
+
+def export_full_kb_json(full_catalog: list[dict], metadata: dict) -> str:
+    """导出全知识库 catalog 为 JSON（含 metadata 顶层包装）。"""
+    wrapper = {
+        "metadata": metadata,
+        "catalog": full_catalog,
+    }
+    return json.dumps(wrapper, ensure_ascii=False, indent=2)
+
+
+def export_full_kb_csv(full_catalog: list[dict]) -> bytes:
+    """导出全知识库 catalog 为 CSV（字段与单文档 CSV 一致，含 document_name）。"""
+    output = io.StringIO()
+    output.write("﻿")  # BOM
+    writer = csv.DictWriter(output, fieldnames=_EXPORT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for entry in full_catalog:
         writer.writerow(entry)
     return output.getvalue().encode("utf-8-sig")

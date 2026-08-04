@@ -3047,3 +3047,660 @@ class TestRetrievalIntentInQuestionDict:
         assert q["target_fact"] == "历史事实"
         assert q["retrieval_query"] == "历史查询"
         assert q["expected_segment_id"] == "seg_legacy"
+
+
+# ── 文档级并发测试 ────────────────────────────────────────────
+
+
+class TestDocumentConcurrency:
+    """文档级并发生成测试。"""
+
+    def _make_doc_configs(self, n_docs=2, chunks_per_doc=10):
+        """构造多文档配置。"""
+        configs = []
+        for i in range(n_docs):
+            doc_id = f"doc_{i}"
+            candidates = _make_doc_candidates(doc_id, chunks_per_doc, f"文档{i}")
+            configs.append({
+                "document_id": doc_id,
+                "document_name": f"文档{i}",
+                "candidates": candidates,
+                "num_questions": 2,
+            })
+        return configs
+
+    def _mock_llm_factory(self, doc_configs, master_seed=42):
+        """创建 mock LLM 函数，按文档名匹配返回 Phase 1/2 结果。
+
+        Phase 2 的 retrieval_query 使用候选内容的前 4 个字符，确保通过 groundedness 校验。
+        """
+        from chunk_exact_questions import sample_candidate_pool
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        call_count = [0]
+        planned_by_doc = {}
+
+        def _find_doc(prompt):
+            """根据 prompt 中的文档名匹配文档 ID。"""
+            for dc in doc_configs:
+                if dc.get("document_name", "") in prompt:
+                    return dc["document_id"]
+            return None
+
+        def mock_llm(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_phase1 = "规划专家" in prompt
+            matched_doc = _find_doc(prompt)
+
+            if not matched_doc:
+                return "[]"
+
+            pool = pool_by_doc[matched_doc]
+
+            if is_phase1:
+                planned = [c["segment_id"] for c in pool[:2]]
+                planned_by_doc[matched_doc] = planned
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "target_fact": f"事实_{sid}", "retrieval_intent": f"意图_{sid}",
+                     "target_label": "标签",
+                     "allowed_modifiers": [], "forbidden_concepts": [],
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned
+                ])
+            else:
+                planned = planned_by_doc.get(matched_doc, [])
+                # 使用候选内容的前 4 字符作为 retrieval_query，确保通过 groundedness 校验
+                pool_map = {c["segment_id"]: c for c in pool}
+                items = []
+                for sid in planned:
+                    if sid in prompt:
+                        c = pool_map.get(sid, {})
+                        content = c.get("content", "")
+                        # 取内容前 4 个非空字符作为查询（确保 groundedness 通过）
+                        query = content[:4].replace(" ", "")
+                        items.append({"candidate_id": sid, "retrieval_query": query, "target_label": "标签"})
+                return json.dumps(items)
+
+        return mock_llm, call_count
+
+    def test_concurrent_two_docs_return_order(self):
+        """两个文档并发生成，结果按输入文档顺序返回。"""
+        doc_configs = self._make_doc_configs(2)
+        mock_llm, _ = self._mock_llm_factory(doc_configs)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        assert len(questions) == 4
+        assert len(doc_stats) == 2
+        # doc_stats 按输入顺序
+        assert doc_stats[0]["document_id"] == "doc_0"
+        assert doc_stats[1]["document_id"] == "doc_1"
+        # questions 按输入文档顺序
+        q_doc_ids = [q["document_id"] for q in questions]
+        assert q_doc_ids == ["doc_0", "doc_0", "doc_1", "doc_1"]
+
+    def test_concurrent_one_doc_failure_isolated(self):
+        """一个文档 Phase 1 失败不影响另一个文档。"""
+        from chunk_exact_questions import sample_candidate_pool
+        doc_configs = self._make_doc_configs(2)
+
+        pool1, _, _ = sample_candidate_pool(
+            doc_configs[1]["candidates"], 2, "doc_1", 42
+        )
+        planned_doc1 = [c["segment_id"] for c in pool1[:2]]
+        pool1_map = {c["segment_id"]: c for c in pool1}
+
+        def mock_llm(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            is_doc0 = "文档0" in prompt
+            is_doc1 = "文档1" in prompt
+
+            if is_phase1 and is_doc0:
+                raise RuntimeError("LLM 调用失败: 限流")
+            if is_phase1 and is_doc1:
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "target_fact": "事实", "retrieval_intent": "意图",
+                     "target_label": "标签",
+                     "allowed_modifiers": [], "forbidden_concepts": [],
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned_doc1
+                ])
+            if not is_phase1 and is_doc1:
+                items = []
+                for sid in planned_doc1:
+                    if sid in prompt:
+                        c = pool1_map.get(sid, {})
+                        query = c.get("content", "")[:4].replace(" ", "")
+                        items.append({"candidate_id": sid, "retrieval_query": query, "target_label": "标签"})
+                return json.dumps(items)
+            return "[]"
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        assert len(doc_stats) == 2
+        doc0_stat = next(s for s in doc_stats if s["document_id"] == "doc_0")
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc_1")
+        assert doc0_stat["status"] == "phase1_failed"
+        assert doc1_stat["status"] == "ok"
+        assert len(questions) == 2
+        assert all(q["document_id"] == "doc_1" for q in questions)
+
+    def test_concurrency_1_matches_serial(self):
+        """并发数 1 与串行语义一致。"""
+        doc_configs = self._make_doc_configs(2)
+        mock_llm, _ = self._mock_llm_factory(doc_configs)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            q_serial, stats_serial, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=1,
+            )
+
+        assert len(q_serial) == 4
+        assert len(stats_serial) == 2
+        assert all(s["status"] == "ok" for s in stats_serial)
+        # 结果按文档顺序
+        assert q_serial[0]["document_id"] == "doc_0"
+        assert q_serial[2]["document_id"] == "doc_1"
+
+    def test_concurrent_dedup_across_docs(self):
+        """跨文档去重仍正确。"""
+        doc_configs = self._make_doc_configs(2)
+        mock_llm, _ = self._mock_llm_factory(doc_configs)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, _, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        cids = [q["candidate_id"] for q in questions]
+        assert len(cids) == len(set(cids)), "跨文档不应有重复 candidate_id"
+
+    def test_concurrent_doc_stats_correct(self):
+        """并发模式下 doc_stats 统计正确。"""
+        doc_configs = self._make_doc_configs(3)
+        mock_llm, _ = self._mock_llm_factory(doc_configs)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=3,
+            )
+
+        assert len(doc_stats) == 3
+        assert all(s["status"] == "ok" for s in doc_stats)
+        total_final = sum(s["final_bound"] for s in doc_stats)
+        assert total_final == len(questions)
+
+    def test_concurrent_seed_reproducibility(self):
+        """相同种子和 LLM 输出下结果可复现。"""
+        doc_configs = self._make_doc_configs(2)
+        mock_llm1, _ = self._mock_llm_factory(doc_configs, master_seed=42)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm1):
+            q1, s1, seed1 = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        mock_llm2, _ = self._mock_llm_factory(doc_configs, master_seed=42)
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm2):
+            q2, s2, seed2 = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        assert seed1 == seed2
+        assert len(q1) == len(q2)
+        for a, b in zip(q1, q2):
+            assert a["candidate_id"] == b["candidate_id"]
+            assert a["document_id"] == b["document_id"]
+
+    def test_concurrent_worker_exception_isolated(self):
+        """Worker 异常不影响其他文档。"""
+        from chunk_exact_questions import sample_candidate_pool
+        doc_configs = self._make_doc_configs(2)
+
+        pool1, _, _ = sample_candidate_pool(
+            doc_configs[1]["candidates"], 2, "doc_1", 42
+        )
+        planned_doc1 = [c["segment_id"] for c in pool1[:2]]
+        pool1_map = {c["segment_id"]: c for c in pool1}
+
+        def mock_llm(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            is_doc0 = "文档0" in prompt
+            is_doc1 = "文档1" in prompt
+
+            if is_phase1 and is_doc0:
+                raise ValueError("模拟不可预期的 worker 错误")
+            if is_phase1 and is_doc1:
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "target_fact": "事实", "retrieval_intent": "意图",
+                     "target_label": "标签",
+                     "allowed_modifiers": [], "forbidden_concepts": [],
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned_doc1
+                ])
+            if not is_phase1 and is_doc1:
+                items = []
+                for sid in planned_doc1:
+                    if sid in prompt:
+                        c = pool1_map.get(sid, {})
+                        query = c.get("content", "")[:4].replace(" ", "")
+                        items.append({"candidate_id": sid, "retrieval_query": query, "target_label": "标签"})
+                return json.dumps(items)
+            return "[]"
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=42, max_workers=2,
+            )
+
+        assert len(doc_stats) == 2
+        doc0_stat = next(s for s in doc_stats if s["document_id"] == "doc_0")
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc_1")
+        assert doc0_stat["status"] in ("phase1_failed", "worker_exception")
+        assert doc1_stat["status"] == "ok"
+        assert len(questions) == 2
+
+
+# ── 并发线程安全回归测试 ────────────────────────────────────────
+
+
+class TestConcurrentThreadSafety:
+    """并发模式线程安全回归测试。
+
+    验证：
+    1. max_workers=2 时 progress_callback 只在主线程被调用
+    2. 两个文档并发生成均成功
+    3. 一个 worker 失败不影响另一文档
+    4. worker exception 输出包含异常类型
+    5. max_workers=1 的原有行为不变
+    """
+
+    def _build_two_doc_configs(self):
+        """构造两文档配置。"""
+        return [
+            {"document_id": "doc1", "document_name": "文档A",
+             "candidates": _make_doc_candidates("doc1", 20), "num_questions": 2},
+            {"document_id": "doc2", "document_name": "文档B",
+             "candidates": _make_doc_candidates("doc2", 20), "num_questions": 2},
+        ]
+
+    def _build_mock_llm_both_succeed(self, pool_by_doc):
+        """构造 mock LLM，两个文档都成功。"""
+        last_planned = [[]]
+
+        def mock_llm(prompt, *args, **kwargs):
+            is_phase1 = "规划专家" in prompt
+            found = []
+            for doc_id, pool in pool_by_doc.items():
+                for c in pool:
+                    if c["segment_id"] in prompt:
+                        found.append(c["segment_id"])
+            if is_phase1:
+                planned = found[:2]
+                last_planned[0] = planned
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "target_fact": f"事实_{sid}", "target_label": "标签",
+                     "allowed_modifiers": [], "forbidden_concepts": [],
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned
+                ])
+            else:
+                return json.dumps([
+                    {"candidate_id": sid, "retrieval_query": "段内容", "target_label": "标签"}
+                    for sid in last_planned[0] if sid in prompt
+                ])
+
+        return mock_llm
+
+    def test_concurrent_progress_callback_only_from_main_thread(self):
+        """max_workers=2 时，progress_callback 只在主线程被调用。
+
+        这是核心回归测试：验证 worker 线程不会调用 progress_callback。
+        """
+        import threading
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        main_thread_id = threading.main_thread().ident
+        callback_thread_ids = []
+
+        def thread_checking_callback(done, total, message):
+            """记录调用线程 ID 的回调。"""
+            callback_thread_ids.append(threading.current_thread().ident)
+
+        mock_llm = self._build_mock_llm_both_succeed(pool_by_doc)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                progress_callback=thread_checking_callback,
+                max_workers=2,
+            )
+
+        # 两个文档都成功
+        assert len(questions) == 4
+        assert all(s["status"] == "ok" for s in doc_stats)
+
+        # 所有回调都在主线程被调用
+        assert len(callback_thread_ids) > 0, "progress_callback 应该被调用过"
+        assert all(tid == main_thread_id for tid in callback_thread_ids), \
+            f"progress_callback 不应在 worker 线程被调用，发现线程 IDs: {set(callback_thread_ids)}"
+
+    def test_concurrent_two_docs_both_succeed(self):
+        """两个文档并发生成均成功。"""
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        mock_llm = self._build_mock_llm_both_succeed(pool_by_doc)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                max_workers=2,
+            )
+
+        # 两个文档各有 2 题
+        doc1_qs = [q for q in questions if q["document_id"] == "doc1"]
+        doc2_qs = [q for q in questions if q["document_id"] == "doc2"]
+        assert len(doc1_qs) == 2
+        assert len(doc2_qs) == 2
+        assert len(doc_stats) == 2
+        assert all(s["status"] == "ok" for s in doc_stats)
+
+    def test_concurrent_one_worker_failure_isolated(self):
+        """一个 worker 失败不影响另一文档。"""
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        doc2_pool = pool_by_doc["doc2"]
+        doc2_planned = [c["segment_id"] for c in doc2_pool[:2]]
+
+        # doc1 的 LLM 调用抛出异常，doc2 正常
+        call_count = [0]
+        last_planned = [[]]
+
+        def mock_llm(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_phase1 = "规划专家" in prompt
+            # 判断是哪个文档：检查 prompt 中包含哪个文档的候选
+            is_doc1 = any(c["segment_id"] in prompt for c in pool_by_doc["doc1"])
+            is_doc2 = any(c["segment_id"] in prompt for c in pool_by_doc["doc2"])
+
+            if is_doc1:
+                raise RuntimeError("模拟 LLM 调用失败")
+
+            if is_doc2:
+                found = [c["segment_id"] for c in doc2_pool if c["segment_id"] in prompt]
+                if is_phase1:
+                    planned = found[:2]
+                    last_planned[0] = planned
+                    return json.dumps([
+                        {"candidate_id": sid, "query_style": "semantic",
+                         "target_fact": "事实", "target_label": "标签",
+                         "allowed_modifiers": [], "forbidden_concepts": [],
+                         "must_preserve_terms": [], "plan": "说明"}
+                        for sid in planned
+                    ])
+                else:
+                    return json.dumps([
+                        {"candidate_id": sid, "retrieval_query": "段内容", "target_label": "标签"}
+                        for sid in last_planned[0] if sid in prompt
+                    ])
+            return "[]"
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                max_workers=2,
+            )
+
+        # doc1 失败，doc2 成功
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc1")
+        doc2_stat = next(s for s in doc_stats if s["document_id"] == "doc2")
+        assert doc1_stat["status"] == "phase1_failed"
+        assert doc2_stat["status"] == "ok"
+
+        # 只有 doc2 的题目
+        assert len(questions) == 2
+        assert all(q["document_id"] == "doc2" for q in questions)
+
+    def test_worker_exception_contains_type(self):
+        """worker exception 输出包含异常类型名称。"""
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        doc2_pool = pool_by_doc["doc2"]
+
+        # doc1 正常完成，doc2 的 _generate_single_doc 抛出未捕获异常
+        last_planned = [[]]
+        call_count = [0]
+
+        def mock_llm(prompt, *args, **kwargs):
+            call_count[0] += 1
+            is_doc1 = any(c["segment_id"] in prompt for c in pool_by_doc["doc1"])
+            is_doc2 = any(c["segment_id"] in prompt for c in pool_by_doc["doc2"])
+
+            if is_doc2:
+                # 第一次调用（Phase 1）抛出异常
+                is_phase1 = "规划专家" in prompt
+                if is_phase1:
+                    raise RuntimeError("doc2 LLM 连接超时")
+                # Phase 2 也抛出异常
+                raise RuntimeError("doc2 LLM 连接超时")
+
+            if is_doc1:
+                found = [c["segment_id"] for c in pool_by_doc["doc1"] if c["segment_id"] in prompt]
+                is_phase1 = "规划专家" in prompt
+                if is_phase1:
+                    planned = found[:2]
+                    last_planned[0] = planned
+                    return json.dumps([
+                        {"candidate_id": sid, "query_style": "semantic",
+                         "target_fact": "事实", "target_label": "标签",
+                         "allowed_modifiers": [], "forbidden_concepts": [],
+                         "must_preserve_terms": [], "plan": "说明"}
+                        for sid in planned
+                    ])
+                else:
+                    return json.dumps([
+                        {"candidate_id": sid, "retrieval_query": "段内容", "target_label": "标签"}
+                        for sid in last_planned[0] if sid in prompt
+                    ])
+            return "[]"
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                max_workers=2,
+            )
+
+        # doc1 成功，doc2 phase1_failed（LLM 异常被 _generate_single_doc 内部捕获）
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc1")
+        doc2_stat = next(s for s in doc_stats if s["document_id"] == "doc2")
+        assert doc1_stat["status"] == "ok"
+        assert doc2_stat["status"] == "phase1_failed"
+
+        # 错误消息包含有意义的信息（非空白）
+        err_msg = doc2_stat["errors"][0]
+        assert "Phase 1 LLM 调用失败" in err_msg, f"错误消息应包含失败原因: {err_msg}"
+        assert "RuntimeError" in err_msg or "doc2" in err_msg, \
+            f"错误消息应包含异常信息: {err_msg}"
+        # 不允许完全空白（旧 bug）
+        assert err_msg.strip(), f"错误消息不能为空白: {err_msg}"
+
+    def test_worker_unhandled_exception_contains_type(self):
+        """worker 未处理异常（如 copy.deepcopy 失败）输出包含异常类型。"""
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool, _generate_single_doc
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        doc2_pool = pool_by_doc["doc2"]
+
+        # doc2 正常完成
+        last_planned = [[]]
+
+        def mock_llm(prompt, *args, **kwargs):
+            is_doc1 = any(c["segment_id"] in prompt for c in pool_by_doc["doc1"])
+            found = []
+            for doc_id, pool in pool_by_doc.items():
+                for c in pool:
+                    if c["segment_id"] in prompt:
+                        found.append(c["segment_id"])
+            is_phase1 = "规划专家" in prompt
+            if is_phase1:
+                planned = found[:2]
+                last_planned[0] = planned
+                return json.dumps([
+                    {"candidate_id": sid, "query_style": "semantic",
+                     "target_fact": f"事实_{sid}", "target_label": "标签",
+                     "allowed_modifiers": [], "forbidden_concepts": [],
+                     "must_preserve_terms": [], "plan": "说明"}
+                    for sid in planned
+                ])
+            else:
+                return json.dumps([
+                    {"candidate_id": sid, "retrieval_query": "段内容", "target_label": "标签"}
+                    for sid in last_planned[0] if sid in prompt
+                ])
+
+        # Mock _generate_single_doc 让 doc1 抛出未捕获异常
+        original_generate = _generate_single_doc
+        call_count = [0]
+
+        def mock_generate_single_doc(doc_idx, dc, *args, **kwargs):
+            if dc["document_id"] == "doc1":
+                raise RuntimeError("doc1 内部状态错误")
+            return original_generate(doc_idx, dc, *args, **kwargs)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm), \
+             patch("chunk_exact_questions._generate_single_doc", side_effect=mock_generate_single_doc):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                max_workers=2,
+            )
+
+        # doc1 worker_exception，doc2 成功
+        doc1_stat = next(s for s in doc_stats if s["document_id"] == "doc1")
+        doc2_stat = next(s for s in doc_stats if s["document_id"] == "doc2")
+        assert doc1_stat["status"] == "worker_exception"
+        assert doc2_stat["status"] == "ok"
+
+        # 错误消息包含异常类型
+        err_msg = doc1_stat["errors"][0]
+        assert "Worker 异常" in err_msg
+        assert "RuntimeError" in err_msg, f"错误消息应包含异常类型: {err_msg}"
+        # 不允许完全空白（旧 bug）
+        assert err_msg != "Worker 异常:", f"错误消息不能为空白: {err_msg}"
+        # repr(exc) 应包含异常描述
+        assert "doc1 内部状态错误" in err_msg, f"错误消息应包含异常描述: {err_msg}"
+
+    def test_serial_mode_unchanged(self):
+        """max_workers=1 的串行模式行为不变（保留细粒度进度）。"""
+        doc_configs = self._build_two_doc_configs()
+        from chunk_exact_questions import sample_candidate_pool
+
+        master_seed = 42
+        pool_by_doc = {}
+        for dc in doc_configs:
+            pool, _, _ = sample_candidate_pool(
+                dc["candidates"], dc["num_questions"], dc["document_id"], master_seed
+            )
+            pool_by_doc[dc["document_id"]] = pool
+
+        # 记录回调调用次数和消息
+        callback_calls = []
+
+        def tracking_callback(done, total, message):
+            callback_calls.append((done, total, message))
+
+        mock_llm = self._build_mock_llm_both_succeed(pool_by_doc)
+
+        with patch("chunk_exact_questions.call_llm", side_effect=mock_llm):
+            questions, doc_stats, _ = generate_chunk_exact_questions_multi_doc(
+                doc_configs, "key", "url", "model",
+                master_seed=master_seed,
+                progress_callback=tracking_callback,
+                max_workers=1,  # 串行模式
+            )
+
+        # 两个文档都成功
+        assert len(questions) == 4
+        assert all(s["status"] == "ok" for s in doc_stats)
+
+        # 串行模式有细粒度进度（每个文档的 Phase 1/Phase 2 都有回调）
+        # 至少应有：每个文档 1 个 phase1 + 1 个 phase2 + 1 个 completed + 1 个最终完成
+        assert len(callback_calls) >= 4, \
+            f"串行模式应有细粒度进度回调，实际调用 {len(callback_calls)} 次"
+
+        # 验证包含 Phase 1/Phase 2 细粒度信息
+        messages = [msg for _, _, msg in callback_calls]
+        has_phase_info = any("Phase 1" in m or "Phase 2" in m or "phase1" in m or "phase2" in m
+                           for m in messages)
+        assert has_phase_info, "串行模式应包含 Phase 1/Phase 2 细粒度进度"

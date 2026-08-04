@@ -10,8 +10,9 @@ import json
 import re
 from datetime import datetime
 from html import escape
+from pathlib import Path
 
-from judge import compute_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE, TRACK_CHUNK_EXACT, backfill_chunk_exact_topk
+from judge import compute_metrics, compute_chunk_exact_metrics, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_NOT_EVALUABLE, TRACK_CHUNK_EXACT, backfill_chunk_exact_topk
 
 # 敏感字段黑名单
 _SENSITIVE_KEYS = frozenset({
@@ -50,6 +51,102 @@ def _fmt_content(text, max_len=500):
     if len(text) <= max_len:
         return text, False
     return text[:max_len] + "...(截断)", True
+
+
+# 元数据字段：需要从题集 JSONL 回填到报告的字段
+_QUESTION_META_FIELDS = (
+    "query_style", "retrieval_intent", "target_fact", "target_label",
+    "expected_content", "expected_segment_id", "expected_content_hash",
+    "document_id", "document_name", "source_position",
+    "question_id", "question_set_id",
+)
+
+
+def load_question_set_metadata(question_set_ids=None):
+    """加载题集 JSONL，构建 question_set_id + question_id -> 元数据的查找表。
+
+    Args:
+        question_set_ids: 要加载的 question_set_id 集合（None=全部）
+
+    Returns:
+        dict: {(question_set_id, question_id): {field: value, ...}}
+    """
+    from question_generator import QUESTIONS_DIR
+    lookup = {}
+    if not QUESTIONS_DIR.exists():
+        return lookup
+
+    for jsonl_path in sorted(QUESTIONS_DIR.glob("questions_*.jsonl")):
+        manifest_path = jsonl_path.parent / f"{jsonl_path.stem}_manifest.json"
+        # 快速检查 manifest 中的 question_set_id
+        if question_set_ids and manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                m_qsid = manifest.get("question_set_id", "")
+                if m_qsid and m_qsid not in question_set_ids:
+                    continue
+            except Exception:
+                pass
+
+        try:
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        q = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    qsid = q.get("question_set_id", "")
+                    qid = q.get("question_id", "")
+                    if question_set_ids and qsid not in question_set_ids:
+                        continue
+                    meta = {}
+                    for field in _QUESTION_META_FIELDS:
+                        val = q.get(field)
+                        if val not in (None, ""):
+                            meta[field] = val
+                    if qsid and qid:
+                        lookup[(qsid, qid)] = meta
+                    elif qsid:
+                        # 按 question 文本回退匹配
+                        question_text = q.get("question", "")
+                        if question_text:
+                            lookup[(qsid, question_text)] = meta
+        except Exception:
+            continue
+
+    return lookup
+
+
+def _lookup_question_meta(judge_result, question_meta_lookup):
+    """从 judge_result 或题集查找表中获取完整元数据。
+
+    优先级：judge_result 已有字段 > question_meta_lookup > 空字符串
+    """
+    qsid = judge_result.get("question_set_id", "")
+    qid = judge_result.get("question_id", "")
+    question_text = judge_result.get("question", "")
+
+    # 从查找表获取
+    from_lookup = {}
+    if qsid and qid:
+        from_lookup = question_meta_lookup.get((qsid, qid), {})
+    if not from_lookup and qsid and question_text:
+        from_lookup = question_meta_lookup.get((qsid, question_text), {})
+
+    # 合并：judge_result 优先，查找表补充
+    result = {}
+    for field in _QUESTION_META_FIELDS:
+        val = judge_result.get(field)
+        if val not in (None, ""):
+            result[field] = val
+        elif field in from_lookup:
+            result[field] = from_lookup[field]
+        else:
+            result[field] = ""
+    return result
 
 
 # ====== 诊断数据构建 ======
@@ -599,10 +696,776 @@ def _render_local_analysis_table(groups, group_label):
     return html
 
 
+# ====== 一致性校验 ======
+
+def validate_report_consistency(all_judge_results, run_data_list, cumulative_metrics):
+    """校验报告各处 n 与 TopK 指标是否一致。
+
+    Returns:
+        list[str]: 不一致的错误描述列表，空列表表示一致。
+    """
+    errors = []
+    valid = [r for r in all_judge_results if "error" not in r]
+
+    # 全局 chunk_exact
+    ce_all = [r for r in valid if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+    ce_eval = [r for r in ce_all
+               if r.get("retrieval_evaluable", True) is not False
+               and r.get("retrieval_top1_hit") is not None]
+    ce_n = len(ce_eval)
+
+    # 累计指标中的 chunk_exact
+    cm_ce_n = cumulative_metrics.get("chunk_exact_evaluable_count", 0)
+    if ce_n != cm_ce_n:
+        errors.append(
+            f"Chunk Exact 可评测数不一致：全局统计 {ce_n}，累计指标 {cm_ce_n}"
+        )
+
+    # TopK 一致性（命中数不能超过样本数）
+    for k_field in ("retrieval_top1_hit", "retrieval_top3_hit", "retrieval_top5_hit", "retrieval_top10_hit"):
+        hit_count = sum(r.get(k_field, 0) for r in ce_eval)
+        if hit_count > ce_n:
+            errors.append(
+                f"Chunk Exact {k_field} 命中数 {hit_count} 超过可评测样本数 {ce_n}"
+            )
+
+    # 各 run 的 chunk_exact 分母一致性
+    for rd in run_data_list:
+        rs = rd.get("run_status", {})
+        run = rd.get("run", {})
+        qsid = rs.get("question_set_id") or run.get("question_set_id", "") or "未知"
+        _jr = rs.get("judge_results", [])
+        _ce = [r for r in _jr if "error" not in r
+               and r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+        _ce_eval = [r for r in _ce
+                    if r.get("retrieval_evaluable", True) is not False
+                    and r.get("retrieval_top1_hit") is not None]
+        run_n = len(_ce_eval)
+        run_t1 = sum(r.get("retrieval_top1_hit", 0) for r in _ce_eval)
+        run_t3 = sum(r.get("retrieval_top3_hit", 0) for r in _ce_eval)
+        run_t5 = sum(r.get("retrieval_top5_hit", 0) for r in _ce_eval)
+        if run_t1 > run_n:
+            errors.append(f"Run {qsid[:12]}: Top1 命中 {run_t1} > 可评测 {run_n}")
+        if run_t3 > run_n:
+            errors.append(f"Run {qsid[:12]}: Top3 命中 {run_t3} > 可评测 {run_n}")
+        if run_t5 > run_n:
+            errors.append(f"Run {qsid[:12]}: Top5 命中 {run_t5} > 可评测 {run_n}")
+
+    return errors
+
+
+# ====== 分层指标 ======
+
+def _build_layered_metrics(chunk_exact_evaluable, sample_lookup,
+                           question_meta_lookup=None):
+    """按 query_style 和 source document 构建分层指标。
+
+    Args:
+        chunk_exact_evaluable: 可评测的 chunk_exact judged results
+        sample_lookup: {trace_id: processed_sample}
+        question_meta_lookup: {(qsid, qid): meta} 题集元数据查找表
+
+    Returns:
+        dict: {
+            "by_query_style": {style: {n, t1, t3, t5, t10}},
+            "by_doc": {doc_label: {n, t1, t3, t5, t10}},
+        }
+    """
+    question_meta_lookup = question_meta_lookup or {}
+
+    def _group_by(key_fn):
+        groups = {}
+        for r in chunk_exact_evaluable:
+            key = key_fn(r) or "未知"
+            groups.setdefault(key, []).append(r)
+        result = {}
+        for key, items in groups.items():
+            n = len(items)
+            result[key] = {
+                "n": n,
+                "t1": sum(r.get("retrieval_top1_hit", 0) for r in items),
+                "t3": sum(r.get("retrieval_top3_hit", 0) for r in items),
+                "t5": sum(r.get("retrieval_top5_hit", 0) for r in items),
+                "t10": sum(r.get("retrieval_top10_hit", 0) for r in items),
+            }
+        return result
+
+    def _query_style_label(r):
+        # 优先从 judged result 读取（新数据可能已有）
+        style = r.get("query_style", "")
+        if style:
+            return style
+        # 回退：从题集 JSONL 元数据查找
+        meta = _lookup_question_meta(r, question_meta_lookup)
+        return meta.get("query_style", "")
+
+    by_style = _group_by(_query_style_label)
+
+    def _doc_label(r):
+        tid = r.get("trace_id", "")
+        sample = sample_lookup.get(tid, {})
+        # 优先级：
+        # 1. judged result 的 document_name（chunk_exact 题目绑定的源文档）
+        # 2. 题集 JSONL 元数据的 document_name
+        # 3. processed sample 的 source_file_name（题集文件名，非源文档）
+        # 4. processed sample 的 document_name
+        doc_name = r.get("document_name", "")
+        if not doc_name:
+            meta = _lookup_question_meta(r, question_meta_lookup)
+            doc_name = meta.get("document_name", "")
+        if not doc_name:
+            doc_name = sample.get("source_file_name", "")
+        if not doc_name:
+            doc_name = sample.get("document_name", "")
+        if not doc_name:
+            return "未知"
+        # 提取文件扩展名
+        for ext in (".docx", ".xlsx", ".xls", ".pdf", ".csv", ".txt", ".md"):
+            if doc_name.lower().endswith(ext):
+                return f"{doc_name} ({ext[1:]})"
+        return doc_name
+
+    by_doc = _group_by(_doc_label)
+
+    return {"by_query_style": by_style, "by_doc": by_doc}
+
+
+def _render_layered_table(groups, group_label, threshold=5):
+    """渲染分层指标表。样本数 < threshold 时标注仅供观察。"""
+    if not groups:
+        return f'<p class="section-note">暂无按{group_label}分组的数据</p>'
+
+    parts = [
+        '<table><tr><th>', group_label, '</th><th>n</th><th>Top1</th><th>Top3</th>'
+        '<th>Top5</th><th>Top10</th><th>Top1→Top3 排名损失</th></tr>'
+    ]
+    for key in sorted(groups.keys(), key=lambda k: groups[k]["n"], reverse=True):
+        g = groups[key]
+        n = g["n"]
+        t1, t3, t5, t10 = g["t1"], g["t3"], g["t5"], g["t10"]
+        loss = t3 - t1  # Top1→Top3 排名损失
+        obs_note = ' <span class="warn">（仅供观察）</span>' if n < threshold else ''
+        parts.append(
+            f'<tr><td>{_safe_str(key)}{obs_note}</td><td>{n}</td>'
+            f'<td>{t1}/{n} ({_pct(t1/n)})</td>'
+            f'<td>{t3}/{n} ({_pct(t3/n)})</td>'
+            f'<td>{t5}/{n} ({_pct(t5/n)})</td>'
+            f'<td>{t10}/{n} ({_pct(t10/n)})</td>'
+            f'<td>{loss}</td></tr>'
+        )
+    parts.append('</table>')
+    return "".join(parts)
+
+
+# ====== 排名诊断 ======
+
+def _build_ranking_diagnostics(chunk_exact_evaluable):
+    """构建互斥排名分布。"""
+    buckets = {"top1": 0, "top2_3": 0, "top4_5": 0, "top6_10": 0, "top10_miss": 0}
+    for r in chunk_exact_evaluable:
+        t1 = r.get("retrieval_top1_hit", 0)
+        t10 = r.get("retrieval_top10_hit", 0)
+        pos = r.get("hit_evidence_position")
+        if t1:
+            buckets["top1"] += 1
+        elif pos is not None and 2 <= pos <= 3:
+            buckets["top2_3"] += 1
+        elif pos is not None and 4 <= pos <= 5:
+            buckets["top4_5"] += 1
+        elif pos is not None and 6 <= pos <= 10:
+            buckets["top6_10"] += 1
+        elif t10:
+            buckets["top6_10"] += 1
+        else:
+            buckets["top10_miss"] += 1
+    return buckets
+
+
+# ====== 失败样本证据对照 ======
+
+def _build_top1_miss_evidence(chunk_exact_evaluable, sample_lookup,
+                               question_meta_lookup=None, max_samples=50):
+    """为 Top1 未中样本构建完整证据对照。
+
+    Returns:
+        list[dict]: 每项包含完整诊断信息和全部 TopK 返回结果
+    """
+    question_meta_lookup = question_meta_lookup or {}
+    records = []
+    for r in chunk_exact_evaluable:
+        if r.get("retrieval_top1_hit", 0) == 1:
+            continue
+        tid = r.get("trace_id", "")
+        sample = sample_lookup.get(tid, {})
+        pos = r.get("hit_evidence_position")
+        t10 = r.get("retrieval_top10_hit", 0)
+
+        # 确定分类
+        if not t10:
+            category = "Top10 未召回"
+        elif pos is not None and 6 <= pos <= 10:
+            category = "Top6-10 排序偏后"
+        elif pos is not None and 4 <= pos <= 5:
+            category = "Top4-5 排序偏后"
+        elif pos is not None and 2 <= pos <= 3:
+            category = "Top2-3 排序偏后"
+        else:
+            category = "排序偏后"
+
+        # 从 judge_result + 题集查找表获取完整元数据
+        meta = _lookup_question_meta(r, question_meta_lookup)
+
+        # expected_content：优先 judge_result，回退 sample，再回退题集
+        expected_content = (r.get("expected_content")
+                            or sample.get("expected_content", "")
+                            or meta.get("expected_content", ""))
+        expected_content_hash = (r.get("expected_content_hash", "")
+                                 or meta.get("expected_content_hash", ""))
+        expected_segment_id = (r.get("expected_segment_id", "")
+                               or meta.get("expected_segment_id", ""))
+
+        # 实际返回结果（全部 TopK，不截断）
+        sample_found = bool(tid and tid in sample_lookup)
+        retrieval_results = sample.get("retrieval_results", []) if sample_found else []
+        actual_returned_count = len(retrieval_results)
+        top_results = []
+        for i, rr in enumerate(retrieval_results):
+            top_results.append({
+                "rank": i + 1,
+                "segment_id": rr.get("segment_id", ""),
+                "document_name": rr.get("document_name", ""),
+                "position": rr.get("position"),
+                "content": rr.get("content", ""),
+                "score": rr.get("score"),
+                "is_expected": (rr.get("segment_id", "") == expected_segment_id),
+            })
+
+        # 分数比较
+        expected_score = None
+        top1_score = None
+        for tr in top_results:
+            if tr["is_expected"]:
+                expected_score = tr["score"]
+            if tr["rank"] == 1:
+                top1_score = tr["score"]
+
+        # score 与排序一致性检查
+        score_rank_mismatch = False
+        if len(top_results) >= 2 and top_results[0]["score"] is not None and top_results[1]["score"] is not None:
+            if top_results[1]["score"] > top_results[0]["score"]:
+                score_rank_mismatch = True
+
+        # 元数据缺失标记
+        missing_fields = []
+        for field in ("query_style", "retrieval_intent", "target_fact", "expected_content"):
+            if not meta.get(field):
+                missing_fields.append(field)
+
+        # review_label: 历史数据无此字段时默认 unreviewed
+        review_label = r.get("review_label", "unreviewed")
+        valid_labels = {"unreviewed", "query_ambiguous", "near_neighbor",
+                        "chunk_boundary", "ranking_error", "gold_error",
+                        "insufficient_evidence"}
+        if review_label not in valid_labels:
+            review_label = "unreviewed"
+
+        records.append({
+            "query": meta.get("query_style") and r.get("question") or r.get("retrieval_query") or r.get("question", ""),
+            "query_style": meta.get("query_style", ""),
+            "retrieval_intent": meta.get("retrieval_intent", ""),
+            "target_fact": meta.get("target_fact", ""),
+            "target_label": meta.get("target_label", "") or r.get("target_label", ""),
+            "question_id": r.get("question_id", ""),
+            "trace_id": tid,
+            "expected_segment_id": expected_segment_id,
+            "expected_content_hash": expected_content_hash,
+            "expected_content": expected_content,
+            "expected_doc": meta.get("document_name", "") or r.get("document_name", ""),
+            "expected_doc_id": meta.get("document_id", "") or r.get("document_id", ""),
+            "expected_source_position": meta.get("source_position", "") or r.get("source_position", ""),
+            "hit_position": pos,
+            "category": category,
+            "review_label": review_label,
+            "top_results": top_results,
+            "actual_returned_count": actual_returned_count,
+            "sample_found": sample_found,
+            "expected_score": expected_score,
+            "top1_score": top1_score,
+            "score_rank_mismatch": score_rank_mismatch,
+            "missing_fields": missing_fields,
+        })
+        if len(records) >= max_samples:
+            break
+    return records
+
+
+def _render_top1_miss_evidence(records, total_count, config_top_k=10):
+    """渲染 Top1 未中样本证据对照（完整诊断版）。"""
+    if not records:
+        return '<p class="section-note">无 Top1 未命中样本</p>'
+
+    parts = []
+    shown = len(records)
+    if total_count > shown:
+        parts.append(f'<p class="section-note">共 {total_count} 条 Top1 未命中，显示前 {shown} 条</p>')
+    else:
+        parts.append(f'<p class="section-note">共 {total_count} 条 Top1 未命中</p>')
+
+    # review_label 计数表
+    label_counts = {}
+    for rec in records:
+        label = rec.get("review_label", "unreviewed")
+        label_counts[label] = label_counts.get(label, 0) + 1
+    _label_display = {
+        "unreviewed": "未审核",
+        "query_ambiguous": "查询歧义",
+        "near_neighbor": "近邻 chunk",
+        "chunk_boundary": "切块边界",
+        "ranking_error": "排序异常",
+        "gold_error": "金标准错误",
+        "insufficient_evidence": "信息不足",
+    }
+    parts.append('<details open><summary><strong>诊断分类统计</strong></summary>')
+    parts.append('<table><tr><th>分类</th><th>数量</th></tr>')
+    for label in ("unreviewed", "query_ambiguous", "near_neighbor", "chunk_boundary",
+                  "ranking_error", "gold_error", "insufficient_evidence"):
+        cnt = label_counts.get(label, 0)
+        if cnt > 0:
+            display = _label_display.get(label, label)
+            parts.append(f'<tr><td>{display}</td><td>{cnt}</td></tr>')
+    parts.append('</table></details>')
+
+    for i, rec in enumerate(records, 1):
+        parts.append(f'<div class="diag-card">')
+
+        # ── 诊断头 ──
+        parts.append(f'<h4>#{i} {_safe_str(rec["query"][:80])}</h4>')
+        parts.append(f'<div class="diag-meta">')
+        parts.append(f'<span>分类: <strong>{_safe_str(rec["category"])}</strong></span>')
+        if rec["query_style"]:
+            parts.append(f'<span>query_style: <code>{_safe_str(rec["query_style"])}</code></span>')
+        if rec["target_label"]:
+            parts.append(f'<span>标签: {_safe_str(rec["target_label"])}</span>')
+        parts.append(f'<span>配置 TopK: {config_top_k} | 实际返回: {rec["actual_returned_count"]}</span>')
+        parts.append(f'</div>')
+
+        # review_label
+        _rl = rec.get("review_label", "unreviewed")
+        _rl_display = _label_display.get(_rl, _rl)
+        parts.append(f'<div class="diag-meta">')
+        parts.append(f'<span>诊断分类: <strong>{_safe_str(_rl_display)}</strong> <code>({_safe_str(_rl)})</code></span>')
+        parts.append(f'</div>')
+
+        # 可折叠 ID
+        parts.append(f'<div class="diag-meta">')
+        parts.append(f'<span>question_id: <code>{_safe_str(rec["question_id"] or "缺失")}</code></span>')
+        parts.append(f'<span>trace_id: <code>{_safe_str(rec["trace_id"][:16])}…</code></span>')
+        parts.append(f'</div>')
+
+        # ── 用户检索意图 ──
+        if rec["retrieval_intent"]:
+            parts.append(f'<p><strong>用户检索意图 (retrieval_intent)</strong>: {_safe_str(rec["retrieval_intent"])}</p>')
+        elif "retrieval_intent" in rec.get("missing_fields", []):
+            parts.append(f'<p><strong>用户检索意图</strong>: <span class="warn">缺失</span></p>')
+
+        # ── 证据锚点 ──
+        if rec["target_fact"]:
+            parts.append(f'<p><strong>标准答案/证据锚点 (target_fact)</strong>: {_safe_str(rec["target_fact"])}</p>')
+        elif "target_fact" in rec.get("missing_fields", []):
+            parts.append(f'<p><strong>证据锚点</strong>: <span class="warn">缺失</span></p>')
+
+        # ── 紧凑对照区：目标 vs Top1（默认展开） ──
+        top_results = rec.get("top_results", [])
+        top1_chunk = top_results[0] if top_results else None
+        exp_seg = _safe_str(rec["expected_segment_id"])
+        exp_hash = _safe_str(rec["expected_content_hash"][:16]) if rec["expected_content_hash"] else "缺失"
+        exp_doc = _safe_str(rec["expected_doc"] or "缺失")
+        exp_pos = _safe_str(rec["expected_source_position"]) if rec["expected_source_position"] else ""
+        exp_content = rec.get("expected_content", "")
+        exp_summary = exp_content[:300] + ("..." if len(exp_content) > 300 else "")
+
+        # 只在目标不是 Top1 时展示对照
+        target_is_top1 = (top1_chunk and top1_chunk.get("is_expected", False))
+        if not target_is_top1:
+            parts.append('<div style="display:flex;gap:16px;margin:12px 0;flex-wrap:wrap;">')
+
+            # 左侧：目标 chunk
+            parts.append('<div style="flex:1;min-width:300px;border:2px solid #28a745;border-radius:8px;padding:12px;background:#f0fff0;">')
+            parts.append('<strong>🎯 目标 chunk</strong>')
+            _rank_str = f'Top{rec["hit_position"]}' if rec["hit_position"] else "未命中"
+            _score_str = f'{rec["expected_score"]:.4f}' if rec["expected_score"] is not None else "N/A"
+            parts.append(f'<div class="diag-meta">rank: <strong>{_rank_str}</strong> | score: {_score_str}'
+                         f' | 文档: {exp_doc}'
+                         f'{" | pos:" + exp_pos if exp_pos else ""}</div>')
+            parts.append(f'<div class="diag-meta">segment: <code title="{exp_seg}">{_safe_str(_short_id(exp_seg))}</code>'
+                         f' | hash: <code>{exp_hash}</code></div>')
+            if rec["target_fact"]:
+                parts.append(f'<p style="margin:6px 0;font-size:0.9em;"><em>{_safe_str(rec["target_fact"])}</em></p>')
+            if exp_content:
+                parts.append(f'<div class="gold-evidence" style="max-height:150px;overflow:auto;font-size:0.85em;">{_safe_str(exp_summary)}</div>')
+            else:
+                parts.append(f'<p class="warn" style="font-size:0.85em;">⚠️ expected_content 缺失</p>')
+            parts.append('</div>')
+
+            # 右侧：Top1 chunk
+            if top1_chunk:
+                t1_seg = _safe_str(top1_chunk.get("segment_id", ""))
+                t1_doc = _safe_str(top1_chunk.get("document_name", "")[:30])
+                t1_score = top1_chunk.get("score")
+                t1_score_str = f"{t1_score:.4f}" if isinstance(t1_score, (int, float)) else "N/A"
+                t1_content = top1_chunk.get("content", "")
+                t1_summary = t1_content[:300] + ("..." if len(t1_content) > 300 else "")
+
+                parts.append('<div style="flex:1;min-width:300px;border:2px solid #dc3545;border-radius:8px;padding:12px;background:#fff5f5;">')
+                parts.append(f'<strong>📊 实际 Top1</strong>')
+                parts.append(f'<div class="diag-meta">rank: <strong>Top1</strong> | score: {t1_score_str}'
+                             f' | 文档: {t1_doc}</div>')
+                parts.append(f'<div class="diag-meta">segment: <code title="{t1_seg}">{_safe_str(_short_id(t1_seg))}</code></div>')
+                if t1_content:
+                    parts.append(f'<div class="gold-evidence" style="max-height:150px;overflow:auto;font-size:0.85em;">{_safe_str(t1_summary)}</div>')
+                else:
+                    parts.append(f'<p class="no-result" style="font-size:0.85em;">无内容</p>')
+                parts.append('</div>')
+
+            parts.append('</div>')  # flex container end
+
+        # ── 目标 chunk 完整信息（始终显示） ──
+        parts.append(f'<p><strong>目标 chunk</strong>: '
+                     f'segment <code title="{exp_seg}">{_safe_str(_short_id(exp_seg)) or "缺失"}</code>'
+                     f' | content_hash: <code>{exp_hash}</code>'
+                     f' | 文档: {exp_doc}'
+                     f'{" | pos:" + exp_pos if exp_pos else ""}'
+                     f' | 命中 rank: <strong>{"Top" + str(rec["hit_position"]) if rec["hit_position"] else "未命中"}</strong>'
+                     f'</p>')
+
+        # 分数信息
+        if rec["expected_score"] is not None:
+            score_parts = [f'目标 score: <strong>{rec["expected_score"]:.4f}</strong>']
+            if rec["top1_score"] is not None:
+                diff = rec["top1_score"] - rec["expected_score"]
+                score_parts.append(f'Top1 score: {rec["top1_score"]:.4f}')
+                score_parts.append(f'差值 (Top1-目标): {diff:+.4f}')
+            parts.append(f'<p>{" | ".join(score_parts)}</p>')
+        elif rec["hit_position"] is not None:
+            parts.append(f'<p class="section-note">目标在 TopK 中但无 Dify 返回 score</p>')
+
+        # ── expected_content 展示 ──
+        if exp_content:
+            summary = exp_content[:500] + ("..." if len(exp_content) > 500 else "")
+            parts.append(f'<details><summary><strong>目标证据 (expected_content)</strong> — {len(exp_content)} 字</summary>')
+            parts.append(f'<div class="gold-evidence">{_safe_str(exp_content)}</div>')
+            parts.append(f'</details>')
+            # 折叠状态下的摘要
+            parts.append(f'<div class="gold-evidence" style="max-height:120px;overflow:hidden;">{_safe_str(summary)}</div>')
+        else:
+            parts.append(f'<p><strong>目标证据 (expected_content)</strong>: <span class="warn">⚠️ 缺失 — 无法校验证据完整性</span></p>')
+
+        # 证据完整性校验
+        integrity_notes = []
+        if not exp_content:
+            integrity_notes.append("expected_content 缺失，无法校验证据完整性")
+        if not rec["expected_content_hash"]:
+            integrity_notes.append("expected_content_hash 缺失")
+        if rec.get("missing_fields"):
+            integrity_notes.append(f"题集元数据缺失字段: {', '.join(rec['missing_fields'])}")
+        if integrity_notes:
+            parts.append(f'<p class="section-note">⚠️ 需复核: {"; ".join(integrity_notes)}</p>')
+
+        # ── 实际返回列表（完整 TopK） ──
+        if top_results:
+            returned = rec["actual_returned_count"]
+            short_warning = ""
+            if returned < config_top_k:
+                short_warning = (f' <span class="warn">⚠️ 实际只返回 {returned} 条，'
+                                 f'本次 Top{config_top_k} 为不足窗口口径</span>')
+
+            parts.append(f'<p><strong>实际返回 Top{returned}</strong>:{short_warning}</p>')
+            parts.append(f'<p class="section-note">Dify 返回 score（字段排序语义未知，以 rank 为准）</p>')
+
+            if rec.get("score_rank_mismatch"):
+                parts.append(f'<p class="warn">⚠️ Top2 score 高于 Top1，score 与返回排序不一致，不可仅凭 score 判断 rerank</p>')
+
+            parts.append('<table class="retrieval-table"><tr><th>Rank</th><th>Segment ID</th>'
+                         '<th>来源文档</th><th>Score</th><th>内容摘要</th></tr>')
+            for tr in top_results:
+                is_exp = tr.get("is_expected", False)
+                row_class = ' class="hit"' if is_exp else ""
+                marker = ' 🎯 <strong>目标 chunk</strong>' if is_exp else ""
+                seg_id = _safe_str(tr["segment_id"])
+                seg_short = _safe_str(_short_id(seg_id))
+                doc_name = _safe_str(tr.get("document_name", "")[:20])
+                score = tr.get("score")
+                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else "N/A"
+                content = tr.get("content", "")
+                content_summary = content[:200] + ("..." if len(content) > 200 else "")
+
+                parts.append(
+                    f'<tr{row_class}><td>{tr["rank"]}{marker}</td>'
+                    f'<td title="{seg_id}"><code>{seg_short}</code></td>'
+                    f'<td>{doc_name}</td>'
+                    f'<td>{score_str}</td>'
+                    f'<td class="content-cell">{_safe_str(content_summary)}</td></tr>'
+                )
+            parts.append('</table>')
+
+            # 可展开的完整 content
+            for tr in top_results:
+                if tr.get("content") and len(tr["content"]) > 200:
+                    is_exp = tr.get("is_expected", False)
+                    label = f'Rank {tr["rank"]}{"（目标 chunk）" if is_exp else ""} 完整内容'
+                    parts.append(f'<details><summary>{label} — {len(tr["content"])} 字</summary>')
+                    parts.append(f'<div class="gold-evidence">{_safe_str(tr["content"])}</div>')
+                    parts.append('</details>')
+        elif not rec.get("sample_found", True):
+            # Judge 显示命中但 processed sample 未找到 — provenance 关联问题
+            parts.append('<p class="warn">⚠️ 报告未找到该 run 的 processed retrieval evidence，无法展示返回列表。'
+                         '这是 provenance/export error，不是 Dify retrieval miss。</p>')
+        else:
+            parts.append('<p class="no-result">processed sample 存在但无检索结果</p>')
+
+        parts.append('</div>')
+
+    return "".join(parts)
+
+
+# ====== 数据质量旗标 ======
+
+def _build_quality_flags(all_judge_results, sample_lookup, run_data_list):
+    """构建数据质量旗标列表。"""
+    flags = []
+    valid = [r for r in all_judge_results if "error" not in r]
+    ce_all = [r for r in valid if r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+
+    # missing_binding
+    missing_binding = [r for r in ce_all if r.get("chunk_exact_status") == "missing_binding"]
+    if missing_binding:
+        flags.append(("warning", f"missing_binding: {len(missing_binding)} 条 chunk_exact 样本缺少 expected_segment_id/content_hash"))
+
+    # no_trace
+    no_trace = [r for r in ce_all if r.get("chunk_exact_status") == "no_trace"]
+    if no_trace:
+        flags.append(("warning", f"no_trace: {len(no_trace)} 条 chunk_exact 样本未关联真实 trace"))
+
+    # no_retrieval
+    no_retrieval = [r for r in ce_all if r.get("chunk_exact_status") == "no_retrieval"]
+    if no_retrieval:
+        flags.append(("warning", f"no_retrieval: {len(no_retrieval)} 条 chunk_exact 样本无检索结果"))
+
+    # 缺少 retrieval_intent / target_fact
+    missing_intent = sum(1 for r in ce_all if not r.get("retrieval_intent"))
+    missing_fact = sum(1 for r in ce_all if not r.get("target_fact"))
+    if missing_intent > 0:
+        flags.append(("info", f"缺少 retrieval_intent: {missing_intent}/{len(ce_all)} 条（历史题集可能无此字段）"))
+    if missing_fact > 0:
+        flags.append(("info", f"缺少 target_fact: {missing_fact}/{len(ce_all)} 条"))
+
+    # 实际返回数少于配置 TopK
+    for rd in run_data_list:
+        rs = rd.get("run_status", {})
+        run = rd.get("run", {})
+        qsid = rs.get("question_set_id") or run.get("question_set_id", "")
+        _jr = rs.get("judge_results", [])
+        short_return = sum(1 for r in _jr
+                           if r.get("evaluation_track") == TRACK_CHUNK_EXACT
+                           and "error" not in r
+                           and len(r.get("retrieval_results", [])) < 5)
+        if short_return > 0:
+            flags.append(("warning", f"Run {_short_id(qsid)}: {short_return} 条样本实际返回结果少于 5 条"))
+
+    return flags
+
+
+def _render_quality_flags(flags):
+    """渲染数据质量旗标。"""
+    if not flags:
+        return '<p class="section-note">未发现数据质量问题</p>'
+    parts = ['<ul>']
+    for level, msg in flags:
+        css = ' class="warn"' if level == "warning" else ""
+        icon = "⚠️" if level == "warning" else "ℹ️"
+        parts.append(f'<li{css}>{icon} {_safe_str(msg)}</li>')
+    parts.append('</ul>')
+    return "".join(parts)
+
+
+# ====== AI 分析包 ======
+
+def build_ai_analysis_markdown(config, cumulative_metrics, chunk_exact_evaluable,
+                               sample_lookup, layered, ranking_diag, top1_miss_records,
+                               top1_miss_total, quality_flags, consistency_errors):
+    """生成面向 GPT/LLM 上传的 Markdown 分析包。"""
+    lines = []
+    config_name = config.get("config_name", "")
+    config_id = config.get("config_id", "")
+
+    lines.append("# RAG 评测 AI 分析包")
+    lines.append(f"\n配置方案: {config_name} ({config_id})")
+    lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 1. 实验口径与配置
+    lines.append("\n---\n## 1. 实验口径与配置\n")
+    lines.append(f"- question_set_id: {', '.join(r.get('question_set_id', '') for r in chunk_exact_evaluable[:3]) or '未知'}")
+    lines.append(f"- question_mode: chunk_exact")
+    lines.append(f"- evaluation_type: chunk_exact")
+    lines.append(f"- 可评测样本数: {len(chunk_exact_evaluable)}")
+    ce_t1 = sum(r.get("retrieval_top1_hit", 0) for r in chunk_exact_evaluable)
+    ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in chunk_exact_evaluable)
+    ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in chunk_exact_evaluable)
+    ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
+    n = len(chunk_exact_evaluable)
+    lines.append(f"- Top1: {ce_t1}/{n} ({_pct(ce_t1/n)})")
+    lines.append(f"- Top3: {ce_t3}/{n} ({_pct(ce_t3/n)})")
+    lines.append(f"- Top5: {ce_t5}/{n} ({_pct(ce_t5/n)})")
+    lines.append(f"- Top10: {ce_t10}/{n} ({_pct(ce_t10/n)})")
+
+    if consistency_errors:
+        lines.append("\n⚠️ 一致性校验错误:")
+        for err in consistency_errors:
+            lines.append(f"  - {err}")
+
+    # 2. 分层指标
+    lines.append("\n---\n## 2. 分层指标\n")
+    lines.append("### 按 query_style")
+    lines.append("| query_style | n | Top1 | Top3 | Top5 | Top10 |")
+    lines.append("|---|---|---|---|---|---|")
+    for style, g in sorted(layered["by_query_style"].items(), key=lambda x: x[1]["n"], reverse=True):
+        sn = g["n"]
+        obs = " (仅供观察)" if sn < 5 else ""
+        lines.append(f"| {style}{obs} | {sn} | {g['t1']}/{sn} ({_pct(g['t1']/sn)}) | {g['t3']}/{sn} ({_pct(g['t3']/sn)}) | {g['t5']}/{sn} ({_pct(g['t5']/sn)}) | {g['t10']}/{sn} ({_pct(g['t10']/sn)}) |")
+
+    lines.append("\n### 按 source document")
+    lines.append("| 文档 | n | Top1 | Top3 | Top5 | Top10 |")
+    lines.append("|---|---|---|---|---|---|")
+    for doc, g in sorted(layered["by_doc"].items(), key=lambda x: x[1]["n"], reverse=True):
+        dn = g["n"]
+        obs = " (仅供观察)" if dn < 5 else ""
+        lines.append(f"| {doc}{obs} | {dn} | {g['t1']}/{dn} ({_pct(g['t1']/dn)}) | {g['t3']}/{dn} ({_pct(g['t3']/dn)}) | {g['t5']}/{dn} ({_pct(g['t5']/dn)}) | {g['t10']}/{dn} ({_pct(g['t10']/dn)}) |")
+
+    # 3. 排名诊断
+    lines.append("\n---\n## 3. 排名诊断\n")
+    lines.append("| 分桶 | 数量 | 占比 |")
+    lines.append("|---|---|---|")
+    total = sum(ranking_diag.values()) or 1
+    for bucket, label in [("top1", "Top1 命中"), ("top2_3", "第 2-3 位首次命中"),
+                          ("top4_5", "第 4-5 位首次命中"), ("top6_10", "第 6-10 位首次命中"),
+                          ("top10_miss", "Top10 未命中")]:
+        c = ranking_diag[bucket]
+        lines.append(f"| {label} | {c} | {_pct(c/total)} |")
+
+    lines.append("\n**指标含义说明：**")
+    lines.append("- TopK Hit = 严格命中同一 Dify segment_id / content_hash（机器判定，非语义匹配）")
+    lines.append("- Top10 命中但 Top1 未中 → 候选已召回，排序或相近块区分待分析（不自动等于 rerank 故障）")
+    lines.append("- Top10 未中 → 优先排查 query、embedding、chunk、候选召回或金标准")
+    lines.append("- score 仅为 Dify 返回字段，rank 才是最终排序依据")
+    lines.append("- 以上为诊断方向，不是确定因果")
+
+    # 4. Top1 未中样本（完整对照）
+    lines.append("\n---\n## 4. Top1 未中样本证据对照\n")
+    # 元数据缺失统计
+    meta_missing = sum(1 for r in top1_miss_records if r.get("missing_fields"))
+    if meta_missing:
+        lines.append(f"⚠️ 缺失元数据 {meta_missing} 条（题集 JSONL 中无 query_style/retrieval_intent 字段）\n")
+    if top1_miss_records:
+        lines.append(f"共 {top1_miss_total} 条 Top1 未命中，展示前 {len(top1_miss_records)} 条\n")
+        for i, rec in enumerate(top1_miss_records[:20], 1):
+            lines.append(f"### #{i} {rec['query'][:80]}")
+            lines.append(f"- 分类: **{rec['category']}**")
+            lines.append(f"- question_id: `{rec.get('question_id', '') or '缺失'}`")
+            lines.append(f"- trace_id: `{rec.get('trace_id', '')[:16]}…`")
+            if rec["query_style"]:
+                lines.append(f"- query_style: {rec['query_style']}")
+            else:
+                lines.append(f"- query_style: 缺失")
+            if rec["retrieval_intent"]:
+                lines.append(f"- 用户检索意图: {rec['retrieval_intent']}")
+            else:
+                lines.append(f"- 用户检索意图: 缺失")
+            if rec["target_fact"]:
+                lines.append(f"- 证据锚点: {rec['target_fact']}")
+            else:
+                lines.append(f"- 证据锚点: 缺失")
+            if rec["target_label"]:
+                lines.append(f"- 标签: {rec['target_label']}")
+            lines.append(f"- expected segment: `{rec['expected_segment_id'] or '缺失'}`")
+            lines.append(f"- expected content_hash: `{(rec['expected_content_hash'] or '缺失')[:16]}`")
+            lines.append(f"- 来源文档: {rec['expected_doc'] or '缺失'}"
+                         + (f" (pos:{rec['expected_source_position']})" if rec.get('expected_source_position') else ""))
+            lines.append(f"- 命中 rank: {'Top' + str(rec['hit_position']) if rec['hit_position'] else '未命中'}")
+            if rec["expected_score"] is not None:
+                lines.append(f"- 目标 score: {rec['expected_score']:.4f}")
+                if rec["top1_score"] is not None:
+                    diff = rec["top1_score"] - rec["expected_score"]
+                    lines.append(f"- Top1 score: {rec['top1_score']:.4f} | 差值: {diff:+.4f}")
+            lines.append(f"- 实际返回: {rec['actual_returned_count']} 条")
+            # expected_content 摘要
+            exp_content = rec.get("expected_content", "")
+            if exp_content:
+                lines.append(f"- 目标证据摘要（{len(exp_content)} 字）: {exp_content[:400]}{'...' if len(exp_content) > 400 else ''}")
+            else:
+                lines.append(f"- 目标证据: ⚠️ 缺失 expected_content")
+            if rec.get("missing_fields"):
+                lines.append(f"- ⚠️ 需复核: 元数据缺失 {', '.join(rec['missing_fields'])}")
+            # 实际返回列表
+            if rec["top_results"]:
+                returned = rec["actual_returned_count"]
+                short_note = ""
+                if returned < 10:
+                    short_note = f" ⚠️ 实际只返回 {returned} 条，Top10 为不足窗口口径"
+                lines.append(f"- 实际返回 Top{returned}{short_note}:")
+                for tr in rec["top_results"]:
+                    score_str = f"{tr['score']:.4f}" if tr["score"] is not None else "N/A"
+                    marker = " 🎯 目标chunk" if tr.get("is_expected") else ""
+                    content_preview = tr.get("content", "")[:100]
+                    lines.append(f"  - #{tr['rank']}: `{tr['segment_id']}` score={score_str} | {content_preview}{marker}")
+                if rec.get("score_rank_mismatch"):
+                    lines.append(f"  - ⚠️ Top2 score > Top1，score 与排序不一致")
+            elif not rec.get("sample_found", True):
+                lines.append(f"- ⚠️ 报告未找到该 run 的 processed retrieval evidence，无法展示返回列表（provenance/export error，非 Dify retrieval miss）")
+            lines.append("")
+    else:
+        lines.append("无 Top1 未命中样本\n")
+
+    # 5. Top10 未中样本
+    top10_miss = [r for r in top1_miss_records if r["category"] == "Top10 未召回"]
+    lines.append("\n---\n## 5. Top10 未中样本\n")
+    if top10_miss:
+        lines.append(f"共 {len(top10_miss)} 条 Top10 完全未召回\n")
+        for i, rec in enumerate(top10_miss[:10], 1):
+            lines.append(f"#{i} `{rec['query'][:50]}` | expected: `{_short_id(rec['expected_segment_id'])}` | doc: {rec['expected_doc']}")
+    else:
+        lines.append("无 Top10 完全未召回样本\n")
+
+    # 6. 数据质量旗标
+    lines.append("\n---\n## 6. 数据质量旗标\n")
+    if quality_flags:
+        for level, msg in quality_flags:
+            icon = "⚠️" if level == "warning" else "ℹ️"
+            lines.append(f"- {icon} {msg}")
+    else:
+        lines.append("未发现数据质量问题")
+
+    # 7. 分析任务说明
+    lines.append("\n---\n## 7. 分析任务说明\n")
+    lines.append("请基于以上证据，区分以下诊断方向并提出实验建议：")
+    lines.append("")
+    lines.append("1. **query 质量** — retrieval_intent 是否合理、是否过于具体或过于宽泛")
+    lines.append("2. **chunk 边界** — expected chunk 是否包含完整答案、是否因分块导致信息碎片化")
+    lines.append("3. **candidate recall** — Top10 未命中说明目标 chunk 未被召回，检查 embedding 或混合检索配置")
+    lines.append("4. **rerank 排序** — Top10 命中但 Top1 未中说明召回正确但排序靠后，检查 rerank 模型或相似候选区分")
+    lines.append("5. **相似条款竞争** — 多个相似 chunk 竞争排名，检查 disambiguating query_style 的命中率")
+    lines.append("")
+    lines.append("**不要仅凭 Top1 数值下结论。** 请按影响优先级提出最多 5 条下一步实验建议。")
+    lines.append("")
+    lines.append("每条建议请包含：问题诊断、影响范围（样本数/占比）、建议操作、预期效果。")
+
+    return "\n".join(lines)
+
+
 # ====== HTML 报告 ======
 
 def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics,
-                          all_judge_results, export_scope="", sample_lookup=None):
+                          all_judge_results, export_scope="", sample_lookup=None,
+                          provenance_info=None):
     """生成自包含 HTML 评测报告。"""
     # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
     for r in all_judge_results:
@@ -699,6 +1562,8 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
   .metric-card .label {{ font-size: 0.85em; color: #666; margin-top: 4px; }}
   .hit {{ color: #28a745; font-weight: 600; }}
   .miss {{ color: #dc3545; font-weight: 600; }}
+  tr.hit {{ background: #d4edda !important; }}
+  tr.hit td {{ border-color: #28a745; }}
   .warn {{ color: #ffc107; }}
   .info-box {{ background: #e7f3ff; border: 1px solid #b3d7ff; border-radius: 6px;
                padding: 12px 16px; margin: 12px 0; font-size: 0.9em; }}
@@ -782,14 +1647,26 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
 </table>
 """)
 
+    # 题集元数据查找表（用于分层指标、证据对照回填 query_style、document_name 等）
+    question_meta_lookup = {}
+
     # chunk_exact 摘要卡片
     if chunk_exact_evaluable:
+        ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
         html_parts.append(f"""
 <div class="metric-grid">
   <div class="metric-card"><div class="value">{ce_n}/{track_counts['chunk_exact']}</div><div class="label">chunk_exact 可评测</div></div>
   <div class="metric-card"><div class="value">{ce_t1}/{ce_n} ({_pct(ce_t1/ce_n)})</div><div class="label">Top1</div></div>
   <div class="metric-card"><div class="value">{ce_t3}/{ce_n} ({_pct(ce_t3/ce_n)})</div><div class="label">Top3</div></div>
   <div class="metric-card"><div class="value">{ce_t5}/{ce_n} ({_pct(ce_t5/ce_n)})</div><div class="label">Top5</div></div>
+  <div class="metric-card"><div class="value">{ce_t10}/{ce_n} ({_pct(ce_t10/ce_n)})</div><div class="label">Top10</div></div>
+</div>
+<div class="info-box">
+  <strong>指标含义说明：</strong><br>
+  • <strong>TopK Hit</strong> = 严格命中同一 Dify segment_id / content_hash（机器判定，非语义匹配）<br>
+  • <strong>Top10 命中但 Top1 未命中</strong> → 候选已召回，排序或相近块区分待分析（不自动等于 rerank 故障）<br>
+  • <strong>Top10 未命中</strong> → 优先排查 query、embedding、chunk、候选召回或金标准<br>
+  • <strong>score</strong> 仅为 Dify 返回字段，<strong>rank</strong> 才是最终排序依据
 </div>
 """)
         if chunk_exact_unevaluable:
@@ -801,6 +1678,14 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
             html_parts.append(
                 f'<p class="section-note">不可评测 {len(chunk_exact_unevaluable)} 条 — {"、".join(ue_parts)}</p>'
             )
+
+    # 一致性校验
+    consistency_errors = validate_report_consistency(all_judge_results, run_data_list, cumulative_metrics)
+    if consistency_errors:
+        err_items = "".join(f"<li>❌ {_safe_str(e)}</li>" for e in consistency_errors)
+        html_parts.append(
+            f'<div class="warn-box"><strong>⚠️ 一致性校验失败</strong><ul>{err_items}</ul></div>'
+        )
 
     # 2. 配置与运行信息
     html_parts.append("<h2>2. 配置与运行信息</h2>")
@@ -1002,26 +1887,31 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
         for rd in run_data_list:
             run = rd["run"]
             rs = rd["run_status"]
-            m = rd.get("metrics") or {}
             qs = _safe_str(rs.get("question_set_name") or run.get("question_set_name", "") or "旧版题集")
             qsid = rs.get("question_set_id") or run.get("question_set_id", "") or ""
             qsid_short = _short_id(qsid)
 
-            ce_count = m.get("chunk_exact_track_count", 0)
+            # 直接从该 run 的 judge_results 计算 chunk_exact 指标
+            # （不依赖 per-run metrics dict 中可能缺失的 count 字段）
+            _run_jr = rs.get("judge_results", [])
+            _run_ce = [r for r in _run_jr if "error" not in r
+                       and r.get("evaluation_track") == TRACK_CHUNK_EXACT]
+            ce_count = len(_run_ce)
             if ce_count == 0:
                 continue
 
-            ce_eval_n = m.get("chunk_exact_evaluable_count", 0)
-            ce_t1 = m.get("chunk_exact_top1_hit_count", 0)
-            ce_t3 = m.get("chunk_exact_top3_hit_count", 0)
-            ce_t5 = m.get("chunk_exact_top5_hit_count", 0)
-            ce_t10 = m.get("chunk_exact_top10_hit_count", 0)
-            ce_miss10 = sum(1 for r in chunk_exact_evaluable
-                            if r.get("question_set_id") == qsid
-                            and r.get("retrieval_top10_hit", 0) == 0)
-            ce_sort = sum(1 for r in chunk_exact_evaluable
-                          if r.get("question_set_id") == qsid
-                          and r.get("retrieval_top1_hit", 0) == 0
+            _run_ce_eval = [r for r in _run_ce
+                            if r.get("retrieval_evaluable", True) is not False
+                            and r.get("retrieval_top1_hit") is not None]
+            ce_eval_n = len(_run_ce_eval)
+            ce_t1 = sum(r.get("retrieval_top1_hit", 0) for r in _run_ce_eval)
+            ce_t3 = sum(r.get("retrieval_top3_hit", 0) for r in _run_ce_eval)
+            ce_t5 = sum(r.get("retrieval_top5_hit", 0) for r in _run_ce_eval)
+            ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in _run_ce_eval)
+            ce_miss10 = sum(1 for r in _run_ce_eval
+                            if r.get("retrieval_top10_hit", 0) == 0)
+            ce_sort = sum(1 for r in _run_ce_eval
+                          if r.get("retrieval_top1_hit", 0) == 0
                           and r.get("retrieval_top5_hit", 0) == 1)
 
             html_parts.append(
@@ -1034,6 +1924,68 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
                 f'<td>{ce_miss10}</td><td>{ce_sort}</td></tr>'
             )
         html_parts.append("</table>")
+
+    # ── 5.5 分析诊断（chunk_exact 专属） ──
+    if chunk_exact_evaluable:
+        html_parts.append("<h2>5.5 分析诊断</h2>")
+
+        # 实验可比性声明
+        all_qsid_set = {r.get("question_set_id", "") for r in chunk_exact_evaluable if r.get("question_set_id")}
+        all_modes = {r.get("question_mode", "") for r in chunk_exact_evaluable}
+        all_eval_types = {r.get("evaluation_type", "") for r in chunk_exact_evaluable}
+        html_parts.append('<div class="info-box">')
+        html_parts.append('<strong>实验可比性声明</strong><br>')
+        html_parts.append(f'question_set_id: {", ".join(sorted(all_qsid_set)) or "未知"}<br>')
+        html_parts.append(f'question_mode: {", ".join(sorted(all_modes)) or "未知"}<br>')
+        html_parts.append(f'evaluation_type: {", ".join(sorted(all_eval_types)) or "未知"}<br>')
+        html_parts.append(f'可直接比较的 run: 本配置方案下 {len(config_runs)} 次运行<br>')
+        html_parts.append('<span class="warn">⚠️ 不同题集、不同 Judge 轨道、不同知识库 snapshot 不得直接比较</span>')
+        html_parts.append('</div>')
+
+        # 加载题集元数据（用于分层指标和证据对照回填 query_style、document_name 等）
+        all_qsid = {r.get("question_set_id", "") for r in chunk_exact_evaluable if r.get("question_set_id")}
+        question_meta_lookup = load_question_set_metadata(all_qsid or None)
+
+        # 分层指标
+        layered = _build_layered_metrics(chunk_exact_evaluable, sample_lookup, question_meta_lookup)
+        html_parts.append("<h3>按 query_style 分层</h3>")
+        html_parts.append(_render_layered_table(layered["by_query_style"], "query_style"))
+        html_parts.append("<h3>按 source document 分层</h3>")
+        html_parts.append(_render_layered_table(layered["by_doc"], "文档"))
+
+        # 排名诊断
+        ranking_diag = _build_ranking_diagnostics(chunk_exact_evaluable)
+        rn = sum(ranking_diag.values()) or 1
+        html_parts.append("<h3>排名诊断（互斥分布）</h3>")
+        html_parts.append('<table><tr><th>分桶</th><th>数量</th><th>占比</th></tr>')
+        for bucket, label in [("top1", "Top1 命中"), ("top2_3", "第 2-3 位首次命中"),
+                              ("top4_5", "第 4-5 位首次命中"), ("top6_10", "第 6-10 位首次命中"),
+                              ("top10_miss", "Top10 未命中")]:
+            c = ranking_diag[bucket]
+            html_parts.append(f'<tr><td>{label}</td><td>{c}</td><td>{_pct(c/rn)}</td></tr>')
+        html_parts.append('</table>')
+        html_parts.append(
+            '<div class="info-box"><strong>诊断方向说明：</strong><br>'
+            '• Top10 命中但 Top1 未中 → 排序/rerank 或相似候选区分问题<br>'
+            '• Top10 未中 → 候选召回、query、chunk 或 embedding 问题<br>'
+            '• 以上为诊断方向，不是确定因果</div>'
+        )
+
+        # Top1 未中样本证据对照
+        meta_hit = sum(1 for r in chunk_exact_evaluable
+                       if _lookup_question_meta(r, question_meta_lookup).get("query_style"))
+        meta_miss = len(chunk_exact_evaluable) - meta_hit
+
+        top1_miss_records = _build_top1_miss_evidence(
+            chunk_exact_evaluable, sample_lookup, question_meta_lookup)
+        top1_miss_total = sum(1 for r in chunk_exact_evaluable if r.get("retrieval_top1_hit", 0) == 0)
+        html_parts.append("<h3>Top1 未中样本证据对照</h3>")
+        if meta_miss > 0:
+            html_parts.append(
+                f'<p class="section-note">ℹ️ 题集元数据回填: {meta_hit}/{len(chunk_exact_evaluable)} 条成功'
+                f'，{meta_miss} 条缺失元数据（历史题集可能无 query_style/retrieval_intent 字段）</p>'
+            )
+        html_parts.append(_render_top1_miss_evidence(top1_miss_records, top1_miss_total))
 
     # 6. 运行详情
     html_parts.append("<h2>6. 运行详情</h2>")
@@ -1128,11 +2080,36 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
                                  "排序问题（Top1 未命中但更高排名命中，说明相关内容被排到较低位置）",
                                  show_details=True)
 
-    # 9. 数据质量
+    # 9. 数据质量与质量旗标
+    quality_flags = _build_quality_flags(all_judge_results, sample_lookup, run_data_list)
+
+    # 计算 processed sample 关联统计
+    ce_with_sample = sum(1 for r in chunk_exact_evaluable if sample_lookup.get(r.get("trace_id", "")))
+    ce_without_sample = len(chunk_exact_evaluable) - ce_with_sample
+
     html_parts.append("<h2>9. 数据质量与可审计信息</h2><ul>")
     html_parts.append(f'<li>Judge 错误结果: <strong>{len(error_results)}</strong> 条</li>')
     html_parts.append(f'<li>不可评测样本（缺少金标准证据）: <strong>{len(not_evaluable_results)}</strong> 条</li>')
     html_parts.append(f'<li>无检索结果的样本: <strong>{no_retrieval_results_count}</strong> 条</li>')
+
+    # processed sample 关联统计
+    html_parts.append(f'<li>Chunk Exact 成功关联 processed sample: <strong>{ce_with_sample}/{len(chunk_exact_evaluable)}</strong></li>')
+    if ce_without_sample > 0:
+        html_parts.append(f'<li class="warn">⚠️ 未找到 processed sample 的 chunk_exact 样本: <strong>{ce_without_sample}</strong> 条（provenance 关联失败，非 Dify retrieval miss）</li>')
+
+    # processed source 摘要
+    if provenance_info:
+        source_paths = provenance_info.get("source_paths", {})
+        if source_paths:
+            html_parts.append('<li>Processed 来源文件:')
+            html_parts.append('<ul>')
+            for path_str, count in source_paths.items():
+                # 只显示文件名，不泄露完整路径
+                fname = Path(path_str).name if path_str else "未知"
+                html_parts.append(f'<li><code>{_safe_str(fname)}</code> ({count} samples)</li>')
+            html_parts.append('</ul></li>')
+        if provenance_info.get("fallback_count", 0) > 0:
+            html_parts.append(f'<li class="warn">⚠️ {provenance_info["fallback_count"]} 个 run 未找到 processed 文件（历史 fallback）</li>')
 
     # chunk_exact 不可评测状态
     if chunk_exact_unevaluable:
@@ -1146,6 +2123,18 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     no_trace = [r for r in all_judge_results if not r.get("trace_id")]
     if no_trace:
         html_parts.append(f'<li class="warn">缺少 trace_id 的结果: <strong>{len(no_trace)}</strong> 条</li>')
+
+    # 质量旗标
+    if quality_flags:
+        for level, msg in quality_flags:
+            css = ' class="warn"' if level == "warning" else ""
+            icon = "⚠️" if level == "warning" else "ℹ️"
+            html_parts.append(f'<li{css}>{icon} {_safe_str(msg)}</li>')
+
+    # 一致性校验结果
+    if consistency_errors:
+        for err in consistency_errors:
+            html_parts.append(f'<li class="warn">❌ {_safe_str(err)}</li>')
 
     if error_results:
         html_parts.append('</ul><h3>Judge 错误详情（前 10 条）</h3><table>')
@@ -1161,6 +2150,47 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     # 附录：Chunk Exact 样本明细
     if chunk_exact_all:
         _render_chunk_exact_sample_appendix(html_parts, all_judge_results, sample_lookup)
+
+    # AI 分析包下载（嵌入 HTML 中，通过 JS 触发下载）
+    if chunk_exact_evaluable:
+        _layered = _build_layered_metrics(chunk_exact_evaluable, sample_lookup, question_meta_lookup)
+        _ranking_diag = _build_ranking_diagnostics(chunk_exact_evaluable)
+        _top1_miss_records = _build_top1_miss_evidence(
+            chunk_exact_evaluable, sample_lookup, question_meta_lookup)
+        _top1_miss_total = sum(1 for r in chunk_exact_evaluable if r.get("retrieval_top1_hit", 0) == 0)
+        _quality_flags = _build_quality_flags(all_judge_results, sample_lookup, run_data_list)
+        ai_md = build_ai_analysis_markdown(
+            config, cumulative_metrics, chunk_exact_evaluable,
+            sample_lookup, _layered, _ranking_diag,
+            _top1_miss_records, _top1_miss_total,
+            _quality_flags, consistency_errors,
+        )
+        import base64
+        ai_md_b64 = base64.b64encode(ai_md.encode("utf-8")).decode("ascii")
+        html_parts.append(f"""
+<div class="no-print" style="margin-top:30px; padding:16px; background:#f0f7ff; border:1px solid #b3d7ff; border-radius:8px;">
+  <strong>📥 下载 AI 分析包</strong>
+  <p style="font-size:0.9em; color:#555;">Markdown 格式，面向 GPT/LLM 上传分析。包含实验口径、分层指标、排名诊断、失败样本对照和分析任务说明。</p>
+  <button onclick="downloadAIAnalysis()" style="padding:8px 16px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer;">
+    下载 AI 分析包（Markdown）
+  </button>
+</div>
+<script>
+function downloadAIAnalysis() {{
+  var b64 = "{ai_md_b64}";
+  var bytes = atob(b64);
+  var blob = new Blob([bytes], {{type: "text/markdown;charset=utf-8"}});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = "ai_analysis_{_safe_str(config_name)[:20]}.md";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}}
+</script>
+""")
 
     html_parts.append("</body></html>")
     return "".join(html_parts)

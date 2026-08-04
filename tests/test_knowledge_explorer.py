@@ -26,12 +26,17 @@ from dify_knowledge import (
     list_datasets,
     list_documents,
     list_segments,
+    list_all_documents,
+    list_all_segments,
     retrieve,
     compute_content_hash,
     build_chunk_catalog,
     detect_duplicates,
     export_catalog_json,
     export_catalog_csv,
+    export_full_kb_json,
+    export_full_kb_csv,
+    build_full_kb_catalog,
     check_connection,
     _EXPORT_COLUMNS,
 )
@@ -716,3 +721,532 @@ class TestRetrieve:
         )
         with pytest.raises(RuntimeError, match="无效或已过期"):
             retrieve("dataset-abc123def456", "http://localhost/v1", "ds1", "q")
+
+
+# ── build_full_kb_catalog ──────────────────────────────────────
+
+
+def _sample_docs_page1():
+    """返回第 1 页文档列表。"""
+    return {
+        "data": [
+            {"id": "doc_a", "name": "文档A.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 1000},
+            {"id": "doc_b", "name": "文档B.docx", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 2000},
+        ],
+        "has_more": False,
+        "total": 2,
+    }
+
+
+def _sample_docs_with_skipped():
+    """返回包含需跳过文档的列表。"""
+    return {
+        "data": [
+            {"id": "doc_ok", "name": "正常文档.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 500},
+            {"id": "doc_archived", "name": "已归档文档.pdf", "indexing_status": "completed", "enabled": True, "archived": True, "word_count": 300},
+            {"id": "doc_error", "name": "失败文档.pdf", "indexing_status": "error", "enabled": True, "archived": False, "word_count": 100},
+        ],
+        "has_more": False,
+        "total": 3,
+    }
+
+
+def _sample_segments_for_doc(doc_id, count=3):
+    """为指定文档生成 segment 数据。"""
+    return [
+        {
+            "id": f"seg_{doc_id}_{i:03d}",
+            "position": i + 1,
+            "document_id": doc_id,
+            "content": f"文档 {doc_id} 的第 {i+1} 段内容。",
+            "index_node_id": f"node_{doc_id}_{i}",
+            "index_node_hash": f"hash_{doc_id}_{i}",
+            "tokens": 50 + i,
+            "word_count": 10 + i,
+            "enabled": True,
+            "status": "completed",
+        }
+        for i in range(count)
+    ]
+
+
+class TestBuildFullKbCatalog:
+    """测试全知识库 catalog 构建。"""
+
+    @patch("dify_knowledge.requests.get")
+    def test_two_docs_multi_page_chunks(self, mock_get):
+        """两个文档、每文档多页 chunks 时，导出总数正确。"""
+        # 第 1 次调用：list_all_documents (page 1)
+        # 第 2 次调用：list_all_segments doc_a page 1
+        # 第 3 次调用：list_all_segments doc_a page 2
+        # 第 4 次调用：list_all_segments doc_b page 1
+        call_count = [0]
+
+        def side_effect(url, **kwargs):
+            call_count[0] += 1
+            params = kwargs.get("params", {})
+            if "/documents" in url and "/segments" not in url:
+                # list_documents
+                return _mock_response({
+                    "data": [
+                        {"id": "doc_a", "name": "文档A.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 1000},
+                        {"id": "doc_b", "name": "文档B.docx", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 2000},
+                    ],
+                    "has_more": False,
+                    "total": 2,
+                })
+            elif "/segments" in url and "doc_a" in url:
+                all_segs_a = _sample_segments_for_doc("doc_a", 3)
+                if params.get("page") == 1:
+                    return _mock_response({
+                        "data": all_segs_a[:2],
+                        "has_more": True,
+                        "total": 3,
+                    })
+                else:
+                    return _mock_response({
+                        "data": all_segs_a[2:],
+                        "has_more": False,
+                        "total": 3,
+                    })
+            elif "/segments" in url and "doc_b" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc_b", 2),
+                    "has_more": False,
+                    "total": 2,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("dataset-key", "http://localhost/v1", "ds1", "测试知识库")
+
+        assert result["metadata"]["total_documents"] == 2
+        assert result["metadata"]["exported_documents"] == 2
+        assert result["metadata"]["skipped_documents"] == 0
+        assert result["metadata"]["failed_documents"] == 0
+        assert result["metadata"]["total_chunks"] == 3 + 2  # doc_a: 3, doc_b: 2
+        assert len(result["catalog"]) == 5
+        assert result["metadata"]["dataset_name"] == "测试知识库"
+        assert result["metadata"]["export_type"] == "full_knowledge_base"
+
+    @patch("dify_knowledge.requests.get")
+    def test_one_doc_failure_others_exported(self, mock_get):
+        """一个文档 API 失败时，其他文档仍被导出且失败被记录。"""
+        call_idx = [0]
+
+        def side_effect(url, **kwargs):
+            call_idx[0] += 1
+            params = kwargs.get("params", {})
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc_ok", "name": "正常文档.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 500},
+                        {"id": "doc_fail", "name": "失败文档.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 800},
+                    ],
+                    "has_more": False,
+                    "total": 2,
+                })
+            elif "/segments" in url and "doc_ok" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc_ok", 2),
+                    "has_more": False,
+                    "total": 2,
+                })
+            elif "/segments" in url and "doc_fail" in url:
+                return _mock_response({"error": "internal error"}, status_code=500)
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("dataset-key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["exported_documents"] == 1
+        assert result["metadata"]["failed_documents"] == 1
+        assert result["metadata"]["total_chunks"] == 2
+        assert len(result["catalog"]) == 2
+
+        failed_stats = [s for s in result["doc_stats"] if s["status"] == "error"]
+        assert len(failed_stats) == 1
+        assert failed_stats[0]["document_name"] == "失败文档.pdf"
+        assert "HTTP 500" in failed_stats[0]["reason"]
+
+    @patch("dify_knowledge.requests.get")
+    def test_skipped_archived_and_error_docs(self, mock_get):
+        """已归档和处理失败的文档被跳过，completed 文档正常导出。"""
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response(_sample_docs_with_skipped())
+            elif "/segments" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc_ok", 1),
+                    "has_more": False,
+                    "total": 1,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("dataset-key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["total_documents"] == 3
+        assert result["metadata"]["exported_documents"] == 1
+        assert result["metadata"]["skipped_documents"] == 2
+        assert result["metadata"]["total_chunks"] == 1
+
+        skipped = [s for s in result["doc_stats"] if s["status"] == "skipped"]
+        assert len(skipped) == 2
+        skip_names = {s["document_name"] for s in skipped}
+        assert "已归档文档.pdf" in skip_names
+        assert "失败文档.pdf" in skip_names
+        # 每个 skipped 文档有明确原因
+        for s in skipped:
+            assert s["reason"] != ""
+            assert "api_fields" in s
+
+    @patch("dify_knowledge.requests.get")
+    def test_each_chunk_has_document_name(self, mock_get):
+        """每个 chunk 都包含 document_name 和完整 content。"""
+        mock_get.return_value = _mock_response({
+            "data": [
+                {"id": "doc_x", "name": "合同模板.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 500},
+            ],
+            "has_more": False,
+            "total": 1,
+        })
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc_x", "name": "合同模板.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 500},
+                    ],
+                    "has_more": False,
+                    "total": 1,
+                })
+            elif "/segments" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc_x", 2),
+                    "has_more": False,
+                    "total": 2,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("dataset-key", "http://localhost/v1", "ds1", "测试库")
+
+        for entry in result["catalog"]:
+            assert entry["document_name"] == "合同模板.pdf"
+            assert entry["dataset_id"] == "ds1"
+            assert entry["content"] != ""
+            assert len(entry["content"]) > 0
+
+    @patch("dify_knowledge.requests.get")
+    def test_no_api_key_in_catalog_or_metadata(self, mock_get):
+        """JSON/CSV/日志不含 dataset API key 或 secret。"""
+        secret_key = "dataset-SUPERSECRET1234567890"
+
+        mock_get.return_value = _mock_response({
+            "data": [
+                {"id": "doc1", "name": "test.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 100},
+            ],
+            "has_more": False,
+            "total": 1,
+        })
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "test.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 100},
+                    ],
+                    "has_more": False,
+                    "total": 1,
+                })
+            elif "/segments" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc1", 1),
+                    "has_more": False,
+                    "total": 1,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog(secret_key, "http://localhost/v1", "ds1")
+
+        # 检查 catalog 不含 key
+        json_str = export_full_kb_json(result["catalog"], result["metadata"])
+        assert secret_key not in json_str
+
+        csv_bytes = export_full_kb_csv(result["catalog"]).decode("utf-8-sig")
+        assert secret_key not in csv_bytes
+
+        # 检查每条记录不含 key
+        for entry in result["catalog"]:
+            assert "api_key" not in entry
+            assert secret_key not in str(entry)
+
+    @patch("dify_knowledge.requests.get")
+    def test_progress_callback_called(self, mock_get):
+        """progress_callback 被正确调用。"""
+        mock_get.return_value = _mock_response({
+            "data": [
+                {"id": "doc1", "name": "doc1.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 100},
+                {"id": "doc2", "name": "doc2.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 200},
+            ],
+            "has_more": False,
+            "total": 2,
+        })
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "doc1.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 100},
+                        {"id": "doc2", "name": "doc2.pdf", "indexing_status": "completed", "enabled": True, "archived": False, "word_count": 200},
+                    ],
+                    "has_more": False,
+                    "total": 2,
+                })
+            elif "/segments" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc1", 1),
+                    "has_more": False,
+                    "total": 1,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        calls = []
+
+        def progress_cb(cur, total, doc_name, chunk_count):
+            calls.append((cur, total, doc_name, chunk_count))
+
+        build_full_kb_catalog("key", "http://localhost/v1", "ds1", progress_callback=progress_cb)
+
+        assert len(calls) == 2
+        assert calls[0][0] == 1  # current
+        assert calls[0][1] == 2  # total
+        assert calls[0][2] == "doc1.pdf"  # doc_name
+        assert calls[0][3] == 1  # chunk_count
+
+
+class TestIndexingStatusField:
+    """测试 indexing_status 字段正确处理。"""
+
+    @patch("dify_knowledge.requests.get")
+    def test_six_completed_docs_all_exported(self, mock_get):
+        """6 个 indexing_status=completed 的文档必须全部进入 chunks 拉取流程。"""
+        docs = [
+            {"id": f"doc_{i}", "name": f"文档{i}.pdf", "indexing_status": "completed",
+             "enabled": True, "archived": False, "word_count": 100 * i}
+            for i in range(1, 7)
+        ]
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({"data": docs, "has_more": False, "total": 6})
+            elif "/segments" in url:
+                # 提取 document_id
+                doc_id = url.split("/documents/")[1].split("/segments")[0]
+                return _mock_response({
+                    "data": _sample_segments_for_doc(doc_id, 1),
+                    "has_more": False,
+                    "total": 1,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["total_documents"] == 6
+        assert result["metadata"]["exported_documents"] == 6
+        assert result["metadata"]["skipped_documents"] == 0
+        assert result["metadata"]["failed_documents"] == 0
+        assert result["metadata"]["total_chunks"] == 6
+
+    @patch("dify_knowledge.requests.get")
+    def test_missing_indexing_status_not_skip_all(self, mock_get):
+        """indexing_status 字段缺失时不能全部跳过。"""
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                # 文档没有 indexing_status 字段
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "无状态文档.pdf", "enabled": True, "word_count": 100},
+                    ],
+                    "has_more": False,
+                    "total": 1,
+                })
+            elif "/segments" in url:
+                return _mock_response({
+                    "data": _sample_segments_for_doc("doc1", 2),
+                    "has_more": False,
+                    "total": 2,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["exported_documents"] == 1
+        assert result["metadata"]["skipped_documents"] == 0
+        assert result["metadata"]["total_chunks"] == 2
+
+    @patch("dify_knowledge.requests.get")
+    def test_all_skipped_has_skipped_count(self, mock_get):
+        """全部文档被跳过时，skipped_count 正确。"""
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "归档1.pdf", "indexing_status": "completed",
+                         "enabled": True, "archived": True, "word_count": 100},
+                        {"id": "doc2", "name": "归档2.pdf", "indexing_status": "completed",
+                         "enabled": True, "archived": True, "word_count": 200},
+                    ],
+                    "has_more": False,
+                    "total": 2,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["exported_documents"] == 0
+        assert result["metadata"]["skipped_documents"] == 2
+        assert result["metadata"]["total_chunks"] == 0
+
+        # 每个 skipped 文档有明确原因和 api_fields
+        for stat in result["doc_stats"]:
+            assert stat["status"] == "skipped"
+            assert stat["reason"] != ""
+            assert "api_fields" in stat
+            assert stat["api_fields"]["archived"] is True
+
+    @patch("dify_knowledge.requests.get")
+    def test_indexing_status_indexing_skipped(self, mock_get):
+        """indexing_status=indexing 的文档被跳过并显示原因。"""
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "处理中.pdf", "indexing_status": "indexing",
+                         "enabled": True, "archived": False, "word_count": 100},
+                    ],
+                    "has_more": False,
+                    "total": 1,
+                })
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["exported_documents"] == 0
+        assert result["metadata"]["skipped_documents"] == 1
+        stat = result["doc_stats"][0]
+        assert stat["status"] == "skipped"
+        assert "indexing" in stat["reason"]
+        assert stat["api_fields"]["indexing_status"] == "indexing"
+
+    @patch("dify_knowledge.requests.get")
+    def test_empty_chunks_is_ok_not_skipped(self, mock_get):
+        """chunks API 返回空列表时，文档算成功导出（0 chunks），不算 skipped。"""
+
+        def side_effect(url, **kwargs):
+            if "/documents" in url and "/segments" not in url:
+                return _mock_response({
+                    "data": [
+                        {"id": "doc1", "name": "空文档.pdf", "indexing_status": "completed",
+                         "enabled": True, "archived": False, "word_count": 0},
+                    ],
+                    "has_more": False,
+                    "total": 1,
+                })
+            elif "/segments" in url:
+                return _mock_response({"data": [], "has_more": False, "total": 0})
+            return _mock_response({"data": []})
+
+        mock_get.side_effect = side_effect
+
+        result = build_full_kb_catalog("key", "http://localhost/v1", "ds1")
+
+        assert result["metadata"]["exported_documents"] == 1
+        assert result["metadata"]["skipped_documents"] == 0
+        assert result["metadata"]["total_chunks"] == 0
+        stat = result["doc_stats"][0]
+        assert stat["status"] == "ok"
+        assert stat["chunk_count"] == 0
+        assert "空列表" in stat["reason"]
+
+
+class TestExportFullKb:
+    """测试全知识库导出格式。"""
+
+    def test_export_full_kb_json_has_metadata(self):
+        """JSON 导出包含 metadata 顶层包装。"""
+        catalog = build_chunk_catalog(
+            _sample_segments_for_doc("doc1", 2), "ds1", "doc1", "文档1.pdf"
+        )
+        metadata = {
+            "export_type": "full_knowledge_base",
+            "dataset_id": "ds1",
+            "dataset_name": "测试库",
+            "total_documents": 1,
+            "exported_documents": 1,
+            "skipped_documents": 0,
+            "failed_documents": 0,
+            "total_chunks": 2,
+            "schema_version": "1.0",
+        }
+        json_str = export_full_kb_json(catalog, metadata)
+        parsed = json.loads(json_str)
+
+        assert "metadata" in parsed
+        assert "catalog" in parsed
+        assert parsed["metadata"]["export_type"] == "full_knowledge_base"
+        assert len(parsed["catalog"]) == 2
+
+    def test_export_full_kb_csv_has_document_name_column(self):
+        """CSV 导出包含 document_name 列。"""
+        catalog = build_chunk_catalog(
+            _sample_segments_for_doc("doc1", 2), "ds1", "doc1", "文档1.pdf"
+        )
+        csv_bytes = export_full_kb_csv(catalog)
+        first_line = csv_bytes.decode("utf-8-sig").split("\n")[0]
+        assert "document_name" in first_line
+
+    def test_export_full_kb_csv_row_count(self):
+        """CSV 行数正确。"""
+        catalog = build_chunk_catalog(
+            _sample_segments_for_doc("doc1", 3), "ds1", "doc1", "文档1.pdf"
+        )
+        csv_bytes = export_full_kb_csv(catalog)
+        lines = csv_bytes.decode("utf-8-sig").strip().split("\n")
+        assert len(lines) == 4  # 1 header + 3 data
+
+
+class TestExportColumnsIncludeDocumentName:
+    """测试 _EXPORT_COLUMNS 包含 document_name。"""
+
+    def test_export_columns_has_document_name(self):
+        """导出列包含 document_name。"""
+        assert "document_name" in _EXPORT_COLUMNS
+
+    def test_catalog_entries_have_document_name(self):
+        """build_chunk_catalog 生成的条目包含 document_name。"""
+        catalog = build_chunk_catalog(
+            [{"id": "s1", "content": "test"}], "ds1", "doc1", "测试文档.pdf"
+        )
+        assert catalog[0]["document_name"] == "测试文档.pdf"

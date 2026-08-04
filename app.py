@@ -366,6 +366,67 @@ def _load_sample_lookup(cache_key="", proc_path_str=""):
     return lookup
 
 
+def _load_samples_from_path(proc_path_str):
+    """从指定路径加载 processed samples（不含 observations），返回 {trace_id: sample}。"""
+    lookup = {}
+    if not proc_path_str:
+        return lookup
+    proc_path = Path(proc_path_str)
+    if not proc_path.exists():
+        return lookup
+    try:
+        with proc_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    obj.pop("observations", None)
+                    tid = obj.get("trace_id")
+                    if tid:
+                        lookup[tid] = obj
+                except json.JSONDecodeError:
+                    continue
+    except IOError:
+        pass
+    return lookup
+
+
+def _build_merged_sample_lookup(config_runs):
+    """为报告导出构建跨 run 的 merged sample lookup。
+
+    按每个 run 的 provenance 定位 processed file，合并所有 samples。
+    返回 (merged_lookup, provenance_info)：
+      - merged_lookup: {trace_id: sample}
+      - provenance_info: dict 含 source_paths、total_loaded、fallback_count
+    """
+    from langfuse_project import find_processed_for_run
+
+    merged = {}
+    source_paths = {}  # path -> sample_count
+    fallback_count = 0
+
+    for run in config_runs:
+        run_id = run.get("run_id", "")
+        if not run_id:
+            continue
+        proc_path = find_processed_for_run(run_id)
+        if not proc_path or not Path(proc_path).exists():
+            fallback_count += 1
+            continue
+        samples = _load_samples_from_path(proc_path)
+        source_paths[proc_path] = len(samples)
+        merged.update(samples)
+
+    provenance_info = {
+        "source_paths": source_paths,
+        "total_loaded": len(merged),
+        "run_count": len(config_runs),
+        "fallback_count": fallback_count,
+    }
+    return merged, provenance_info
+
+
 def _resolve_processed_path():
     """解析当前最合适的 processed 文件路径（隔离路径优先，回退全局）。
 
@@ -1152,7 +1213,7 @@ with tab_kb:
         validate_dataset_key,
     )
     from dify_knowledge import (
-        list_datasets, list_documents, list_segments, retrieve,
+        list_datasets, list_documents, list_segments, list_all_documents, retrieve,
         build_chunk_catalog, detect_duplicates,
         export_catalog_json, export_catalog_csv,
         check_connection,
@@ -1488,6 +1549,18 @@ with tab_kb:
                 for k in _stale_keys:
                     del st.session_state[k]
 
+                # 缓存全库文档列表（供全知识库导出和出题使用）
+                _kb_docs_cache_key = f"_kb_all_docs_{selected_ds_id}"
+                if _kb_docs_cache_key not in st.session_state:
+                    try:
+                        _cached_all_docs = list_all_documents(
+                            kb_api_key, kb_base_url, selected_ds_id,
+                        )
+                        st.session_state[_kb_docs_cache_key] = _cached_all_docs
+                    except Exception:
+                        st.session_state[_kb_docs_cache_key] = []
+                st.session_state["_kb_all_docs"] = st.session_state[_kb_docs_cache_key]
+
             if selected_ds_id:
                 # ── 文档列表 ──────────────────────────────────────
                 st.markdown("### 文档列表")
@@ -1770,7 +1843,7 @@ with tab_kb:
                             if not ce_api_base or not ce_model:
                                 st.error("Judge Base URL 或 Model 未配置。请先在「Judge 评测」tab 配置 Judge API。")
 
-                            ce_col1, ce_col2 = st.columns(2)
+                            ce_col1, ce_col2, ce_col3 = st.columns(3)
                             with ce_col1:
                                 # 随机种子
                                 ce_random_seed = st.number_input(
@@ -1789,6 +1862,14 @@ with tab_kb:
                                     "题集名称",
                                     value=_default_name,
                                     key="ce_random_name",
+                                )
+                            with ce_col3:
+                                ce_max_workers = st.selectbox(
+                                    "文档并发数",
+                                    options=[1, 2, 3],
+                                    index=1,  # 默认 2
+                                    key="ce_max_workers",
+                                    help="并发越高越快，但越可能遇到模型限流。建议 2。",
                                 )
 
                             # 校验：每个选中文档的题数不超过可用 chunk 数
@@ -1864,6 +1945,7 @@ with tab_kb:
                                             master_seed=ce_random_seed if ce_random_seed > 0 else 0,
                                             timeout=60,
                                             progress_callback=_update_progress,
+                                            max_workers=ce_max_workers,
                                         )
 
                                         # ── 阶段 4/4：校验保存（90-100%）──
@@ -2160,7 +2242,7 @@ with tab_kb:
                                                 f"content_hash: `{entry['content_hash'][:16]}...`"
                                             )
 
-                            # ── 导出 ──────────────────────────────────────
+                            # ── 导出当前文档 ──────────────────────────────────
                             st.markdown("### 导出 Chunk Catalog")
 
                             export_col1, export_col2 = st.columns(2)
@@ -2168,7 +2250,7 @@ with tab_kb:
                             with export_col1:
                                 json_bytes = export_catalog_json(catalog).encode("utf-8")
                                 st.download_button(
-                                    label="📥 导出 JSON",
+                                    label="📥 导出当前文档 JSON",
                                     data=json_bytes,
                                     file_name=f"chunk_catalog_{selected_doc_id[:8]}.json",
                                     mime="application/json",
@@ -2178,7 +2260,7 @@ with tab_kb:
                             with export_col2:
                                 csv_bytes = export_catalog_csv(catalog)
                                 st.download_button(
-                                    label="📥 导出 CSV",
+                                    label="📥 导出当前文档 CSV",
                                     data=csv_bytes,
                                     file_name=f"chunk_catalog_{selected_doc_id[:8]}.csv",
                                     mime="text/csv",
@@ -2186,11 +2268,179 @@ with tab_kb:
                                 )
 
                             st.caption(
-                                f"导出包含 {len(catalog)} 条分块记录，"
-                                f"字段：segment_id, position, document_id, content, "
+                                f"当前文档导出包含 {len(catalog)} 条分块记录，"
+                                f"字段：segment_id, position, document_id, document_name, content, "
                                 f"index_node_id, index_node_hash, tokens, word_count, "
                                 f"enabled, status, content_hash"
                             )
+
+                            # ── 导出全知识库 ────────────────────────────────
+                            st.divider()
+                            st.markdown("### 导出全知识库 Chunk Catalog")
+                            st.caption(
+                                "导出当前知识库全部文档的 chunk catalog，不依赖上方「分块预览」选中的文档。"
+                            )
+
+                            # 展示知识库信息
+                            _ds_name_for_export = ds_name_map.get(selected_ds_id, "未知")
+                            _all_docs_for_export = st.session_state.get("_kb_all_docs", [])
+                            _total_docs_for_export = len(_all_docs_for_export)
+
+                            st.markdown(
+                                f"**知识库：** {_ds_name_for_export} | "
+                                f"**dataset_id：** `{selected_ds_id[:16]}...` | "
+                                f"**文档总数：** {_total_docs_for_export}"
+                            )
+
+                            _fk_export_col1, _fk_export_col2 = st.columns(2)
+
+                            with _fk_export_col1:
+                                _fk_json_clicked = st.button(
+                                    "📥 导出全知识库 JSON",
+                                    key="kb_export_full_json_btn",
+                                    disabled=(not _total_docs_for_export),
+                                )
+
+                            with _fk_export_col2:
+                                _fk_csv_clicked = st.button(
+                                    "📥 导出全知识库 CSV",
+                                    key="kb_export_full_csv_btn",
+                                    disabled=(not _total_docs_for_export),
+                                )
+
+                            # 处理全知识库导出
+                            if _fk_json_clicked or _fk_csv_clicked:
+                                from dify_knowledge import (
+                                    build_full_kb_catalog,
+                                    export_full_kb_json,
+                                    export_full_kb_csv,
+                                )
+
+                                _fk_progress_bar = st.progress(0, text="准备导出...")
+                                _fk_status_text = st.empty()
+                                _fk_total_chunks = [0]
+
+                                def _fk_progress_cb(cur, total, doc_name, chunk_count):
+                                    _fk_total_chunks[0] += chunk_count
+                                    pct = int(cur / max(total, 1) * 100)
+                                    _fk_progress_bar.progress(
+                                        pct,
+                                        text=f"正在读取第 {cur}/{total} 个文档",
+                                    )
+                                    _fk_status_text.caption(
+                                        f"📄 {doc_name[:30]}… | 已累计 {_fk_total_chunks[0]} 个 chunk"
+                                    )
+
+                                try:
+                                    _fk_result = build_full_kb_catalog(
+                                        kb_api_key, kb_base_url,
+                                        selected_ds_id, _ds_name_for_export,
+                                        progress_callback=_fk_progress_cb,
+                                    )
+                                    _fk_progress_bar.progress(100, text="导出完成")
+                                    _fk_status_text.empty()
+
+                                    _fk_meta = _fk_result["metadata"]
+                                    _fk_stats = _fk_result["doc_stats"]
+                                    _fk_catalog = _fk_result["catalog"]
+
+                                    # 显示导出摘要
+                                    _fk_ok = sum(1 for s in _fk_stats if s["status"] == "ok")
+                                    _fk_skip = sum(1 for s in _fk_stats if s["status"] == "skipped")
+                                    _fk_err = sum(1 for s in _fk_stats if s["status"] == "error")
+                                    _fk_total_chunks = _fk_meta["total_chunks"]
+
+                                    if _fk_ok == 0:
+                                        st.warning(
+                                            f"⚠️ 无文档成功导出：**{_fk_skip}** 个跳过 / "
+                                            f"**{_fk_err}** 个失败 / 共 **{_fk_total_chunks}** 个 chunk"
+                                        )
+                                    else:
+                                        st.success(
+                                            f"导出完成：**{_fk_ok}** 个文档成功 / "
+                                            f"**{_fk_skip}** 个跳过 / "
+                                            f"**{_fk_err}** 个失败 / "
+                                            f"共 **{_fk_total_chunks}** 个 chunk"
+                                        )
+
+                                    # 逐份显示跳过文档详情（含 API 字段摘要）
+                                    _fk_skipped = [s for s in _fk_stats if s["status"] == "skipped"]
+                                    if _fk_skipped:
+                                        with st.expander(f"⏭️ 跳过文档详情（{len(_fk_skipped)} 个）", expanded=(_fk_ok == 0)):
+                                            for _fs in _fk_skipped:
+                                                _api = _fs.get("api_fields", {})
+                                                _api_summary = ", ".join(
+                                                    f"{k}={v}" for k, v in _api.items()
+                                                    if v not in (None, "", True, False)
+                                                ) or "（无额外字段）"
+                                                st.markdown(
+                                                    f"- **{_fs['document_name']}** "
+                                                    f"(`{_fs['document_id'][:12]}...`)\n"
+                                                    f"  跳过原因: {_fs['reason']}\n"
+                                                    f"  API 字段: {_api_summary}"
+                                                )
+
+                                    # 显示失败文档详情
+                                    _fk_failed = [s for s in _fk_stats if s["status"] == "error"]
+                                    if _fk_failed:
+                                        with st.expander(f"❌ 失败文档详情（{len(_fk_failed)} 个）", expanded=False):
+                                            for _fs in _fk_failed:
+                                                st.markdown(
+                                                    f"- **{_fs['document_name']}** (`{_fs['document_id'][:12]}...`): "
+                                                    f"{_fs['reason']}"
+                                                )
+
+                                    # 0 chunk 的成功文档提示
+                                    _fk_zero_chunk_ok = [
+                                        s for s in _fk_stats
+                                        if s["status"] == "ok" and s["chunk_count"] == 0
+                                    ]
+                                    if _fk_zero_chunk_ok:
+                                        with st.expander(f"ℹ️ 成功但 0 chunks 的文档（{len(_fk_zero_chunk_ok)} 个）", expanded=False):
+                                            for _fs in _fk_zero_chunk_ok:
+                                                st.markdown(
+                                                    f"- **{_fs['document_name']}** "
+                                                    f"(`{_fs['document_id'][:12]}...`): "
+                                                    f"{_fs['reason'] or 'chunks API 返回空列表'}"
+                                                )
+
+                                    # 生成下载（total_chunks == 0 时禁用）
+                                    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    _ds_short = selected_ds_id[:8]
+                                    _fk_dl_disabled = (_fk_total_chunks == 0)
+
+                                    if _fk_json_clicked:
+                                        _fk_json_str = export_full_kb_json(_fk_catalog, _fk_meta)
+                                        _fk_json_bytes = _fk_json_str.encode("utf-8")
+                                        st.download_button(
+                                            label=f"⬇️ 下载全知识库 JSON（{_fk_total_chunks} chunks）",
+                                            data=_fk_json_bytes,
+                                            file_name=f"chunk_catalog_{_ds_short}_all_{_ts}.json",
+                                            mime="application/json",
+                                            key="kb_export_full_json_dl",
+                                            disabled=_fk_dl_disabled,
+                                        )
+
+                                    if _fk_csv_clicked:
+                                        _fk_csv_bytes = export_full_kb_csv(_fk_catalog)
+                                        st.download_button(
+                                            label=f"⬇️ 下载全知识库 CSV（{_fk_total_chunks} chunks）",
+                                            data=_fk_csv_bytes,
+                                            file_name=f"chunk_catalog_{_ds_short}_all_{_ts}.csv",
+                                            mime="text/csv",
+                                            key="kb_export_full_csv_dl",
+                                            disabled=_fk_dl_disabled,
+                                        )
+
+                                    # 缓存结果供出题模块使用
+                                    st.session_state["_fk_last_catalog"] = _fk_catalog
+                                    st.session_state["_fk_last_metadata"] = _fk_meta
+                                    st.session_state["_fk_last_stats"] = _fk_stats
+
+                                except Exception as exc:
+                                    _fk_progress_bar.progress(100, text="导出失败")
+                                    _fk_status_text.empty()
+                                    st.error(f"全知识库导出失败: {exc}")
 
                             # ── 基于当前预览文档手动创建题集 ──
                             st.divider()
@@ -8041,9 +8291,8 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
             _m = compute_metrics(_jr) if _jr else {}
             _run_data_list.append({"run": _run, "run_status": _rs, "metrics": _m})
 
-        # 构建 processed sample lookup（trace_id -> sample，缓存）
-        _proc_path_str, _proc_mtime = _resolve_processed_path()
-        _sample_lookup = _load_sample_lookup(_proc_mtime, _proc_path_str)
+        # 构建 processed sample lookup（按每个 run 的 provenance 定位 processed file）
+        _sample_lookup, _provenance_info = _build_merged_sample_lookup(config_runs)
 
         _disp_name = selected_config.get('config_name', '未命名')
         _cid = selected_config.get('config_id', '')
