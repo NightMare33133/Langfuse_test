@@ -487,16 +487,27 @@ def _content_hash_for_match(text):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _scan_retrieval_for_hit(retrieval_results, expected_id, expected_hash, max_rank=10):
+    """扫描检索结果列表，返回命中位置（1-indexed）或 None。"""
+    for rank, r in enumerate(retrieval_results[:max_rank]):
+        seg_id = (r.get("segment_id") or "").strip()
+        content = (r.get("content") or "").strip()
+        content_hash = _content_hash_for_match(content) if content else ""
+        if (expected_id and seg_id == expected_id) or \
+           (expected_hash and content_hash and content_hash == expected_hash):
+            return rank + 1
+    return None
+
+
 def _judge_chunk_exact(sample):
     """chunk_exact 轨道纯机器判定：按 segment_id / content_hash 匹配。
 
     不调用 LLM，完全确定性判定。
-    扫描 retrieval_results[:10]，计算 Top1/Top3/Top5/Top10。
+    支持多检索：扫描 retrieval_calls 中所有检索结果，计算最佳命中位置。
     fail-closed：缺少绑定或无检索结果时标记为不可评测，不写入 miss。
     """
     expected_id = (sample.get("expected_segment_id") or "").strip()
     expected_hash = (sample.get("expected_content_hash") or "").strip()
-    retrieval_results = sample.get("retrieval_results") or []
     trace_id = (sample.get("trace_id") or "").strip()
 
     _none_result = {
@@ -517,23 +528,45 @@ def _judge_chunk_exact(sample):
                 "chunk_exact_status": "no_trace",
                 "retrieval_evaluable": False}
 
+    # ── 收集所有检索结果（兼容单检索和多检索） ──
+    retrieval_calls = sample.get("retrieval_calls") or []
+    if retrieval_calls:
+        # 多检索模式：每个 call 独立扫描，取最佳命中
+        all_results = []
+        per_call_hits = []
+        best_hit_position = None
+        for call in retrieval_calls:
+            call_results = call.get("results") or []
+            call_order = call.get("order", 0)
+            call_hit = _scan_retrieval_for_hit(call_results, expected_id, expected_hash)
+            per_call_hits.append({
+                "order": call_order,
+                "observation_id": call.get("observation_id"),
+                "query": call.get("query"),
+                "hit_position": call_hit,
+                "result_count": len(call_results),
+            })
+            # 更新最佳命中（跨 call 取最小 rank）
+            if call_hit is not None:
+                if best_hit_position is None or call_hit < best_hit_position:
+                    best_hit_position = call_hit
+            for r in call_results:
+                r_copy = dict(r)
+                r_copy["_retrieval_call_order"] = call_order
+                all_results.append(r_copy)
+        retrieval_results = all_results
+        hit_position = best_hit_position
+    else:
+        # 单检索模式（向后兼容）
+        retrieval_results = sample.get("retrieval_results") or []
+        per_call_hits = []
+        hit_position = _scan_retrieval_for_hit(retrieval_results, expected_id, expected_hash)
+
     if not retrieval_results:
         return {**_none_result,
                 "reason": "trace 已关联但无检索结果，chunk_exact 无法判定",
                 "chunk_exact_status": "no_retrieval",
                 "retrieval_evaluable": False}
-
-    hit_position = None
-    for rank, r in enumerate(retrieval_results[:10]):
-        seg_id = (r.get("segment_id") or "").strip()
-        content = (r.get("content") or "").strip()
-        content_hash = _content_hash_for_match(content) if content else ""
-
-        # 按 segment_id 或 content_hash 匹配
-        if (expected_id and seg_id == expected_id) or \
-           (expected_hash and content_hash and content_hash == expected_hash):
-            hit_position = rank + 1
-            break
 
     t1 = 1 if hit_position is not None and hit_position <= 1 else 0
     t3 = 1 if hit_position is not None and hit_position <= 3 else 0
@@ -545,7 +578,7 @@ def _judge_chunk_exact(sample):
         reason += f" (expected_id={expected_id[:12]}...)" if expected_id else ""
         reason += f" (expected_hash={expected_hash[:12]}...)" if expected_hash and not expected_id else ""
 
-    return {
+    result = {
         "retrieval_top1_hit": t1,
         "retrieval_top3_hit": t3,
         "retrieval_top5_hit": t5,
@@ -556,6 +589,17 @@ def _judge_chunk_exact(sample):
         "chunk_exact_status": "",
         "retrieval_evaluable": True,
     }
+
+    # ── 多检索统计 ──
+    if per_call_hits:
+        result["retrieval_call_count"] = len(per_call_hits)
+        result["per_call_hits"] = per_call_hits
+        hit_calls = [h for h in per_call_hits if h["hit_position"] is not None]
+        result["per_subquery_hit"] = len(hit_calls) > 0
+        result["trace_level_coverage"] = len(hit_calls) > 0
+        result["subquery_hit_count"] = len(hit_calls)
+
+    return result
 
 
 def backfill_chunk_exact_topk(result, sample_lookup=None):
@@ -595,19 +639,19 @@ def backfill_chunk_exact_topk(result, sample_lookup=None):
         if sample:
             expected_id = (sample.get("expected_segment_id") or "").strip()
             expected_hash = (sample.get("expected_content_hash") or "").strip()
-            retrieval_results = sample.get("retrieval_results") or []
+
+            # 支持多检索：收集所有 retrieval_calls 的结果
+            retrieval_calls = sample.get("retrieval_calls") or []
+            if retrieval_calls:
+                all_results = []
+                for call in retrieval_calls:
+                    all_results.extend(call.get("results") or [])
+                retrieval_results = all_results
+            else:
+                retrieval_results = sample.get("retrieval_results") or []
 
             if (expected_id or expected_hash) and retrieval_results:
-                hit_position = None
-                for rank, r in enumerate(retrieval_results[:10]):
-                    seg_id = (r.get("segment_id") or "").strip()
-                    content = (r.get("content") or "").strip()
-                    content_hash = _content_hash_for_match(content) if content else ""
-                    if (expected_id and seg_id == expected_id) or \
-                       (expected_hash and content_hash and content_hash == expected_hash):
-                        hit_position = rank + 1
-                        break
-
+                hit_position = _scan_retrieval_for_hit(retrieval_results, expected_id, expected_hash)
                 result["retrieval_top10_hit"] = 1 if hit_position is not None and hit_position <= 10 else 0
 
     # ── Top1/Top3/Top5：从 hit_evidence_position 推导（旧版扫描了 top5，position 可靠） ──

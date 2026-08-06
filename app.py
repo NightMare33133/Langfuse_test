@@ -5694,6 +5694,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         _s.pop("observations", None)
                     st.session_state["samples"] = samples
                     st.session_state["summary"] = full_summary
+                    # 解析完成后重置页码，确保显示最新数据
+                    st.session_state["sample_page"] = 1
 
                     # 标记快照已解析（仅冻结快照）
                     if source_type == "evidence_snapshot" and selected_source.get("snapshot_id"):
@@ -5776,13 +5778,55 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
         if bad_line_count > 0:
             st.warning(f"有 {bad_line_count} 行解析失败")
 
-        # Search filter
-        search = st.text_input("搜索问题内容", "", key="sample_search")
-        filtered = samples
-        if search:
-            filtered = [s for s in samples if search.lower() in (s.get("question") or "").lower()]
+        # ── 排序控制 ──
+        _sort_col1, _sort_col2 = st.columns([1, 2])
+        with _sort_col1:
+            _sort_mode = st.radio(
+                "排序方式",
+                ["最新优先", "最早优先"],
+                key="sample_sort_mode",
+                horizontal=True,
+            )
 
-        # Pagination
+        # ── 搜索筛选 ──
+        search = st.text_input("搜索问题内容", "", key="sample_search")
+
+        # ── 页码重置：排序或搜索变化时自动回到第 1 页 ──
+        _prev_sort = st.session_state.get("_prev_sample_sort")
+        _prev_search = st.session_state.get("_prev_sample_search", "")
+        if _sort_mode != _prev_sort or search != _prev_search:
+            st.session_state["sample_page"] = 1
+            st.session_state["_prev_sample_sort"] = _sort_mode
+            st.session_state["_prev_sample_search"] = search
+
+        # 排序 → 筛选 → 分页（顺序不可颠倒）
+        _sort_newest_first = (_sort_mode == "最新优先")
+
+        from parser import _parse_ts_for_sort
+        _with_ts = []
+        _no_ts = []
+        for s in samples:
+            ts = s.get("trace_timestamp") or s.get("earliest_obs_time")
+            dt = _parse_ts_for_sort(ts)
+            if dt is None:
+                _no_ts.append(s)
+            else:
+                _with_ts.append((dt, s.get("trace_id", ""), s))
+
+        if _sort_newest_first:
+            _with_ts.sort(key=lambda x: (-x[0].timestamp(), x[1]))
+        else:
+            _with_ts.sort(key=lambda x: (x[0].timestamp(), x[1]))
+        _no_ts.sort(key=lambda x: x.get("trace_id", ""))
+
+        sorted_samples = [item[2] for item in _with_ts] + _no_ts
+
+        if search:
+            filtered = [s for s in sorted_samples if search.lower() in (s.get("question") or "").lower()]
+        else:
+            filtered = sorted_samples
+
+        # ── 分页 ──
         _SAMPLE_PAGE_SIZE = 20
         _total_pages = max(1, (len(filtered) + _SAMPLE_PAGE_SIZE - 1) // _SAMPLE_PAGE_SIZE)
         if _total_pages > 1:
@@ -5800,16 +5844,29 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
 
         for i, sample in enumerate(page_items):
             question = sample.get("question") or "(无问题)"
+            retrieval_calls = sample.get("retrieval_calls") or []
             retrieval_results = sample.get("retrieval_results") or []
-            retrieval_count = len(retrieval_results)
+            retrieval_call_count = sample.get("retrieval_call_count") or len(retrieval_calls)
             trace_id = sample.get("trace_id", "")
             eval_track = sample.get("evaluation_track", "")
 
-            # 检索状态分类显示
+            # ── 时间显示 ──
+            from parser import _parse_ts_for_sort
+            _ts_raw = sample.get("trace_timestamp") or sample.get("earliest_obs_time")
+            _ts_dt = _parse_ts_for_sort(_ts_raw)
+            if _ts_dt is not None:
+                _ts_local = _ts_dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                _ts_local = "时间未知"
+
+            # ── 检索状态分类显示（优先使用 retrieval_calls） ──
             if not trace_id or trace_id.startswith("batch_qa_"):
                 _retrieval_badge = "⚠️ 未关联 trace"
-            elif retrieval_count > 0:
-                _retrieval_badge = f"检索 {retrieval_count} 条"
+            elif retrieval_calls:
+                _total_results = sum(len(c.get("results") or []) for c in retrieval_calls)
+                _retrieval_badge = f"🔍 {retrieval_call_count} 次检索, {_total_results} 条结果"
+            elif retrieval_results:
+                _retrieval_badge = f"检索 {len(retrieval_results)} 条"
             elif sample.get("retrieval_query"):
                 _retrieval_badge = "检索 0 条（trace 已关联，无命中）"
             else:
@@ -5823,13 +5880,13 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
 
             _q_short = question[:50] + "..." if len(question) > 50 else question
             with st.expander(
-                f"{_q_short} | {_retrieval_badge}{_track_badge} | {trace_id[:12]}..."
+                f"{_ts_local} | {_q_short} | {_retrieval_badge}{_track_badge} | {trace_id[:12]}..."
             ):
+                # 时间和 trace_id 信息栏
+                st.caption(f"🕐 {_ts_local}　|　trace_id: `{trace_id}`")
+
                 st.markdown("**问题**")
                 st.code(sample.get("question") or "(无)", language=None)
-
-                st.markdown("**检索查询 (retrieval_query)**")
-                st.code(sample.get("retrieval_query") or "(无)", language=None)
 
                 # chunk_exact 题显示绑定信息
                 if eval_track == "chunk_exact":
@@ -5842,22 +5899,50 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         if _exp_hash:
                             st.caption(f"expected_content_hash: `{_exp_hash[:16]}...`")
 
-                # 检索结果状态说明
+                # ── 检索结果展示（优先 retrieval_calls，回退 retrieval_results） ──
                 if not trace_id or trace_id.startswith("batch_qa_"):
                     st.info("此样本未关联真实 Langfuse trace，无法获取检索结果。请先在「批量提问」中执行并同步 trace。")
-                elif retrieval_count == 0 and not sample.get("retrieval_query"):
-                    st.info("此样本缺少 retrieval_query，可能是旧数据或非检索类题目。")
-                elif retrieval_count == 0:
+                elif retrieval_calls:
+                    # 多检索模式：按 call 展示
+                    st.markdown(f"**检索调用 ({retrieval_call_count} 次)**")
+                    for call in retrieval_calls:
+                        _call_order = call.get("order", "?")
+                        _call_query = call.get("query") or "(无 query)"
+                        _call_latency = call.get("latency_ms")
+                        _call_results = call.get("results") or []
+                        _latency_str = f"{_call_latency}ms" if _call_latency is not None else "N/A"
+                        with st.expander(
+                            f"检索 #{_call_order}: {_call_query[:60]} "
+                            f"({len(_call_results)} 条, {_latency_str})"
+                        ):
+                            st.caption(
+                                f"observation: `{call.get('observation_id', '')[:16]}` | "
+                                f"延迟: {_latency_str} | "
+                                f"时间: {call.get('start_time', '')[:19]}"
+                            )
+                            for r in _call_results:
+                                _title = r.get("title") or "(无标题)"
+                                _score = r.get("score")
+                                _content = r.get("content") or ""
+                                _score_str = f" (score: {_score})" if _score is not None else ""
+                                with st.expander(f"{_title}{_score_str}"):
+                                    st.text((_content or "(无内容)")[:2000])
+                elif retrieval_results:
+                    # 单检索模式（向后兼容）
+                    st.markdown(f"**检索查询 (retrieval_query)**")
+                    st.code(sample.get("retrieval_query") or "(无)", language=None)
+                    st.markdown(f"**检索结果 ({len(retrieval_results)} 条)**")
+                    for r in retrieval_results:
+                        title = r.get("title") or "(无标题)"
+                        score = r.get("score")
+                        content = r.get("content") or ""
+                        score_str = f" (score: {score})" if score is not None else ""
+                        with st.expander(f"{title}{score_str}"):
+                            st.text((content or "(无内容)")[:2000])
+                elif sample.get("retrieval_query"):
                     st.info("trace 已关联但 Dify 未返回检索结果（embedding 未命中或检索配置为空）。")
-
-                st.markdown(f"**检索结果 ({retrieval_count} 条)**")
-                for r in retrieval_results:
-                    title = r.get("title") or "(无标题)"
-                    score = r.get("score")
-                    content = r.get("content") or ""
-                    score_str = f" (score: {score})" if score is not None else ""
-                    with st.expander(f"{title}{score_str}"):
-                        st.text((content or "(无内容)")[:2000])
+                else:
+                    st.info("此样本缺少 retrieval_query，可能是旧数据或非检索类题目。")
 
                 st.markdown(f"**LLM 模型**: `{sample.get('llm_model') or 'N/A'}`")
 
@@ -8299,10 +8384,14 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         _export_scope = f"配置 {_disp_name}，{len(config_runs)} 次运行"
 
         with _export_cols[0]:
+            # 从 config_snapshot 读取 configured_top_k
+            _snapshot = (config_runs[0].get("config_snapshot") or {}) if config_runs else {}
+            _configured_top_k = _snapshot.get("top_k", 10) or 10
             _html_bytes = build_evaluation_html(
                 selected_config, config_runs, _run_data_list,
                 cumulative_metrics, all_judge_results,
                 export_scope=_export_scope, sample_lookup=_sample_lookup,
+                configured_top_k=_configured_top_k,
             ).encode("utf-8")
             st.download_button(
                 label=f"下载 HTML 报告（{_disp_name}）",

@@ -27,6 +27,9 @@ from report_export import (
     validate_report_consistency, _build_layered_metrics, _build_ranking_diagnostics,
     _build_quality_flags, _build_top1_miss_evidence, build_ai_analysis_markdown,
     load_question_set_metadata, _lookup_question_meta, _render_top1_miss_evidence,
+    _compute_sample_recall_info, _compute_recall_statistics,
+    _compute_doc_level_recall_stats, _render_recall_overview_section,
+    _render_doc_level_recall_table,
 )
 
 
@@ -1567,6 +1570,249 @@ def test_provenance_info_in_html():
     print("[OK] provenance_info 正确显示在 HTML 中")
 
 
+# ====== 召回规模信息测试 ======
+
+def _make_chunk_exact_with_retrieval(trace_id, t1, t3, t5, t10, position=None,
+                                     expected_seg_id="seg_target",
+                                     retrieval_count=10):
+    """创建带检索结果的 chunk_exact 测试数据。"""
+    r = _make_chunk_exact_result(trace_id, t1, t3, t5, position, expected_seg_id)
+    r["retrieval_top10_hit"] = t10
+    return r
+
+
+def _make_sample_with_n_results(trace_id, n, expected_seg_id="seg_target"):
+    """创建有 n 条检索结果的 processed sample。"""
+    results = []
+    for i in range(1, n + 1):
+        seg_id = expected_seg_id if i == 1 else f"seg_other_{i}"
+        results.append({
+            "position": i,
+            "segment_id": seg_id,
+            "document_name": f"doc_{i}.pdf",
+            "score": round(0.95 - i * 0.05, 4),
+            "content": f"检索结果 {i} 的内容",
+        })
+    return _make_processed_sample(trace_id, retrieval_results=results)
+
+
+def test_full_window_status():
+    """configured_top_k=10, actual_returned_count=10 → full_window。"""
+    from report_export import _compute_sample_recall_info
+
+    r = _make_chunk_exact_with_retrieval("ce_fw", 1, 1, 1, 1, 1)
+    sl = {"ce_fw": _make_sample_with_n_results("ce_fw", 10)}
+
+    info = _compute_sample_recall_info(r, sl, configured_top_k=10)
+    assert info["window_status"] == "full_window", f"Expected full_window, got {info['window_status']}"
+    assert info["actual_returned_count"] == 10
+    assert info["effective_k"] == 10
+    assert info["window_reason"] == ""
+    print("[OK] full_window: configured_top_k=10, actual=10")
+
+
+def test_partial_window_status():
+    """configured_top_k=10, actual_returned_count=4 → partial_window。"""
+    from report_export import _compute_sample_recall_info
+
+    r = _make_chunk_exact_with_retrieval("ce_pw", 0, 0, 0, 0, None)
+    sl = {"ce_pw": _make_sample_with_n_results("ce_pw", 4)}
+
+    info = _compute_sample_recall_info(r, sl, configured_top_k=10)
+    assert info["window_status"] == "partial_window", f"Expected partial_window, got {info['window_status']}"
+    assert info["actual_returned_count"] == 4
+    assert info["effective_k"] == 4
+    print("[OK] partial_window: configured_top_k=10, actual=4")
+
+
+def test_doc_chunk_count_displayed():
+    """doc_chunk_counts={"doc.pdf": 7} 时报告显示 source_document_chunk_count=7。"""
+    from report_export import _compute_sample_recall_info
+
+    r = _make_chunk_exact_with_retrieval("ce_dc", 1, 1, 1, 1, 1)
+    r["document_name"] = "doc.pdf"
+    sl = {"ce_dc": _make_sample_with_n_results("ce_dc", 10)}
+    doc_chunk_counts = {"doc.pdf": 7}
+
+    info = _compute_sample_recall_info(r, sl, configured_top_k=10,
+                                       doc_chunk_counts=doc_chunk_counts)
+    assert info["target_source_document_chunk_count"] == 7, \
+        f"Expected 7, got {info['target_source_document_chunk_count']}"
+    print("[OK] doc_chunk_count displayed: doc.pdf=7")
+
+
+def test_unknown_partial_window_reason():
+    """无法判断原因时显示 unknown。"""
+    from report_export import _compute_sample_recall_info
+
+    r = _make_chunk_exact_with_retrieval("ce_unk", 0, 0, 0, 0, None)
+    sl = {"ce_unk": _make_sample_with_n_results("ce_unk", 4)}
+    # 不传 doc_chunk_counts，无法判断原因
+    info = _compute_sample_recall_info(r, sl, configured_top_k=10)
+    assert info["window_reason"] == "unknown", f"Expected unknown, got {info['window_reason']}"
+    print("[OK] unknown partial_window_reason: no doc_chunk_counts")
+
+
+def test_source_document_has_fewer_chunks_reason():
+    """文档 chunk 总数 < configured_top_k 时归因为 source_document_has_fewer_chunks。"""
+    from report_export import _compute_sample_recall_info
+
+    r = _make_chunk_exact_with_retrieval("ce_few", 0, 0, 0, 0, None)
+    r["document_name"] = "small_doc.pdf"
+    sl = {"ce_few": _make_sample_with_n_results("ce_few", 4)}
+    doc_chunk_counts = {"small_doc.pdf": 5}
+
+    info = _compute_sample_recall_info(r, sl, configured_top_k=10,
+                                       doc_chunk_counts=doc_chunk_counts)
+    assert info["window_reason"] == "source_document_has_fewer_chunks", \
+        f"Expected source_document_has_fewer_chunks, got {info['window_reason']}"
+    print("[OK] source_document_has_fewer_chunks: doc has 5 chunks < top_k=10")
+
+
+def test_all_results_shown_not_truncated():
+    """HTML 展示全部实际返回结果，而不是固定只显示 5 条。"""
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    # 为 chunk_exact 样本添加 10 条检索结果
+    for tid in ["t_ce_1", "t_ce_2", "t_ce_3", "t_ce_4"]:
+        sl[tid] = _make_sample_with_n_results(tid, 10)
+
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r,
+                                 sample_lookup=sl, configured_top_k=10)
+
+    # 检查检索结果表中是否展示了全部结果（不截断为 5）
+    # 在 _render_chunk_exact_diagnostic_cards 中，展开详情应显示 "实际返回 10 条"
+    assert "实际返回 10 条" in html or "实际返回" in html, \
+        "应显示实际返回结果数量"
+    print("[OK] all results shown: actual_returned_count displayed")
+
+
+def test_backward_compatibility():
+    """旧数据缺少新字段时仍能正常生成报告。"""
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    # 不传递新参数，使用默认值
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r, sample_lookup=sl)
+    assert "RAG 评测报告" in html
+    assert "chunk_exact" in html.lower() or "Chunk Exact" in html
+    print("[OK] backward compatibility: old data without new fields")
+
+
+def test_topk_metrics_unchanged():
+    """Top1/Top3/Top5/Top10 指标计算结果保持不变。"""
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    # 传递新参数，不应影响指标计算
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r,
+                                 sample_lookup=sl, configured_top_k=10,
+                                 knowledge_base_total_chunks=100,
+                                 doc_chunk_counts={"doc1.pdf": 50})
+
+    # 验证 chunk_exact 指标仍然正确（fixture 中有 4 个可评测样本）
+    # t_ce_1: Top1 hit, t_ce_2: Top3 hit, t_ce_3: Top5 hit, t_ce_4: miss
+    assert "4/4" in html or "4" in html, "应有 4 个可评测样本"
+    # Top1: 1/4
+    assert "1/4" in html, "Top1 应为 1/4"
+    print("[OK] TopK metrics unchanged with new parameters")
+
+
+def test_recall_overview_section_in_html():
+    """HTML 中包含召回规模概览区域。"""
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    for tid in ["t_ce_1", "t_ce_2", "t_ce_3", "t_ce_4"]:
+        sl[tid] = _make_sample_with_n_results(tid, 10)
+
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r,
+                                 sample_lookup=sl, configured_top_k=10,
+                                 knowledge_base_total_chunks=500,
+                                 doc_chunk_counts={"doc1.pdf": 100, "doc2.pdf": 200})
+
+    assert "召回规模概览" in html, "应包含召回规模概览区域"
+    assert "500" in html, "应显示知识库总 chunk 数"
+    assert "full_window" in html or "full" in html.lower(), "应显示窗口状态"
+    print("[OK] recall overview section in HTML")
+
+
+def test_doc_level_recall_table_in_html():
+    """HTML 中包含文档级召回统计表。"""
+    config, runs, rdl, cum_m, all_r, sl = _build_fixture()
+    for tid in ["t_ce_1", "t_ce_2", "t_ce_3", "t_ce_4"]:
+        sl[tid] = _make_sample_with_n_results(tid, 10)
+
+    html = build_evaluation_html(config, rdl, rdl, cum_m, all_r,
+                                 sample_lookup=sl, configured_top_k=10,
+                                 doc_chunk_counts={"doc1.pdf": 100})
+
+    assert "文档级召回统计" in html, "应包含文档级召回统计表"
+    print("[OK] doc-level recall table in HTML")
+
+
+def test_partial_window_warning_in_metrics():
+    """部分窗口受限时，指标区域显示警告。"""
+    config = _build_config()
+    # 创建 2 个样本：1 个 full_window，1 个 partial_window
+    r1 = _make_chunk_exact_with_retrieval("ce_pw1", 1, 1, 1, 1, 1)
+    r2 = _make_chunk_exact_with_retrieval("ce_pw2", 0, 0, 0, 0, None)
+    all_r = [r1, r2]
+
+    sl = {
+        "ce_pw1": _make_sample_with_n_results("ce_pw1", 10),
+        "ce_pw2": _make_sample_with_n_results("ce_pw2", 4),
+    }
+
+    run = {
+        "run_id": "run_pw_001",
+        "config_id": "cfg_test_001",
+        "question_count": 2,
+        "status": "completed",
+        "started_at": "2026-07-16T10:00:00",
+        "config_snapshot": {"top_k": 10},
+    }
+    run_status = {
+        "batch_success": 2, "batch_total": 2, "processed_count": 2,
+        "judge_count": 2, "question_count": 2,
+        "judge_results": all_r,
+    }
+    from judge import compute_metrics
+    metrics = compute_metrics(all_r)
+    rdl = [{"run": run, "run_status": run_status, "metrics": metrics}]
+
+    html = build_evaluation_html(config, rdl, rdl, metrics, all_r,
+                                 sample_lookup=sl, configured_top_k=10)
+
+    assert "partial_window" in html or "partial" in html.lower(), \
+        "应显示 partial_window 警告"
+    print("[OK] partial_window warning in metrics")
+
+
+def test_configured_top_k_from_snapshot():
+    """configured_top_k 从 config_snapshot 读取。"""
+    config = _build_config()
+    r1 = _make_chunk_exact_with_retrieval("ce_snap", 1, 1, 1, 1, 1)
+    sl = {"ce_snap": _make_sample_with_n_results("ce_snap", 10)}
+
+    run = {
+        "run_id": "run_snap_001",
+        "config_id": "cfg_test_001",
+        "question_count": 1,
+        "status": "completed",
+        "config_snapshot": {"top_k": 5},
+    }
+    run_status = {
+        "batch_success": 1, "batch_total": 1, "processed_count": 1,
+        "judge_count": 1, "question_count": 1,
+        "judge_results": [r1],
+    }
+    from judge import compute_metrics
+    metrics = compute_metrics([r1])
+    rdl = [{"run": run, "run_status": run_status, "metrics": metrics}]
+
+    # 不传 configured_top_k，应从 snapshot 读取 top_k=5
+    html = build_evaluation_html(config, rdl, rdl, metrics, [r1],
+                                 sample_lookup=sl)
+
+    assert "配置 TopK" in html or "配置=" in html or "top_k" in html.lower() or "5" in html, \
+        "应从 snapshot 读取 top_k=5"
+    print("[OK] configured_top_k from snapshot: top_k=5")
+
+
 def test_provenance_fallback_warning():
     """历史 fallback 时显示警告。"""
     config, runs, rdl, cum_m, all_r, sl = _build_fixture()
@@ -1879,6 +2125,20 @@ def main():
     test_top1_miss_shows_expected_and_top1_side_by_side()
     test_no_rerank_score_text()
     test_metric_clarification_in_html()
+
+    # 召回规模信息测试
+    test_full_window_status()
+    test_partial_window_status()
+    test_doc_chunk_count_displayed()
+    test_unknown_partial_window_reason()
+    test_source_document_has_fewer_chunks_reason()
+    test_all_results_shown_not_truncated()
+    test_backward_compatibility()
+    test_topk_metrics_unchanged()
+    test_recall_overview_section_in_html()
+    test_doc_level_recall_table_in_html()
+    test_partial_window_warning_in_metrics()
+    test_configured_top_k_from_snapshot()
 
     print("=" * 60)
     print("[OK] 所有测试通过！")

@@ -287,7 +287,11 @@ def _short_id(id_str, n=12):
 
 
 def build_chunk_exact_diagnostic_data(judge_results, sample_lookup, config=None,
-                                      max_samples=_MAX_DIAGNOSTIC_SAMPLES):
+                                      max_samples=_MAX_DIAGNOSTIC_SAMPLES,
+                                      configured_top_k=10,
+                                      knowledge_base_total_chunks=None,
+                                      doc_chunk_counts=None,
+                                      question_meta_lookup=None):
     """为 chunk_exact 轨道构建诊断数据：Top10 未命中、排序偏后和排序问题。
 
     诊断拆分：
@@ -300,6 +304,10 @@ def build_chunk_exact_diagnostic_data(judge_results, sample_lookup, config=None,
         sample_lookup: {trace_id: processed_sample_dict}
         config: 配置方案 dict
         max_samples: 每类最大条数
+        configured_top_k: 配置 TopK
+        knowledge_base_total_chunks: 知识库总 chunk 数
+        doc_chunk_counts: dict[doc_name → chunk_count]
+        question_meta_lookup: 题集元数据查找表
 
     Returns:
         dict: {
@@ -341,7 +349,12 @@ def build_chunk_exact_diagnostic_data(judge_results, sample_lookup, config=None,
         else:
             continue
 
-        record = _build_chunk_exact_one_diagnostic(r, sample_lookup, config)
+        record = _build_chunk_exact_one_diagnostic(
+            r, sample_lookup, config,
+            configured_top_k=configured_top_k,
+            knowledge_base_total_chunks=knowledge_base_total_chunks,
+            doc_chunk_counts=doc_chunk_counts,
+            question_meta_lookup=question_meta_lookup)
         if category == "top10_miss":
             top10_miss.append(record)
         elif category == "top5_miss_but_top10_hit":
@@ -359,10 +372,16 @@ def build_chunk_exact_diagnostic_data(judge_results, sample_lookup, config=None,
     }
 
 
-def _build_chunk_exact_one_diagnostic(judge_result, sample_lookup, config):
+def _build_chunk_exact_one_diagnostic(judge_result, sample_lookup, config,
+                                      configured_top_k=10,
+                                      knowledge_base_total_chunks=None,
+                                      doc_chunk_counts=None,
+                                      question_meta_lookup=None):
     """为单个 chunk_exact judged result 构建诊断记录。"""
     tid = judge_result.get("trace_id", "")
     sample = sample_lookup.get(tid)
+
+    doc_name = _resolve_doc_name(judge_result, sample, question_meta_lookup)
 
     base = {
         "trace_id": tid,
@@ -382,24 +401,109 @@ def _build_chunk_exact_one_diagnostic(judge_result, sample_lookup, config):
         "config_id": config.get("config_id", ""),
     }
 
-    # 从 sample 获取 retrieval 结果（扫描 Top10）
+    # 从 sample 获取 retrieval 结果（全部返回，不截断）
     if sample:
-        raw_results = sample.get("retrieval_results") or []
-        clean_results = []
-        for rr in raw_results[:10]:
-            clean_results.append({
-                "position": rr.get("position"),
-                "segment_id": rr.get("segment_id") or rr.get("document_name") or "",
-                "score": rr.get("score"),
-                "content": (rr.get("content") or "")[:300],
-            })
-        base["retrieval_results"] = clean_results
-        base["retrieval_result_count"] = len(raw_results)
-        base["retrieval_query"] = sample.get("retrieval_query") or sample.get("question") or ""
+        expected_seg_id = judge_result.get("expected_segment_id") or ""
+
+        # ── 多检索支持 ──
+        retrieval_calls = sample.get("retrieval_calls") or []
+        if retrieval_calls:
+            # 多检索模式：收集所有 call 的结果
+            all_results = []
+            clean_calls = []
+            for call in retrieval_calls:
+                call_results = call.get("results") or []
+                clean_call_results = []
+                for rr in call_results:
+                    seg_id = rr.get("segment_id") or rr.get("document_name") or ""
+                    clean_call_results.append({
+                        "position": rr.get("position"),
+                        "segment_id": seg_id,
+                        "document_name": rr.get("document_name") or "",
+                        "score": rr.get("score"),
+                        "content": (rr.get("content") or "")[:300],
+                        "content_hash": rr.get("content_hash") or "",
+                        "is_expected": (seg_id == expected_seg_id) if expected_seg_id else False,
+                    })
+                    all_results.append({
+                        "position": rr.get("position"),
+                        "segment_id": seg_id,
+                        "document_name": rr.get("document_name") or "",
+                        "score": rr.get("score"),
+                        "content": (rr.get("content") or "")[:300],
+                        "content_hash": rr.get("content_hash") or "",
+                        "is_expected": (seg_id == expected_seg_id) if expected_seg_id else False,
+                        "_retrieval_call_order": call.get("order"),
+                    })
+                clean_calls.append({
+                    "order": call.get("order"),
+                    "observation_id": call.get("observation_id"),
+                    "query": call.get("query"),
+                    "start_time": call.get("start_time"),
+                    "end_time": call.get("end_time"),
+                    "latency_ms": call.get("latency_ms"),
+                    "results": clean_call_results,
+                    "result_count": len(clean_call_results),
+                })
+            base["retrieval_calls"] = clean_calls
+            base["retrieval_call_count"] = len(clean_calls)
+            base["retrieval_results"] = all_results  # 平展用于兼容
+            base["retrieval_result_count"] = len(all_results)
+            base["retrieval_query"] = retrieval_calls[-1].get("query") or sample.get("question") or ""
+        else:
+            # 单检索模式（向后兼容）
+            raw_results = sample.get("retrieval_results") or []
+            clean_results = []
+            for rr in raw_results:
+                seg_id = rr.get("segment_id") or rr.get("document_name") or ""
+                clean_results.append({
+                    "position": rr.get("position"),
+                    "segment_id": seg_id,
+                    "document_name": rr.get("document_name") or "",
+                    "score": rr.get("score"),
+                    "content": (rr.get("content") or "")[:300],
+                    "content_hash": rr.get("content_hash") or "",
+                    "is_expected": (seg_id == expected_seg_id) if expected_seg_id else False,
+                })
+            base["retrieval_results"] = clean_results
+            base["retrieval_result_count"] = len(raw_results)
+            base["retrieval_query"] = sample.get("retrieval_query") or sample.get("question") or ""
+            base["retrieval_calls"] = []
+            base["retrieval_call_count"] = 0
     else:
         base["retrieval_results"] = []
         base["retrieval_result_count"] = 0
         base["retrieval_query"] = judge_result.get("question", "")
+        base["retrieval_calls"] = []
+        base["retrieval_call_count"] = 0
+
+    # ── 多检索命中统计 ──
+    per_call_hits = judge_result.get("per_call_hits") or []
+    if per_call_hits:
+        base["per_call_hits"] = per_call_hits
+        base["subquery_hit_count"] = judge_result.get("subquery_hit_count", 0)
+        base["per_subquery_hit"] = judge_result.get("per_subquery_hit", False)
+
+    # 召回规模信息
+    actual_returned = base["retrieval_result_count"]
+    effective_k = min(configured_top_k, actual_returned)
+    doc_chunks = doc_chunk_counts.get(doc_name) if doc_chunk_counts else None
+
+    if actual_returned >= configured_top_k:
+        window_status = "full_window"
+        window_reason = ""
+    else:
+        window_status = "partial_window"
+        window_reason = _determine_partial_window_reason(doc_name, configured_top_k, doc_chunk_counts)
+
+    base["configured_top_k"] = configured_top_k
+    base["actual_returned_count"] = actual_returned
+    base["effective_k"] = effective_k
+    base["window_status"] = window_status
+    base["window_reason"] = window_reason
+    base["target_source_document"] = doc_name
+    base["target_source_document_chunk_count"] = doc_chunks
+    base["knowledge_base_total_chunks"] = knowledge_base_total_chunks
 
     return base
 
@@ -418,7 +522,8 @@ def _render_chunk_exact_diagnostic_cards(html_parts, records, total_count, secti
         html_parts.append(f'<p class="section-note">共 {total_count} 条</p>')
 
     html_parts.append('<table><tr><th>#</th><th>Query</th><th>Target Label</th>'
-                      '<th>Expected Segment</th><th>首次命中</th><th>状态</th></tr>')
+                      '<th>Expected Segment</th><th>首次命中</th><th>状态</th>'
+                      '<th>实际返回</th><th>有效 K</th><th>窗口状态</th></tr>')
 
     for i, d in enumerate(records, 1):
         query = _safe_str(d.get("retrieval_query") or d.get("question", ""))
@@ -429,37 +534,145 @@ def _render_chunk_exact_diagnostic_cards(html_parts, records, total_count, secti
         pos_str = f"Top{pos}" if pos is not None else "未命中"
         status = "✅ 命中" if pos is not None and pos <= 5 else "❌ 未命中"
 
+        # 召回规模信息
+        actual = d.get("actual_returned_count", d.get("retrieval_result_count", "?"))
+        eff_k = d.get("effective_k", "?")
+        win_status = d.get("window_status", "")
+        win_display = ""
+        if win_status == "partial_window":
+            reason = d.get("window_reason", "")
+            reason_text = {"source_document_has_fewer_chunks": "文档 chunk 不足",
+                           "unknown": "原因未知"}.get(reason, reason)
+            win_display = f'<span class="warn">⚠️ partial ({reason_text})</span>'
+        elif win_status == "full_window":
+            win_display = "✅ full"
+
         html_parts.append(
             f'<tr><td>{i}</td>'
             f'<td title="{_safe_str(d.get("question", ""))}">{query[:60]}</td>'
             f'<td>{target_label}</td>'
             f'<td title="{expected_seg_full}">{expected_seg}</td>'
             f'<td>{pos_str}</td>'
-            f'<td>{status}</td></tr>'
+            f'<td>{status}</td>'
+            f'<td>{actual}</td>'
+            f'<td>{eff_k}</td>'
+            f'<td>{win_display}</td></tr>'
         )
 
     html_parts.append('</table>')
 
-    # 展开详细检索结果
+    # 展开详细检索结果（展示全部实际返回结果）
     for i, d in enumerate(records, 1):
-        ret_results = d.get("retrieval_results") or []
-        if ret_results:
-            query = d.get("retrieval_query") or d.get("question", "")
-            expected_seg = d.get("expected_segment_id", "")
-            html_parts.append(f'<details><summary>#{i} {_safe_str(query[:50])} — 实际 Top5 返回</summary>')
+        retrieval_calls = d.get("retrieval_calls") or []
+        expected_seg = d.get("expected_segment_id", "")
+
+        if retrieval_calls:
+            # ── 多检索模式：按 call 展示 ──
+            call_count = d.get("retrieval_call_count", len(retrieval_calls))
+            total_results = d.get("retrieval_result_count", 0)
+            subquery_hit = d.get("subquery_hit_count", 0)
+            per_call_hits = d.get("per_call_hits") or []
+
+            html_parts.append(f'<details><summary>#{i} 多检索 ({call_count} 次调用, '
+                              f'共 {total_results} 条结果, {subquery_hit}/{call_count} 次命中)</summary>')
             html_parts.append(f'<p class="section-note">Expected: <code>{_safe_str(expected_seg)}</code></p>')
-            html_parts.append('<table class="retrieval-table"><tr><th>Rank</th><th>Segment ID</th><th>Score</th></tr>')
-            for rr in ret_results:
-                seg_id = _safe_str(_short_id(rr.get("segment_id", "")))
-                seg_id_full = _safe_str(rr.get("segment_id", ""))
-                score = rr.get("score", "")
-                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _safe_str(str(score))
-                html_parts.append(
-                    f'<tr><td>{rr.get("position", "")}</td>'
-                    f'<td title="{seg_id_full}">{seg_id}</td>'
-                    f'<td>{score_str}</td></tr>'
-                )
-            html_parts.append('</table></details>')
+
+            for call in retrieval_calls:
+                call_order = call.get("order", "?")
+                call_query = _safe_str(call.get("query") or "(无 query)")
+                call_latency = call.get("latency_ms")
+                call_result_count = call.get("result_count", 0)
+                call_obs_id = _safe_str(_short_id(call.get("observation_id", "")))
+
+                # 查找该 call 的命中状态
+                call_hit_info = ""
+                for h in per_call_hits:
+                    if h.get("order") == call_order:
+                        hp = h.get("hit_position")
+                        if hp is not None:
+                            call_hit_info = f' <span class="hit">✅ 命中 Top{hp}</span>'
+                        else:
+                            call_hit_info = ' <span class="miss">❌ 未命中</span>'
+                        break
+
+                latency_str = f"{call_latency}ms" if call_latency is not None else "N/A"
+                html_parts.append(f'<div style="margin:8px 0;padding:8px;background:#f8f9fa;border-radius:4px;">')
+                html_parts.append(f'<strong>检索 #{call_order}</strong>: '
+                                  f'<code>{call_query[:80]}</code>{call_hit_info}<br>')
+                html_parts.append(f'<span class="section-note">'
+                                  f'observation: <code>{call_obs_id}</code> | '
+                                  f'延迟: {latency_str} | '
+                                  f'返回: {call_result_count} 条</span>')
+
+                call_results = call.get("results") or []
+                if call_results:
+                    html_parts.append('<table class="retrieval-table"><tr><th>Rank</th><th>Segment ID</th>'
+                                      '<th>来源文档</th><th>Score</th><th>Content Hash</th><th>内容摘要</th>'
+                                      '<th>是否目标</th></tr>')
+                    for rr in call_results:
+                        seg_id = _safe_str(_short_id(rr.get("segment_id", "")))
+                        seg_id_full = _safe_str(rr.get("segment_id", ""))
+                        doc_name = _safe_str(rr.get("document_name", "")[:20])
+                        score = rr.get("score", "")
+                        score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _safe_str(str(score))
+                        content_hash = _safe_str(_short_id(rr.get("content_hash", ""), 8))
+                        content = rr.get("content", "")
+                        content_summary = content[:100] + ("..." if len(content) > 100 else "")
+                        is_exp = rr.get("is_expected", False)
+                        marker = ' 🎯' if is_exp else ""
+                        row_class = ' class="hit"' if is_exp else ""
+                        html_parts.append(
+                            f'<tr{row_class}><td>{rr.get("position", "")}{marker}</td>'
+                            f'<td title="{seg_id_full}">{seg_id}</td>'
+                            f'<td>{doc_name}</td>'
+                            f'<td>{score_str}</td>'
+                            f'<td>{content_hash}</td>'
+                            f'<td class="content-cell">{_safe_str(content_summary)}</td>'
+                            f'<td>{"✅" if is_exp else ""}</td></tr>'
+                        )
+                    html_parts.append('</table>')
+                html_parts.append('</div>')
+
+            html_parts.append('</details>')
+        else:
+            # ── 单检索模式（向后兼容） ──
+            ret_results = d.get("retrieval_results") or []
+            if ret_results:
+                query = d.get("retrieval_query") or d.get("question", "")
+                actual_count = d.get("actual_returned_count", len(ret_results))
+                configured = d.get("configured_top_k", "?")
+                window_note = ""
+                if d.get("window_status") == "partial_window":
+                    window_note = f' <span class="warn">⚠️ 实际返回 {actual_count} 条 &lt; 配置 {configured}</span>'
+
+                html_parts.append(f'<details><summary>#{i} {_safe_str(query[:50])} '
+                                  f'— 实际返回 {actual_count} 条{window_note}</summary>')
+                html_parts.append(f'<p class="section-note">Expected: <code>{_safe_str(expected_seg)}</code></p>')
+                html_parts.append('<table class="retrieval-table"><tr><th>Rank</th><th>Segment ID</th>'
+                                  '<th>来源文档</th><th>Score</th><th>Content Hash</th><th>内容摘要</th>'
+                                  '<th>是否目标</th></tr>')
+                for rr in ret_results:
+                    seg_id = _safe_str(_short_id(rr.get("segment_id", "")))
+                    seg_id_full = _safe_str(rr.get("segment_id", ""))
+                    doc_name = _safe_str(rr.get("document_name", "")[:20])
+                    score = rr.get("score", "")
+                    score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _safe_str(str(score))
+                    content_hash = _safe_str(_short_id(rr.get("content_hash", ""), 8))
+                    content = rr.get("content", "")
+                    content_summary = content[:100] + ("..." if len(content) > 100 else "")
+                    is_exp = rr.get("is_expected", False)
+                    marker = ' 🎯' if is_exp else ""
+                    row_class = ' class="hit"' if is_exp else ""
+                    html_parts.append(
+                        f'<tr{row_class}><td>{rr.get("position", "")}{marker}</td>'
+                        f'<td title="{seg_id_full}">{seg_id}</td>'
+                        f'<td>{doc_name}</td>'
+                        f'<td>{score_str}</td>'
+                        f'<td>{content_hash}</td>'
+                        f'<td class="content-cell">{_safe_str(content_summary)}</td>'
+                        f'<td>{"✅" if is_exp else ""}</td></tr>'
+                    )
+                html_parts.append('</table></details>')
 
 
 def _render_chunk_exact_sample_appendix(html_parts, all_judge_results, sample_lookup):
@@ -857,6 +1070,93 @@ def _render_layered_table(groups, group_label, threshold=5):
     return "".join(parts)
 
 
+def _render_recall_overview_section(configured_top_k, knowledge_base_total_chunks,
+                                    total_documents, doc_chunk_counts,
+                                    recall_stats):
+    """渲染召回规模概览 HTML 区块。"""
+    parts = []
+
+    # 全局配置信息
+    kb_display = knowledge_base_total_chunks if knowledge_base_total_chunks is not None else "未知"
+    doc_display = total_documents if total_documents is not None else "未知"
+
+    parts.append('<div class="info-box">')
+    parts.append(f'<strong>召回规模配置</strong><br>')
+    parts.append(f'配置 TopK: <strong>{configured_top_k}</strong> | '
+                 f'知识库总 chunk 数: <strong>{kb_display}</strong> | '
+                 f'文档数: <strong>{doc_display}</strong>')
+    parts.append('</div>')
+
+    # 每文档 chunk 数量统计
+    if doc_chunk_counts:
+        parts.append('<details open><summary><strong>各文档 chunk 数量统计</strong></summary>')
+        parts.append('<table><tr><th>文档名</th><th>chunk 总数</th></tr>')
+        for doc_name, count in sorted(doc_chunk_counts.items()):
+            parts.append(f'<tr><td>{_safe_str(doc_name)}</td><td>{count}</td></tr>')
+        parts.append('</table></details>')
+
+    # 实际返回数量分布
+    dist = recall_stats.get("return_distribution", {})
+    if dist:
+        parts.append('<details open><summary><strong>实际返回数量分布</strong></summary>')
+        parts.append('<table><tr><th>返回数量</th><th>题目数</th></tr>')
+        for bucket in _return_distribution_buckets(configured_top_k):
+            cnt = dist.get(bucket, 0)
+            parts.append(f'<tr><td>{bucket} 条</td><td>{cnt}</td></tr>')
+        parts.append('</table></details>')
+
+    # 窗口状态汇总
+    full = recall_stats.get("full_window_count", 0)
+    partial = recall_stats.get("partial_window_count", 0)
+    rate = recall_stats.get("partial_window_rate", 0)
+    parts.append(f'<p class="section-note">窗口状态: '
+                 f'full_window <strong>{full}</strong> | '
+                 f'partial_window <strong>{partial}</strong> '
+                 f'({rate:.1%})</p>')
+
+    return "".join(parts)
+
+
+def _render_doc_level_recall_table(doc_stats, configured_top_k):
+    """渲染文档级召回统计表。"""
+    if not doc_stats:
+        return '<p class="section-note">暂无文档级统计数据</p>'
+
+    parts = [
+        '<table><tr><th>文档名</th><th>chunk 总数</th><th>题目数</th>'
+        '<th>平均返回数</th><th>窗口受限题数</th>'
+        '<th>Top1</th><th>Top3</th><th>Top5</th><th>Top10</th>'
+        '<th>Top10 未命中</th><th>窗口受限比例</th></tr>'
+    ]
+
+    for d in doc_stats:
+        n = d["question_count"]
+        chunk_display = d["chunk_count"] if d["chunk_count"] is not None else "未知"
+        t1_str = f'{d["t1"]}/{n} ({_pct(d["t1"]/n)})' if n else "N/A"
+        t3_str = f'{d["t3"]}/{n} ({_pct(d["t3"]/n)})' if n else "N/A"
+        t5_str = f'{d["t5"]}/{n} ({_pct(d["t5"]/n)})' if n else "N/A"
+        t10_str = f'{d["t10"]}/{n} ({_pct(d["t10"]/n)})' if n else "N/A"
+
+        parts.append(
+            f'<tr><td>{_safe_str(d["doc_name"])}</td>'
+            f'<td>{chunk_display}</td>'
+            f'<td>{n}</td>'
+            f'<td>{d["avg_returned"]}</td>'
+            f'<td>{d["partial_count"]}</td>'
+            f'<td>{t1_str}</td>'
+            f'<td>{t3_str}</td>'
+            f'<td>{t5_str}</td>'
+            f'<td>{t10_str}</td>'
+            f'<td>{d["miss10"]}</td>'
+            f'<td>{_pct(d["partial_rate"])}</td></tr>'
+        )
+
+    parts.append('</table>')
+    parts.append(f'<p class="section-note">配置 TopK = {configured_top_k}；'
+                 f'"窗口受限"指实际返回数 &lt; 配置 TopK</p>')
+    return "".join(parts)
+
+
 # ====== 排名诊断 ======
 
 def _build_ranking_diagnostics(chunk_exact_evaluable):
@@ -879,6 +1179,196 @@ def _build_ranking_diagnostics(chunk_exact_evaluable):
         else:
             buckets["top10_miss"] += 1
     return buckets
+
+
+# ====== 召回规模信息 ======
+
+def _resolve_doc_name(judge_result, sample=None, question_meta_lookup=None):
+    """解析文档名称，优先级：judge_result > 题集元数据 > sample。"""
+    doc_name = judge_result.get("document_name", "")
+    if not doc_name and question_meta_lookup:
+        meta = _lookup_question_meta(judge_result, question_meta_lookup)
+        doc_name = meta.get("document_name", "")
+    if not doc_name and sample:
+        doc_name = sample.get("source_file_name", "") or sample.get("document_name", "")
+    return doc_name or "未知"
+
+
+def _determine_partial_window_reason(doc_name, configured_top_k, doc_chunk_counts=None):
+    """判断 partial_window 原因（保守策略）。
+
+    仅当文档 chunk 总数明确小于 configured_top_k 时才归因为
+    "source_document_has_fewer_chunks"，其余情况一律 "unknown"。
+    """
+    if doc_chunk_counts and doc_name in doc_chunk_counts:
+        if doc_chunk_counts[doc_name] < configured_top_k:
+            return "source_document_has_fewer_chunks"
+    return "unknown"
+
+
+def _compute_sample_recall_info(judge_result, sample_lookup, configured_top_k=10,
+                                knowledge_base_total_chunks=None, doc_chunk_counts=None,
+                                question_meta_lookup=None):
+    """计算单个 chunk_exact 样本的召回规模信息。
+
+    Returns:
+        dict: {
+            "actual_returned_count": int,
+            "effective_k": int,
+            "window_status": "full_window" | "partial_window",
+            "window_reason": str,
+            "configured_top_k": int,
+            "knowledge_base_total_chunks": int | None,
+            "target_source_document": str,
+            "target_source_document_chunk_count": int | None,
+        }
+    """
+    tid = judge_result.get("trace_id", "")
+    sample = sample_lookup.get(tid)
+    retrieval_results = (sample.get("retrieval_results") or []) if sample else []
+    actual_returned_count = len(retrieval_results)
+    effective_k = min(configured_top_k, actual_returned_count)
+
+    doc_name = _resolve_doc_name(judge_result, sample, question_meta_lookup)
+    doc_chunks = None
+    if doc_chunk_counts and doc_name in doc_chunk_counts:
+        doc_chunks = doc_chunk_counts[doc_name]
+
+    if actual_returned_count >= configured_top_k:
+        window_status = "full_window"
+        window_reason = ""
+    else:
+        window_status = "partial_window"
+        window_reason = _determine_partial_window_reason(doc_name, configured_top_k, doc_chunk_counts)
+
+    return {
+        "actual_returned_count": actual_returned_count,
+        "effective_k": effective_k,
+        "window_status": window_status,
+        "window_reason": window_reason,
+        "configured_top_k": configured_top_k,
+        "knowledge_base_total_chunks": knowledge_base_total_chunks,
+        "target_source_document": doc_name,
+        "target_source_document_chunk_count": doc_chunks,
+    }
+
+
+def _compute_recall_statistics(chunk_exact_evaluable, sample_lookup, configured_top_k=10,
+                               knowledge_base_total_chunks=None, doc_chunk_counts=None,
+                               question_meta_lookup=None):
+    """计算全局召回规模统计。
+
+    Returns:
+        dict: {
+            "return_distribution": {bucket_label: count},
+            "full_window_count": int,
+            "partial_window_count": int,
+            "partial_window_rate": float,
+            "per_sample_info": list[dict],
+        }
+    """
+    distribution = {}
+    for bucket in _return_distribution_buckets(configured_top_k):
+        distribution[bucket] = 0
+
+    full_window_count = 0
+    partial_window_count = 0
+    per_sample_info = []
+
+    for r in chunk_exact_evaluable:
+        info = _compute_sample_recall_info(
+            r, sample_lookup, configured_top_k,
+            knowledge_base_total_chunks, doc_chunk_counts, question_meta_lookup)
+        per_sample_info.append(info)
+        n = info["actual_returned_count"]
+        bucket = _return_count_to_bucket(n, configured_top_k)
+        distribution[bucket] = distribution.get(bucket, 0) + 1
+
+        if info["window_status"] == "full_window":
+            full_window_count += 1
+        else:
+            partial_window_count += 1
+
+    total = len(chunk_exact_evaluable) or 1
+    return {
+        "return_distribution": distribution,
+        "full_window_count": full_window_count,
+        "partial_window_count": partial_window_count,
+        "partial_window_rate": partial_window_count / total,
+        "per_sample_info": per_sample_info,
+    }
+
+
+def _return_distribution_buckets(configured_top_k=10):
+    """生成返回数量分布的桶标签。"""
+    return ["1-3", "4-5", f"6-{configured_top_k - 1}", f"{configured_top_k}+"]
+
+
+def _return_count_to_bucket(n, configured_top_k=10):
+    """将实际返回数映射到分布桶。"""
+    if n <= 3:
+        return "1-3"
+    elif n <= 5:
+        return "4-5"
+    elif n < configured_top_k:
+        return f"6-{configured_top_k - 1}"
+    else:
+        return f"{configured_top_k}+"
+
+
+def _compute_doc_level_recall_stats(chunk_exact_evaluable, sample_lookup, configured_top_k=10,
+                                    doc_chunk_counts=None, question_meta_lookup=None):
+    """按 source document 统计召回规模。
+
+    Returns:
+        list[dict]: 按题目数降序排列，每项包含：
+            doc_name, chunk_count, question_count, avg_returned,
+            partial_count, t1, t3, t5, t10, miss10, partial_rate
+    """
+    question_meta_lookup = question_meta_lookup or {}
+    groups = {}
+    for r in chunk_exact_evaluable:
+        tid = r.get("trace_id", "")
+        sample = sample_lookup.get(tid)
+        doc_name = _resolve_doc_name(r, sample, question_meta_lookup)
+        groups.setdefault(doc_name, []).append(r)
+
+    stats = []
+    for doc_name, items in groups.items():
+        n = len(items)
+        total_returned = 0
+        partial_count = 0
+        for r in items:
+            tid = r.get("trace_id", "")
+            sample = sample_lookup.get(tid)
+            ret_count = len(sample.get("retrieval_results") or []) if sample else 0
+            total_returned += ret_count
+            if ret_count < configured_top_k:
+                partial_count += 1
+
+        t1 = sum(r.get("retrieval_top1_hit", 0) for r in items)
+        t3 = sum(r.get("retrieval_top3_hit", 0) for r in items)
+        t5 = sum(r.get("retrieval_top5_hit", 0) for r in items)
+        t10 = sum(r.get("retrieval_top10_hit", 0) for r in items)
+        miss10 = sum(1 for r in items if r.get("retrieval_top10_hit", 0) == 0)
+
+        chunk_count = None
+        if doc_chunk_counts and doc_name in doc_chunk_counts:
+            chunk_count = doc_chunk_counts[doc_name]
+
+        stats.append({
+            "doc_name": doc_name,
+            "chunk_count": chunk_count,
+            "question_count": n,
+            "avg_returned": round(total_returned / n, 1) if n else 0,
+            "partial_count": partial_count,
+            "t1": t1, "t3": t3, "t5": t5, "t10": t10,
+            "miss10": miss10,
+            "partial_rate": partial_count / n if n else 0,
+        })
+
+    stats.sort(key=lambda x: x["question_count"], reverse=True)
+    return stats
 
 
 # ====== 失败样本证据对照 ======
@@ -1046,7 +1536,12 @@ def _render_top1_miss_evidence(records, total_count, config_top_k=10):
             parts.append(f'<span>query_style: <code>{_safe_str(rec["query_style"])}</code></span>')
         if rec["target_label"]:
             parts.append(f'<span>标签: {_safe_str(rec["target_label"])}</span>')
-        parts.append(f'<span>配置 TopK: {config_top_k} | 实际返回: {rec["actual_returned_count"]}</span>')
+        _actual = rec["actual_returned_count"]
+        _eff_k = min(config_top_k, _actual)
+        _win_note = ""
+        if _actual < config_top_k:
+            _win_note = f' <span class="warn">⚠️ partial_window（有效 K={_eff_k}）</span>'
+        parts.append(f'<span>配置 TopK: {config_top_k} | 实际返回: {_actual} | 有效 K: {_eff_k}{_win_note}</span>')
         parts.append(f'</div>')
 
         # review_label
@@ -1465,11 +1960,26 @@ def build_ai_analysis_markdown(config, cumulative_metrics, chunk_exact_evaluable
 
 def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics,
                           all_judge_results, export_scope="", sample_lookup=None,
-                          provenance_info=None):
-    """生成自包含 HTML 评测报告。"""
+                          provenance_info=None,
+                          configured_top_k=None,
+                          knowledge_base_total_chunks=None,
+                          doc_chunk_counts=None):
+    """生成自包含 HTML 评测报告。
+
+    Args:
+        configured_top_k: 配置 TopK（None 时从 config_snapshot 读取，默认 10）
+        knowledge_base_total_chunks: 知识库总 chunk 数（None 时显示"未知"）
+        doc_chunk_counts: dict[doc_name → chunk_count]（None 时显示"未知"）
+    """
     # 补齐旧版 chunk_exact 结果缺失的 TopK 字段
     for r in all_judge_results:
         backfill_chunk_exact_topk(r, sample_lookup)
+
+    # 解析 configured_top_k（优先使用传入参数，否则从 config_snapshot 读取）
+    if configured_top_k is None:
+        snapshot0 = (run_data_list[0].get("run", {}).get("config_snapshot") or {}) if run_data_list else {}
+        configured_top_k = snapshot0.get("top_k", 10) or 10
+    doc_chunk_counts = doc_chunk_counts or {}
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     config_name = _safe_str(config.get("config_name", ""))
@@ -1504,9 +2014,28 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     all_qsid = {r.get("question_set_id", "") for r in valid_results if r.get("question_set_id")}
     is_cross_set = len(all_qsid) > 1
 
+    # 召回规模统计（仅 chunk_exact 轨道）
+    recall_stats = {}
+    doc_level_recall = []
+    if chunk_exact_evaluable:
+        # 加载题集元数据（用于文档名解析）
+        _qmeta_for_recall = load_question_set_metadata(all_qsid or None)
+        recall_stats = _compute_recall_statistics(
+            chunk_exact_evaluable, sample_lookup, configured_top_k,
+            knowledge_base_total_chunks, doc_chunk_counts, _qmeta_for_recall)
+        doc_level_recall = _compute_doc_level_recall_stats(
+            chunk_exact_evaluable, sample_lookup, configured_top_k,
+            doc_chunk_counts, _qmeta_for_recall)
+    total_documents = len(doc_chunk_counts) if doc_chunk_counts else None
+
     # 诊断数据
     diag = build_diagnostic_data(all_judge_results, sample_lookup, config)
-    ce_diag = build_chunk_exact_diagnostic_data(all_judge_results, sample_lookup, config)
+    ce_diag = build_chunk_exact_diagnostic_data(
+        all_judge_results, sample_lookup, config,
+        configured_top_k=configured_top_k,
+        knowledge_base_total_chunks=knowledge_base_total_chunks,
+        doc_chunk_counts=doc_chunk_counts,
+        question_meta_lookup=_qmeta_for_recall if chunk_exact_evaluable else None)
 
     # 总览统计
     total_questions = sum(rd.get("run", {}).get("question_count", 0) for rd in run_data_list)
@@ -1653,20 +2182,28 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
     # chunk_exact 摘要卡片
     if chunk_exact_evaluable:
         ce_t10 = sum(r.get("retrieval_top10_hit", 0) for r in chunk_exact_evaluable)
+        # 窗口状态信息
+        _fw = recall_stats.get("full_window_count", ce_n)
+        _pw = recall_stats.get("partial_window_count", 0)
+        _window_note = ""
+        if _pw > 0:
+            _window_note = f'<br><span class="warn">⚠️ 其中 {_pw} 题实际返回 &lt; {configured_top_k} 条，按实际窗口计算</span>'
+
         html_parts.append(f"""
 <div class="metric-grid">
   <div class="metric-card"><div class="value">{ce_n}/{track_counts['chunk_exact']}</div><div class="label">chunk_exact 可评测</div></div>
   <div class="metric-card"><div class="value">{ce_t1}/{ce_n} ({_pct(ce_t1/ce_n)})</div><div class="label">Top1</div></div>
   <div class="metric-card"><div class="value">{ce_t3}/{ce_n} ({_pct(ce_t3/ce_n)})</div><div class="label">Top3</div></div>
   <div class="metric-card"><div class="value">{ce_t5}/{ce_n} ({_pct(ce_t5/ce_n)})</div><div class="label">Top5</div></div>
-  <div class="metric-card"><div class="value">{ce_t10}/{ce_n} ({_pct(ce_t10/ce_n)})</div><div class="label">Top10</div></div>
+  <div class="metric-card"><div class="value">{ce_t10}/{ce_n} ({_pct(ce_t10/ce_n)})</div><div class="label">Top10 (配置={configured_top_k})</div></div>
 </div>
 <div class="info-box">
   <strong>指标含义说明：</strong><br>
   • <strong>TopK Hit</strong> = 严格命中同一 Dify segment_id / content_hash（机器判定，非语义匹配）<br>
   • <strong>Top10 命中但 Top1 未命中</strong> → 候选已召回，排序或相近块区分待分析（不自动等于 rerank 故障）<br>
   • <strong>Top10 未命中</strong> → 优先排查 query、embedding、chunk、候选召回或金标准<br>
-  • <strong>score</strong> 仅为 Dify 返回字段，<strong>rank</strong> 才是最终排序依据
+  • <strong>score</strong> 仅为 Dify 返回字段，<strong>rank</strong> 才是最终排序依据<br>
+  • full_window: <strong>{_fw}</strong> 题 | partial_window: <strong>{_pw}</strong> 题{_window_note}
 </div>
 """)
         if chunk_exact_unevaluable:
@@ -1721,6 +2258,13 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
             f'<td>{qc}</td><td>{status}</td><td>{bs}/{bt}</td><td>{started}</td></tr>'
         )
     html_parts.append('</table>')
+
+    # 2.5 召回规模概览
+    if chunk_exact_evaluable:
+        html_parts.append("<h2>2.5 召回规模概览</h2>")
+        html_parts.append(_render_recall_overview_section(
+            configured_top_k, knowledge_base_total_chunks,
+            total_documents, doc_chunk_counts, recall_stats))
 
     # 3. 全局 Judge 指标
     html_parts.append("<h2>3. 全局 Judge 指标</h2>")
@@ -1952,6 +2496,11 @@ def build_evaluation_html(config, config_runs, run_data_list, cumulative_metrics
         html_parts.append(_render_layered_table(layered["by_query_style"], "query_style"))
         html_parts.append("<h3>按 source document 分层</h3>")
         html_parts.append(_render_layered_table(layered["by_doc"], "文档"))
+
+        # 文档级召回统计
+        if doc_level_recall:
+            html_parts.append("<h3>文档级召回统计</h3>")
+            html_parts.append(_render_doc_level_recall_table(doc_level_recall, configured_top_k))
 
         # 排名诊断
         ranking_diag = _build_ranking_diagnostics(chunk_exact_evaluable)

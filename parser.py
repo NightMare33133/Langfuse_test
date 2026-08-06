@@ -77,6 +77,48 @@ def normalize_timestamp(value):
 
 
 
+def _parse_ts_for_sort(value):
+    """将时间字符串解析为 timezone-aware datetime，用于排序。
+
+    回退优先级：Langfuse trace timestamp → start_time → created_at → updated_at
+    解析失败返回 None（排在最后）。
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        pass
+
+    for fmt in _TIMESTAMP_FORMATS:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if text.endswith("Z"):
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+
+    return None
+
+
+
 def normalize_observation_row(row):
     """Normalize a raw observation row to a consistent internal format.
 
@@ -171,14 +213,23 @@ def build_trace_sample(trace_id, observations):
         "question": None,
         "root_input": None,
         "root_output": None,
+        # ── 兼容字段（单检索投影，仅保留最后一次 retrieval） ──
         "retrieval_query": None,
         "retrieval_results": [],
+        # ── 多检索字段（保留所有 retrieval calls） ──
+        "retrieval_calls": [],
+        "retrieval_call_count": 0,
         "llm_model": None,
         "llm_input": None,
         "llm_output": None,
         "final_answer": None,
         "observations": [],
+        # ── 时间字段（从 TRACE root 或最早 observation 提取） ──
+        "trace_timestamp": None,      # Langfuse trace.timestamp（TRACE root 的 startTime）
+        "earliest_obs_time": None,    # 所有 observation 中最早的 start_time
     }
+
+    _retrieval_order = 0  # 用于跟踪 retrieval call 顺序
 
     for obs in observations:
         parsed_input = obs.get("input")
@@ -207,6 +258,8 @@ def build_trace_sample(trace_id, observations):
                 "name": name,
                 "node_type": node_type,
                 "start_time": obs.get("startTime"),
+                "end_time": obs.get("endTime"),
+                "parent_observation_id": obs.get("parentObservationId"),
                 "input": parsed_input,
                 "output": parsed_output,
                 "metadata": parsed_metadata,
@@ -236,19 +289,50 @@ def build_trace_sample(trace_id, observations):
             if isinstance(parsed_output, dict) and parsed_output.get("answer"):
                 sample["final_answer"] = sample["final_answer"] or parsed_output["answer"]
 
+        # ── 知识检索：收集所有 retrieval calls ──
         if node_type == "knowledge-retrieval" or "??" in (name or ""):
+            _retrieval_order += 1
+            _query = None
+            _results = []
             if isinstance(parsed_input, dict):
-                sample["retrieval_query"] = parsed_input.get("query") or sample[
-                    "retrieval_query"
-                ]
+                _query = parsed_input.get("query")
             if isinstance(parsed_output, dict):
-                results = parsed_output.get("result") or []
-                if isinstance(results, list):
-                    sample["retrieval_results"] = [
+                raw_results = parsed_output.get("result") or []
+                if isinstance(raw_results, list):
+                    _results = [
                         simplify_retrieval_item(item)
-                        for item in results
+                        for item in raw_results
                         if isinstance(item, dict)
                     ]
+
+            # 计算延迟
+            _start = obs.get("startTime")
+            _end = obs.get("endTime")
+            _latency_ms = None
+            if _start and _end:
+                try:
+                    _dt_start = _parse_ts_for_sort(_start)
+                    _dt_end = _parse_ts_for_sort(_end)
+                    if _dt_start and _dt_end:
+                        _latency_ms = int((_dt_end - _dt_start).total_seconds() * 1000)
+                except Exception:
+                    pass
+
+            sample["retrieval_calls"].append({
+                "order": _retrieval_order,
+                "observation_id": obs.get("id"),
+                "query": _query,
+                "start_time": _start,
+                "end_time": _end,
+                "latency_ms": _latency_ms,
+                "results": _results,
+            })
+
+            # 兼容字段：保留最后一次 retrieval（向后兼容）
+            if _query:
+                sample["retrieval_query"] = _query
+            if _results:
+                sample["retrieval_results"] = _results
 
         if obs.get("rawType") == "GENERATION" or node_type == "llm" or name == "LLM":
             sample["llm_model"] = (
@@ -264,6 +348,20 @@ def build_trace_sample(trace_id, observations):
         if node_type == "answer" or "??" in (name or ""):
             if isinstance(parsed_output, dict) and parsed_output.get("answer"):
                 sample["final_answer"] = parsed_output["answer"]
+
+    sample["retrieval_call_count"] = len(sample["retrieval_calls"])
+
+    # ── 提取时间字段 ──
+    # 1. trace_timestamp: TRACE root 的 startTime（对应 Langfuse trace.timestamp）
+    # 2. earliest_obs_time: 所有 observation 中最早的 start_time
+    _earliest = None
+    for obs in sample["observations"]:
+        if obs.get("is_trace_root") and obs.get("start_time"):
+            sample["trace_timestamp"] = obs["start_time"]
+        st = obs.get("start_time")
+        if st and (_earliest is None or st < _earliest):
+            _earliest = st
+    sample["earliest_obs_time"] = _earliest
 
     return sample
 
@@ -628,7 +726,21 @@ def parse_langfuse_jsonl(input_path, progress_callback=None):
     if progress_callback:
         progress_callback("building", num_traces, num_traces, num_traces, 0)
 
-    samples.sort(key=lambda x: (x.get("question") or "", x["trace_id"]))
+    # 按时间倒序排列（最新在前），时间缺失排在最后
+    # 稳定排序：相同时间按 trace_id 升序保证确定性
+    _with_ts = []
+    _no_ts = []
+    for s in samples:
+        ts = s.get("trace_timestamp") or s.get("earliest_obs_time")
+        dt = _parse_ts_for_sort(ts)
+        if dt is None:
+            _no_ts.append(s)
+        else:
+            _with_ts.append((dt, s.get("trace_id", ""), s))
+
+    _with_ts.sort(key=lambda x: (-x[0].timestamp(), x[1]))
+    _no_ts.sort(key=lambda x: x.get("trace_id", ""))
+    samples = [item[2] for item in _with_ts] + _no_ts
 
     # Phase 4: backfill reference answers
     if progress_callback:
