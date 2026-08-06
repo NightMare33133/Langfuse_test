@@ -327,8 +327,9 @@ def build_chunk_catalog(segments: list[dict],
     """将原始 segments 转为标准化 chunk catalog。
 
     每条记录包含：
-    segment_id, position, document_id, document_name, content, index_node_id,
-    index_node_hash, tokens, word_count, enabled, status, content_hash
+    segment_id, position, document_id, document_name, content, summary,
+    index_node_id, index_node_hash, tokens, word_count, enabled, status,
+    content_hash
 
     Args:
         segments: Dify API 返回的 segment 列表
@@ -345,6 +346,11 @@ def build_chunk_catalog(segments: list[dict],
             # 尝试从 word_count 等字段推断，否则留空
             position = seg.get("index", "")
 
+        # summary: Dify Dataset API 在较新版本中返回的 AI 摘要字段
+        # 可能为 None（旧实例或未启用摘要功能），统一转为空字符串
+        raw_summary = seg.get("summary", "")
+        summary = (raw_summary or "").strip()
+
         entry = {
             "segment_id": seg.get("id", ""),
             "position": position,
@@ -352,6 +358,7 @@ def build_chunk_catalog(segments: list[dict],
             "document_name": document_name or seg.get("document_name", ""),
             "dataset_id": dataset_id,
             "content": content,
+            "summary": summary,
             "index_node_id": seg.get("index_node_id", ""),
             "index_node_hash": seg.get("index_node_hash", ""),
             "tokens": seg.get("tokens", 0),
@@ -385,7 +392,8 @@ def detect_duplicates(catalog: list[dict]) -> dict[str, list[dict]]:
 # 导出的列顺序（含 document_name，便于按文档出题）
 _EXPORT_COLUMNS = [
     "segment_id", "position", "document_id", "document_name", "dataset_id",
-    "content", "index_node_id", "index_node_hash",
+    "content", "summary",
+    "index_node_id", "index_node_hash",
     "tokens", "word_count", "enabled", "status", "content_hash",
 ]
 

@@ -366,6 +366,22 @@ def _load_sample_lookup(cache_key="", proc_path_str=""):
     return lookup
 
 
+def _clear_session_samples():
+    """清理 session 中的解析结果（不删除磁盘文件）。"""
+    for _k in ("samples", "summary", "sample_page", "_use_frozen_source"):
+        st.session_state.pop(_k, None)
+
+
+def _on_project_changed(old_proj_id: str, new_proj_id: str):
+    """项目切换时清理 session 中的旧解析结果。
+
+    当 old_proj_id 为空（启动时无项目 / legacy fallback）且 new_proj_id 非空，
+    或两者不同且均非空时，清理 session 中的 samples/summary。
+    """
+    if new_proj_id and (not old_proj_id or old_proj_id != new_proj_id):
+        _clear_session_samples()
+
+
 def _load_samples_from_path(proc_path_str):
     """从指定路径加载 processed samples（不含 observations），返回 {trace_id: sample}。"""
     lookup = {}
@@ -1145,9 +1161,60 @@ if _rss_log:
         _delta = _rss_log[-1]["rss_mb"] - _rss_log[0]["rss_mb"]
         st.caption(f"累计变化: {_delta:+.0f} MB")
 
-# Load existing samples if available（优先隔离路径，回退旧全局路径）
-if "samples" not in st.session_state:
-    _loaded_proj_id = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+# ── 自动恢复上次连接的项目 ──
+# session_state 在新浏览器 tab 中为空，但项目注册表在磁盘上持久化。
+# 启动时自动加载最近同步的项目，使 find_latest_processed 能找到隔离路径。
+if "_lf_project_info" not in st.session_state:
+    try:
+        from langfuse_project import list_projects as _lp_list
+        _registered = _lp_list()
+        if _registered:
+            # 取最近同步的项目
+            _registered.sort(key=lambda p: p.get("last_sync_at", "") or "", reverse=True)
+            _auto_proj = _registered[0]
+            st.session_state["_lf_project_info"] = {
+                "project_id": _auto_proj["project_id"],
+                "project_name": _auto_proj.get("project_name", ""),
+                "host": _auto_proj.get("host", ""),
+                "key_masked": _auto_proj.get("key_masked", ""),
+            }
+    except Exception:
+        pass
+
+# ── 清理跨项目残留的 _use_frozen_source ──
+_loaded_proj_id = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+_frozen_src = st.session_state.get("_use_frozen_source")
+if _frozen_src and _loaded_proj_id:
+    _frozen_pid = _frozen_src.get("project_id", "")
+    if _frozen_pid and _frozen_pid != _loaded_proj_id:
+        st.session_state.pop("_use_frozen_source", None)
+        _frozen_src = None
+
+# ── 强制刷新：当前缓存有效时，从磁盘重新加载最新解析结果 ──
+# 核心问题：Streamlit session_state 跨浏览器 tab 持久化。
+# 上次会话解析的 frozen snapshot 样本会残留，即使当前缓存已有更新数据。
+# 解决：比较当前缓存 trace_count 与 session 中样本数，不一致则强制从磁盘重新加载。
+# 保护：_frozen_source_just_set 标记防止用户刚选择的冻结源被误清。
+# 重新读取 project_id（button handler 可能已更新 session_state）
+_loaded_proj_id = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+_need_reload = "samples" not in st.session_state
+_just_set = st.session_state.pop("_frozen_source_just_set", False)
+if not _need_reload and _loaded_proj_id and not _just_set:
+    try:
+        from langfuse_project import get_current_cache_stats as _gccs_check
+        _ccs_check = _gccs_check(_loaded_proj_id)
+        _cc_trace = _ccs_check.get("trace_count", 0)
+        _session_count = len(st.session_state.get("samples") or [])
+        # 当前缓存有数据 且 数量不同 → 强制刷新（旧 session 残留数据过期）
+        if _cc_trace > 0 and _cc_trace != _session_count:
+            _need_reload = True
+            # 清除过期的 _use_frozen_source（来自上一次 session）
+            st.session_state.pop("_use_frozen_source", None)
+            _frozen_src = None
+    except Exception:
+        pass
+
+if _need_reload:
     try:
         from langfuse_project import find_latest_processed as _flp_startup
         _samples_file, _summary_file = _flp_startup(_loaded_proj_id)
@@ -2269,7 +2336,7 @@ with tab_kb:
 
                             st.caption(
                                 f"当前文档导出包含 {len(catalog)} 条分块记录，"
-                                f"字段：segment_id, position, document_id, document_name, content, "
+                                f"字段：segment_id, position, document_id, document_name, content, summary, "
                                 f"index_node_id, index_node_hash, tokens, word_count, "
                                 f"enabled, status, content_hash"
                             )
@@ -5126,6 +5193,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 st.success(msg)
                                 try:
                                     _proj_info = identify_project_info(_tp["host"], _tp_pk, _tp_sk)
+                                    _old_pid = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+                                    _on_project_changed(_old_pid, _proj_info.get("project_id", ""))
                                     st.session_state["_lf_project_info"] = _proj_info
                                 except Exception as _pe:
                                     st.warning(f"项目识别失败: {_pe}")
@@ -5161,6 +5230,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 st.success(msg)
                                 try:
                                     _proj_info = identify_project_info(langfuse_host, langfuse_pk, langfuse_sk)
+                                    _old_pid = st.session_state.get("_lf_project_info", {}).get("project_id", "")
+                                    _on_project_changed(_old_pid, _proj_info.get("project_id", ""))
                                     st.session_state["_lf_project_info"] = _proj_info
                                 except Exception as _pe:
                                     st.warning(f"项目识别失败: {_pe}")
@@ -5349,7 +5420,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                                 langfuse_host, _proj_info.get("key_masked", ""),
                             )
 
-                            # 更新 stats
+                            # 更新 stats（同步不切换项目，保留 _use_frozen_source）
                             st.session_state["_lf_project_info"] = _proj_info
                             st.rerun()
 
@@ -5498,6 +5569,22 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         f"⚠️ 当前展示的是历史解析结果（来源类型：`{_parsed_source_type}`）。"
                         f"点击下方按钮解析当前缓存。"
                     )
+                elif _parsed_source_type == "current_cache":
+                    # 检查缓存是否在上次解析后被更新（fingerprint 变化）
+                    _parsed_fp = _parsed_summary.get("source_file_fingerprint", "")
+                    if _parsed_fp:
+                        try:
+                            from langfuse_project import _traces_path as __tp, _obs_path as __op
+                            _cur_trace_fp = compute_file_fingerprint(__tp(_proj_id_for_sources))
+                            _cur_obs_fp = compute_file_fingerprint(__op(_proj_id_for_sources))
+                            _cur_fp = f"{_cur_trace_fp}|{_cur_obs_fp}" if _cur_trace_fp else ""
+                            if _cur_fp and _parsed_fp != _cur_fp:
+                                st.warning(
+                                    "⚠️ 当前解析结果不是最新动态缓存（缓存已更新）。"
+                                    "请点击「解析当前缓存」刷新。"
+                                )
+                        except Exception:
+                            pass
 
         elif _proj_id_for_sources and _cc_trace > 0 and not _cc_has_obs:
             st.warning("当前缓存不含 observation 数据。请检查 API 权限后重新同步。")
@@ -5550,6 +5637,8 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                         has_obs = _sel_frozen.get("has_observations", False)
                         _can_parse = True
                         st.session_state["_use_frozen_source"] = _sel_frozen
+                        # 标记为当前 session 的主动选择，防止 startup 清理误删
+                        st.session_state["_frozen_source_just_set"] = True
                         st.rerun()
 
         # 检查是否用户选择了历史数据源
@@ -5759,10 +5848,24 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
     if not samples:
         st.info("请在上方「数据导入」区域上传或拉取 Langfuse 数据，然后点击「开始解析」")
     else:
-        input_file = summary.get("input_file") or (selected_name if 'selected_name' in dir() and selected_name else "") or ""
+        _src_type = summary.get("langfuse_source_type", "")
+        _src_snap = summary.get("langfuse_snapshot_id", "")
+        _src_pid = summary.get("langfuse_project_id", "")
+        input_file = summary.get("input_file") or ""
         output_file = summary.get("output_file") or ""
-        if input_file:
-            st.caption(f"数据来源: `{Path(input_file).name}`" + (f" → 解析结果: `{Path(output_file).name}`" if output_file else ""))
+
+        # 显示实际数据来源（区分动态缓存 / 冻结快照 / 旧版文件）
+        if _src_type == "current_cache":
+            _src_label = f"当前动态缓存（项目 `{_src_pid[:20]}...`）"
+        elif _src_type == "evidence_snapshot" and _src_snap:
+            _src_label = f"冻结快照 `{_src_snap}`"
+        elif input_file:
+            _src_label = f"`{Path(input_file).name}`"
+        else:
+            _src_label = "未知来源"
+
+        _output_label = f" → 解析结果: `{output_file}`" if output_file else ""
+        st.caption(f"数据来源: {_src_label}{_output_label}")
 
         # Stats
         trace_count = summary.get("trace_count") or len(samples)
