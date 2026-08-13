@@ -945,7 +945,7 @@ def migrate_processed_samples(processed_file=None, experiments_dir=None, backup=
                 # 获取 run_id
                 run_id = obj.get("run_id", "")
                 if not run_id:
-                    user_id = obj.get("user_id", "")
+                    user_id = obj.get("user_id") or ""
                     if user_id.startswith("rag_eval:"):
                         parts = user_id.split(":", 2)
                         if len(parts) == 3:
@@ -1074,7 +1074,7 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
                     # 通过 run_id 或 user_id 中的 run_id 关联
                     sample_run_id = obj.get("run_id", "")
                     if not sample_run_id:
-                        user_id = obj.get("user_id", "")
+                        user_id = obj.get("user_id") or ""
                         if user_id.startswith("rag_eval:"):
                             parts = user_id.split(":", 2)
                             if len(parts) == 3:
@@ -1100,7 +1100,7 @@ def get_run_status(run_id: str, batch_dir=None, raw_dir=None,
                     # 通过 run_id 或 user_id 中的 run_id 关联
                     sample_run_id = obj.get("run_id", "")
                     if not sample_run_id:
-                        user_id = obj.get("user_id", "")
+                        user_id = obj.get("user_id") or ""
                         if user_id.startswith("rag_eval:"):
                             parts = user_id.split(":", 2)
                             if len(parts) == 3:

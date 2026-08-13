@@ -43,7 +43,7 @@ def _load_run_samples(run_id):
             # 匹配 run_id：直接字段或 user_id 嵌入
             obj_run_id = obj.get("run_id", "")
             if not obj_run_id:
-                uid = obj.get("user_id", "")
+                uid = obj.get("user_id") or ""
                 if uid.startswith("rag_eval:"):
                     parts = uid.split(":", 2)
                     if len(parts) == 3:

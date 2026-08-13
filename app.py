@@ -1127,30 +1127,26 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         render_judge_result_detail(r, sample, key_prefix)
 
 
-st.set_page_config(page_title="Langfuse RAG 评测工具", layout="wide")
-st.title("Langfuse RAG 评测工具")
+st.set_page_config(page_title="RAG 评测工作台", layout="wide")
+st.title("RAG 评测工作台")
 
 # --- Sidebar ---
 st.sidebar.markdown(
-    "RAG 检索 + 回答质量评测工具。"
-    "从知识库生成题目，通过 Dify 批量提问，解析为结构化样本后用 LLM Judge 自动评分。"
-    "运行看板按配置方案汇总累计指标、运行历史和单次运行详情。"
+    "一站式 RAG 质量评测平台：从知识库探索、出题、批量提问到 LLM Judge 自动评分，"
+    "覆盖检索命中与回答质量两个维度，按配置方案汇总累计指标。"
 )
 st.sidebar.divider()
-st.sidebar.markdown("**四步工作流**")
+st.sidebar.markdown("**核心工作流**")
 st.sidebar.markdown(
-    "1. **题目生成** — 上传知识库文件（.txt/.md/.docx/.xlsx/.xls/.csv），自动按章节切分后调用 LLM 出题，"
-    "生成带参考答案的评测题集\n"
-    "2. **批量提问** — 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，"
-    "收集回答与检索结果\n"
-    "3. **样本准备** — 解析 Dify / Langfuse 记录为结构化样本，回填参考答案和运行元数据\n"
-    "4. **Judge 评测** — 按评测轨道自动评分：检索评测关注 Top1/3/5 命中，"
-    "问答评测关注回答正确性/合理性"
+    "1. **题目生成** — 上传知识库文件，自动切分并调用 LLM 生成带参考答案的评测题集\n"
+    "2. **批量提问** — 选择题集与 RAG 配置方案，通过 Dify API 批量提问，收集回答和检索结果\n"
+    "3. **样本准备** — 将 Dify / Langfuse 记录解析为结构化样本，回填参考答案和运行元数据\n"
+    "4. **Judge 评测** — 自动评分：检索层看 Top1/3/5 命中，回答层看正确性/合理性"
 )
 st.sidebar.divider()
-st.sidebar.markdown("**运行看板** — 按配置方案查看累计结果、运行历史和单次运行详情")
-st.sidebar.markdown("**知识库探索** — 浏览 Dify 知识库、文档和分块内容，检测重复分块")
-st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有独立配置面板和详细说明。")
+st.sidebar.markdown("**知识库探索** — 浏览知识库 → 文档 → 分块层级结构，检测重复分块，支持 chunk_exact 出题和检索诊断")
+st.sidebar.markdown("**运行看板** — 按配置方案查看累计指标、运行历史和单次运行详情")
+st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有详细说明和独立配置面板。")
 
 # --- 内存用量显示 ---
 _rss_log = st.session_state.get("_rss_log", [])
@@ -1244,11 +1240,11 @@ tab_kb, tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["
 # ========== Tab: 知识库探索 ==========
 with tab_kb:
     st.subheader("知识库探索")
-    st.caption("浏览 Dify 知识库、文档和分块内容，检测重复分块，导出 chunk catalog snapshot")
+    st.caption("浏览知识库层级结构、检测重复分块、按文档出题、导出快照，一站式管理知识库质量")
 
     with st.expander("知识库探索模块说明（点击展开）", expanded=False):
         st.markdown("""
-**一句话总览：** 连接 Dify 知识库 API，浏览数据集 → 文档 → 分块的层级结构，对分块内容计算 SHA-256 哈希以检测重复，并导出可复现的 chunk catalog snapshot。
+**一句话总览：** 连接 Dify 知识库 API，浏览数据集 → 文档 → 分块的层级结构，检测重复分块，支持按文档随机出题（chunk_exact）和手动检索诊断，导出可复现的 chunk catalog snapshot。
 
 ---
 
@@ -1260,7 +1256,10 @@ with tab_kb:
 | 列出文档 | 调用 `GET /datasets/{id}/documents` 分页展示文档列表 |
 | 分块浏览 | 调用 `GET /datasets/{id}/documents/{id}/segments`，支持 status 过滤和分页 |
 | 重复检测 | 对分块内容做规范化 SHA-256 哈希，标记内容完全相同的分块 |
-| 导出 | JSON 和 CSV 格式导出 chunk catalog（含 content_hash） |
+| chunk_exact 出题 | 按文档随机或手动选择 chunk，自动生成带精确 segment_id 绑定的评测题集 |
+| 检索诊断 | 对指定知识库执行语义检索，查看 TopK 排名和命中情况，快速验证检索质量 |
+| 全库导出 | 一键导出整个知识库的 chunk catalog（JSON/CSV），含 content_hash |
+| 快照导出 | 导出当前文档分块的可复现 snapshot |
 
 **安全说明**
 - 本模块仅使用 GET 请求，**不会**上传、删除、编辑、启用或禁用任何文档或分块
@@ -2794,12 +2793,12 @@ with tab_kb:
 # ========== Tab: 题目生成 ==========
 with tab_qgen:
     st.subheader("题目生成")
-    st.caption("上传知识库文件，调用 LLM 自动生成测评题目")
+    st.caption("上传知识库文件，自动切分后调用 LLM 生成带参考答案的评测题集，支持检索评测和全流程问答两种模式")
 
     # ---------- 模块说明 ----------
     with st.expander("题目生成模块说明（点击展开）", expanded=False):
         st.markdown("""
-**一句话总览：** 上传知识库文件，自动按章节切分后调用 LLM 生成带参考答案的测评题目，为后续严格评测提供标准答案。
+**一句话总览：** 上传知识库文件，自动按章节切分后调用 LLM 生成带参考答案的评测题集。支持「检索评测」（单跳 TopK 命中）和「全流程问答评测」两种模式，为后续严格评测提供标准答案。
 
 ---
 
@@ -3714,12 +3713,12 @@ LLM 只能从候选目录中选择 `candidate_id`，不得自造 anchor_range、
 # ========== Tab: 批量提问 ==========
 with tab_batch:
     st.subheader("批量提问")
-    st.caption("将题目批量发送到 Dify Q&A 接口，自动收集回答和检索结果")
+    st.caption("选择题集与 RAG 配置方案，通过 Dify API 批量提问，自动收集回答和检索结果")
 
     # ---------- 模块说明 ----------
     with st.expander("批量提问模块说明（点击展开）", expanded=False):
         st.markdown("""
-**一句话总览：** 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，收集回答与检索结果，生成可直接用于评测的结构化样本。
+**一句话总览：** 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，收集回答与检索结果，生成可直接用于「样本准备 → Judge 评测」的结构化样本。
 
 ---
 
@@ -4968,12 +4967,12 @@ PISP和AISP的区别?
 with tab_samples:
     _record_rss("样本准备页")
     st.subheader("样本准备")
-    st.caption("导入 Langfuse 导出数据，解析并准备评测样本")
+    st.caption("导入 Dify / Langfuse 数据，解析为结构化样本，回填参考答案和运行元数据")
 
     # ---------- 模块说明 ----------
     with st.expander("样本准备模块说明（点击展开）", expanded=False):
         st.markdown(f"""
-**一句话总览：** 将 Dify / Langfuse 的运行记录解析为结构化样本，回填参考答案和运行元数据，为 Judge 评测提供输入。
+**一句话总览：** 将 Dify / Langfuse 的运行记录解析为结构化样本，自动回填参考答案和运行元数据，为 Judge 评测提供标准化输入。
 
 ---
 
@@ -5040,7 +5039,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
     # --- Data import section (collapsible) ---
     with st.expander("数据导入", expanded=not samples):
         # Step 1: Acquire data
-        st.markdown("**第一步：获取 Langfuse 导出文件**")
+        st.markdown("**第一步：获取数据源**")
         source_mode = st.radio(
             "获取方式",
             ["从 API 拉取", "上传文件"],
@@ -5763,7 +5762,7 @@ run_id → processed sample → 真实 Langfuse trace_id → Judge result
                     for _s in samples:
                         _rid = _s.get("run_id", "")
                         if not _rid:
-                            _uid = _s.get("user_id", "")
+                            _uid = _s.get("user_id") or ""
                             if _uid.startswith("rag_eval:"):
                                 _parts = _uid.split(":", 2)
                                 if len(_parts) == 3:
@@ -6224,6 +6223,7 @@ def build_judge_plan(filtered_samples, existing_results_map, mode):
 # ========== Tab: Judge 评测 ==========
 with tab_judge:
     st.subheader("Judge 评测")
+    st.caption("对解析后的样本进行自动评分，覆盖检索命中（Top1/3/5）和回答正确性两个维度")
 
     # ---------- 数据来源摘要 ----------
     if samples and summary:
@@ -6290,12 +6290,12 @@ with tab_judge:
         if has_mixed_modes or has_mixed_tracks:
             st.warning("**混合评测**：包含不同类型的题目和评分依据，指标将按评测轨道分组展示，避免混合口径。")
     else:
-        st.caption("对解析后的样本进行自动评分")
+        st.info("📭 尚无样本数据。请先完成「样本准备」步骤，解析后的样本将自动出现在这里。")
 
     # ---------- 运行机制说明 ----------
     with st.expander("Judge 运行机制说明（点击展开）", expanded=False):
         st.markdown(f"""
-**一句话总览：** Judge 从「样本准备」中取出候选样本，逐条调用 LLM 对检索质量和回答正确性进行评分，结果保存到评测结果文件。
+**一句话总览：** Judge 从「样本准备」中取出候选样本，逐条调用 LLM 对检索质量和回答正确性进行评分，结果保存到评测结果文件，供「运行看板」汇总展示。
 
 ---
 
@@ -7858,12 +7858,12 @@ Judge 有三层减少重复调用的机制：
 with tab_experiment:
     _record_rss("实验看板页")
     st.subheader("配置与运行看板")
-    st.caption("按评测配置查看累计结果、运行历史和单次运行详情。")
+    st.caption("按评测配置方案聚合累计指标，查看运行历史趋势和单次运行详情")
 
     # ---------- 模块说明 ----------
     with st.expander("运行看板说明（点击展开）", expanded=False):
         st.markdown("""
-**一句话总览：** 按评测配置查看累计结果、运行历史和单次运行详情。
+**一句话总览：** 按评测配置方案聚合累计指标，查看运行历史趋势和单次运行详情，支持导出评测报告和失败样本。
 
 ---
 
@@ -8961,7 +8961,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                         for _tid, _pobj in _all_lookup.items():
                             _p_run_id = _pobj.get("run_id", "")
                             if not _p_run_id:
-                                _p_uid = _pobj.get("user_id", "")
+                                _p_uid = _pobj.get("user_id") or ""
                                 if _p_uid.startswith("rag_eval:"):
                                     _p_parts = _p_uid.split(":", 2)
                                     if len(_p_parts) == 3:

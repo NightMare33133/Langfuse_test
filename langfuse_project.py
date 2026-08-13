@@ -201,7 +201,7 @@ def _backfill_run_index_for_run(run_id: str):
                         # 检查 run_id 或 user_id 中的 run_id
                         sample_run_id = obj.get("run_id", "")
                         if not sample_run_id:
-                            user_id = obj.get("user_id", "")
+                            user_id = obj.get("user_id") or ""
                             if user_id.startswith("rag_eval:"):
                                 parts = user_id.split(":", 2)
                                 if len(parts) == 3:
@@ -248,7 +248,7 @@ def backfill_run_index_all():
                         obj = json.loads(line)
                         sample_run_id = obj.get("run_id", "")
                         if not sample_run_id:
-                            user_id = obj.get("user_id", "")
+                            user_id = obj.get("user_id") or ""
                             if user_id.startswith("rag_eval:"):
                                 parts = user_id.split(":", 2)
                                 if len(parts) == 3:
