@@ -1146,6 +1146,7 @@ st.sidebar.markdown(
 st.sidebar.divider()
 st.sidebar.markdown("**知识库探索** — 浏览知识库 → 文档 → 分块层级结构，检测重复分块，支持 chunk_exact 出题和检索诊断")
 st.sidebar.markdown("**运行看板** — 按配置方案查看累计指标、运行历史和单次运行详情")
+st.sidebar.markdown("**材料入库** — 批量上传合同文件，调用 Workflow 提取 metadata，预览确认后写入知识库")
 st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有详细说明和独立配置面板。")
 
 # --- 内存用量显示 ---
@@ -1234,11 +1235,38 @@ if "_rss_init" not in st.session_state:
     _record_rss("初始加载")
     st.session_state["_rss_init"] = True
 
-# --- Tabs ---
-tab_kb, tab_qgen, tab_batch, tab_samples, tab_judge, tab_experiment = st.tabs(["知识库探索", "题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板"])
+# --- 缓存函数（避免每次 rerun 发起重复网络请求） ---
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_list_datasets(api_key: str, base_url: str):
+    """缓存知识库列表（60s TTL）。"""
+    from dify_knowledge import list_datasets as _list_datasets
+    return _list_datasets(api_key, base_url, timeout=10)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_kb_profiles():
+    """缓存知识库连接配置列表（60s TTL）。"""
+    from dify_kb_connection import list_kb_profiles as _list
+    return _list()
+
+
+# --- 导航 ---
+PAGES = ["知识库探索", "题目生成", "批量提问", "样本准备", "Judge 评测", "运行看板", "材料入库"]
+DEFAULT_PAGE = "知识库探索"
+
+selected_page = st.segmented_control(
+    "导航",
+    options=PAGES,
+    default=DEFAULT_PAGE,
+    key="_active_page",
+    label_visibility="collapsed",
+)
 
 # ========== Tab: 知识库探索 ==========
-with tab_kb:
+
+# --- 页面渲染函数（仅当前激活页面执行） ---
+
+def render_kb_explorer():
     st.subheader("知识库探索")
     st.caption("浏览知识库层级结构、检测重复分块、按文档出题、导出快照，一站式管理知识库质量")
 
@@ -1318,7 +1346,7 @@ with tab_kb:
         st.caption("本页仅使用 **知识库 API Key**（`dataset-` 开头），与批量提问的 App Key（`app-` 开头）完全独立。")
 
         # 列出已保存的配置
-        kb_profiles = list_kb_profiles()
+        kb_profiles = _cached_kb_profiles()
 
         # ── 自动选择逻辑 ──
         _auto_selected_pid = ""
@@ -1576,7 +1604,7 @@ with tab_kb:
 
         try:
             with st.spinner("正在加载知识库列表..."):
-                datasets = list_datasets(kb_api_key, kb_base_url)
+                datasets = _cached_list_datasets(kb_api_key, kb_base_url)
         except RuntimeError as exc:
             st.error(f"获取知识库列表失败: {exc}")
             datasets = []
@@ -2791,7 +2819,7 @@ with tab_kb:
                                             st.info("未返回任何检索结果。请检查查询内容和知识库是否有数据。")
 
 # ========== Tab: 题目生成 ==========
-with tab_qgen:
+def render_question_gen():
     st.subheader("题目生成")
     st.caption("上传知识库文件，自动切分后调用 LLM 生成带参考答案的评测题集，支持检索评测和全流程问答两种模式")
 
@@ -3711,7 +3739,7 @@ LLM 只能从候选目录中选择 `candidate_id`，不得自造 anchor_range、
 
 
 # ========== Tab: 批量提问 ==========
-with tab_batch:
+def render_batch_query():
     st.subheader("批量提问")
     st.caption("选择题集与 RAG 配置方案，通过 Dify API 批量提问，自动收集回答和检索结果")
 
@@ -4964,8 +4992,10 @@ PISP和AISP的区别?
                     st.warning("没有成功的结果可推送")
 
 # ========== Tab: 样本准备 ==========
-with tab_samples:
+def render_sample_prep():
     _record_rss("样本准备页")
+    samples = st.session_state.get("samples")  # 从 session_state 读取，避免 UnboundLocalError
+    summary = st.session_state.get("summary") or {}
     st.subheader("样本准备")
     st.caption("导入 Dify / Langfuse 数据，解析为结构化样本，回填参考答案和运行元数据")
 
@@ -6221,7 +6251,7 @@ def build_judge_plan(filtered_samples, existing_results_map, mode):
 
 
 # ========== Tab: Judge 评测 ==========
-with tab_judge:
+def render_judge():
     st.subheader("Judge 评测")
     st.caption("对解析后的样本进行自动评分，覆盖检索命中（Top1/3/5）和回答正确性两个维度")
 
@@ -7855,7 +7885,7 @@ Judge 有三层减少重复调用的机制：
                 )
 
 # ========== Tab: 运行看板 ==========
-with tab_experiment:
+def render_dashboard():
     _record_rss("实验看板页")
     st.subheader("配置与运行看板")
     st.caption("按评测配置方案聚合累计指标，查看运行历史趋势和单次运行详情")
@@ -7923,6 +7953,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
         get_config_display_value, get_config_summary,
         EXPERIMENTS_DIR,
     )
+    from langfuse_project import find_processed_for_run
     from judge import (
         compute_metrics, compute_chunk_exact_metrics,
         TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA, TRACK_CHUNK_EXACT,
@@ -9345,9 +9376,6 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 st.session_state["_xcmp_result"] = _diff
                             except Exception as _diff_err:
                                 st.error(f"对比失败: {_diff_err}")
-
-                # 显示已有对比结果
-                _diff = st.session_state.get("_xcmp_result")
                 if _diff and _diff.get("summary"):
                     _s = _diff["summary"]
                     _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -9512,3 +9540,1286 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                     )
                     st.caption("检索指标变化趋势")
                     st.plotly_chart(fig_trend, use_container_width=True, key="history_trend")
+
+# ========== Tab: 材料入库 ==========
+def render_ingestion():
+    st.subheader("材料入库")
+    st.caption("批量上传合同文件，调用 Dify Workflow 提取结构化 metadata，预览确认后写入知识库")
+
+    with st.expander("材料入库模块说明（点击展开）", expanded=False):
+        st.markdown("""
+**一句话总览：** 批量上传合同文件 → 调用已发布的 Dify Workflow 自动提取 metadata（合同包、文档类型、标题、语言、摘要、主题） → 预览确认后创建知识库文档并绑定 metadata。
+
+---
+
+### 入库流程
+
+1. **上传文件** — 支持批量选择合同文件和合同包
+2. **调用 Workflow** — 自动调用 Dify Workflow 提取结构化 metadata
+3. **预览确认** — 页面显示入库预览表，可编辑标题、类型、语言、摘要、topics
+4. **确认入库** — 创建知识库文档并绑定 metadata
+5. **重复检测** — 基于文件内容 SHA-256 自动跳过已入库文件
+
+### 环境变量
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `DIFY_WORKFLOW_BASE_URL` | Workflow API 地址 | `http://localhost/v1` |
+| `DIFY_WORKFLOW_API_KEY` | Workflow API Key（app- 开头） | `app-xxxxxxxx` |
+| `DIFY_DATASET_API_KEY` | 知识库写入 Key（dataset- 开头） | `dataset-xxxxxxxx` |
+| `DIFY_DATASET_API_BASE` | 知识库 API 地址 | `http://localhost/v1` |
+
+### Metadata 字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `contract_package` | string | 合同包标识 |
+| `document_type` | string | 文档类型 |
+| `document_title` | string | 文档标题 |
+| `document_language` | string | 文档语言 |
+| `document_summary` | string | 文档摘要 |
+| `topics` | string | 主题列表（JSON 数组） |
+""")
+
+    from dify_ingestion import (
+        validate_workflow_key,
+        validate_dataset_key,
+        upload_file,
+        run_workflow,
+        run_auto_ingestion_workflow,
+        parse_auto_ingestion_outputs,
+        validate_workflow_outputs,
+        create_document,
+        create_document_by_file,
+        get_dataset_info,
+        try_pipeline_ingestion,
+        find_document_by_name,
+        wait_for_document_segments,
+        get_document_indexing_status,
+        get_document_segments,
+        INDEXING_STATUS_LABELS,
+        list_metadata_fields,
+        bind_document_metadata,
+        ensure_required_metadata_fields,
+        compute_content_hash,
+        check_duplicate,
+        append_ingestion_record,
+        build_ingestion_record,
+        INGESTION_HISTORY_DIR,
+        VALID_WORKFLOW_PACKAGES,
+        REQUIRED_METADATA_FIELDS,
+    )
+
+    # ── 入库模式选择 ──
+    st.markdown("#### 1. 入库模式")
+    ingestion_mode = st.radio(
+        "选择入库模式",
+        options=["auto", "manual"],
+        format_func=lambda x: (
+            "⚡ 自动批量入库（推荐 · 一键完成元数据提取、Pipeline切分与绑定）"
+            if x == "auto"
+            else "🛠️ 提取后预览编辑（旧模式 · 提取后人工编辑再写入知识库）"
+        ),
+        horizontal=True,
+        key="ingestion_mode_choice",
+    )
+
+    st.divider()
+
+    # ── Workflow 连接配置 ──
+    st.markdown("#### 2. Workflow 连接配置")
+    wf_env_base = os.getenv("DIFY_WORKFLOW_BASE_URL", "") or "http://localhost/v1"
+
+    if ingestion_mode == "auto":
+        wf_default_key = (
+            os.getenv("DIFY_AUTO_INGESTION_WORKFLOW_API_KEY", "")
+            or os.getenv("DIFY_WORKFLOW_API_KEY", "")
+            or "app-UBFDflNS3i1NnZ11dLp9Nc8i"
+        )
+        wf_label_suffix = "全流程自动入库"
+        wf_env_hint = "DIFY_AUTO_INGESTION_WORKFLOW_API_KEY"
+    else:
+        wf_default_key = (
+            os.getenv("DIFY_EXTRACT_WORKFLOW_API_KEY", "")
+            or "app-Q7L956EeyxhsHD65GDHv4knx"
+        )
+        wf_label_suffix = "元数据提取（旧模式）"
+        wf_env_hint = "DIFY_EXTRACT_WORKFLOW_API_KEY"
+
+    wf_c1, wf_c2 = st.columns(2)
+    with wf_c1:
+        wf_base_url = st.text_input(
+            "Workflow API Base URL",
+            value=wf_env_base,
+            key="ingestion_wf_base_url",
+        )
+    with wf_c2:
+        wf_api_key_input = st.text_input(
+            f"Workflow API Key（{wf_label_suffix}）",
+            value=wf_default_key,
+            type="password",
+            key=f"ingestion_wf_api_key_{ingestion_mode}",
+            help=f"用于触发当前模式（{wf_label_suffix}）的 Dify Workflow Key",
+        )
+        wf_api_key = wf_api_key_input.strip() if wf_api_key_input else wf_default_key
+        wf_key_ok, wf_key_msg = validate_workflow_key(wf_api_key) if wf_api_key else (False, "未设置")
+        if wf_key_ok:
+            st.caption(f"✅ Workflow Key 有效（`{wf_api_key[:8]}...`）— 对应：**{wf_label_suffix}**")
+        else:
+            st.error(f"❌ Workflow Key: {wf_key_msg}")
+            st.caption(f"请在 `.env` 中设置 `{wf_env_hint}`（app- 开头）或直接在此输入")
+
+    st.divider()
+
+    # ── Dataset 选择（复用知识库连接配置） ──
+    if ingestion_mode == "auto":
+        st.markdown("#### 3. 目标知识库（必选 · 工作流必填参数 dataset_id）")
+        st.caption(
+            "📌 **核心说明**：全流程入库工作流将以此 `dataset_id` 自动读取 Pipeline 入口配置、"
+            "执行父子切分与索引入库，并自动初始化与绑定文档元数据。"
+        )
+    else:
+        st.markdown("#### 3. 目标知识库（仅确认入库时写入）")
+
+    from dify_kb_connection import list_kb_profiles, load_kb_profile, get_kb_api_key, mask_api_key as kb_mask_api_key
+
+    _ing_kb_env_key = os.getenv("DIFY_DATASET_API_KEY", "")
+    _ing_kb_env_base = os.getenv("DIFY_DATASET_API_BASE", "") or "http://localhost/v1"
+
+    kb_profiles = _cached_kb_profiles()
+    ds_api_key = ""
+    ds_base_url = _ing_kb_env_base
+    ds_dataset_id = ""
+
+    if kb_profiles:
+        kb_profile_options = []
+        for p in kb_profiles:
+            pid = p.get("profile_id", "")
+            pname = p.get("profile_name", "未命名")
+            purl = p.get("base_url", "")
+            pmasked = p.get("key_masked", "")
+            label = f"{pname} · {purl}"
+            if pmasked:
+                label += f" · Key: {pmasked}"
+            kb_profile_options.append((pid, label))
+
+        ing_selected_pid = st.selectbox(
+            "选择知识库连接配置",
+            options=[""] + [c[0] for c in kb_profile_options],
+            format_func=lambda x: (
+                "（请选择）" if not x
+                else next((c[1] for c in kb_profile_options if c[0] == x), x)
+            ),
+            key="ingestion_kb_profile",
+        )
+
+        if ing_selected_pid:
+            ing_meta = load_kb_profile(ing_selected_pid)
+            if ing_meta:
+                ds_base_url = ing_meta.get("base_url", _ing_kb_env_base)
+                saved_key = get_kb_api_key(ing_selected_pid)
+                if saved_key:
+                    ds_api_key = saved_key
+                    st.caption(f"知识库连接：{ing_meta.get('profile_name', '未命名')}（`{kb_mask_api_key(saved_key)}`）")
+                else:
+                    st.warning("该配置未保存 Key，请先在知识库探索中配置。")
+    elif _ing_kb_env_key:
+        ds_api_key = _ing_kb_env_key
+        st.caption(f"使用环境变量 `DIFY_DATASET_API_KEY`（`{kb_mask_api_key(_ing_kb_env_key)}`）")
+    else:
+        st.warning("未找到知识库连接配置。请先在「知识库探索」中配置，或设置环境变量 `DIFY_DATASET_API_KEY`。")
+
+    # Dataset 列表（缓存 60s，避免每次 rerun 发起网络请求）
+    ds_doc_form = ""  # 目标知识库的分段模式
+    if ds_api_key and ds_base_url:
+        try:
+            datasets = _cached_list_datasets(ds_api_key, ds_base_url)
+            ds_options = {d["id"]: f"{d.get('name', '未命名')}（{d['id'][:8]}...）" for d in datasets}
+            selected_ds_id = st.selectbox(
+                "选择目标知识库",
+                options=[""] + list(ds_options.keys()),
+                format_func=lambda x: "（请选择）" if not x else ds_options.get(x, x),
+                key="ingestion_dataset",
+            )
+            if selected_ds_id:
+                ds_dataset_id = selected_ds_id
+                # 从列表数据中读取 doc_form
+                ds_info = next((d for d in datasets if d["id"] == selected_ds_id), None)
+                if ds_info:
+                    ds_doc_form = ds_info.get("doc_form", "")
+                # 列表接口未返回时，尝试详情接口
+                if not ds_doc_form:
+                    try:
+                        detail = get_dataset_info(ds_api_key, ds_base_url, selected_ds_id)
+                        ds_doc_form = detail.get("doc_form", "")
+                    except RuntimeError:
+                        pass
+                if ds_doc_form:
+                    _doc_form_label = {
+                        "text_model": "普通分段",
+                        "hierarchical_model": "父子分块",
+                        "qa_model": "Q&A 模式",
+                    }.get(ds_doc_form, ds_doc_form)
+                    st.info(f"📋 当前分段模式：**{_doc_form_label}**（`{ds_doc_form}`）")
+                else:
+                    st.warning(
+                        "⚠️ 无法获取该知识库的分段模式（doc_form），无法创建文档。\n\n"
+                        "请确认 Dify 版本支持该字段，或手动检查知识库设置。"
+                    )
+        except RuntimeError as exc:
+            st.error(f"获取知识库列表失败: {exc}")
+
+    if ingestion_mode == "auto" and not ds_dataset_id:
+        st.warning("⚠️ **请先选择目标知识库**：当前全流程入库工作流必须传入 `dataset_id`，以运行 Pipeline 与自动绑定 metadata。")
+
+    st.divider()
+
+    # ── 文件上传 ──
+    st.markdown("#### 4. 上传合同文件")
+    st.info("📌 **批量约束**：一次批量上传的文件必须属于同一个合同包，请勿混合上传不同合同包的文件。")
+
+    pkg_col1, pkg_col2 = st.columns(2)
+    with pkg_col1:
+        contract_package = st.selectbox(
+            "合同包",
+            options=sorted(VALID_WORKFLOW_PACKAGES),
+            format_func=lambda x: {
+                "baseline_2_4": "baseline_2_4（基线合同）",
+                "tech_platform_2_5": "tech_platform_2_5（项目合同）",
+            }.get(x, x),
+            key="ingestion_pkg",
+        )
+    with pkg_col2:
+        uploaded_files = st.file_uploader(
+            "选择合同文件（支持批量）",
+            type=None,
+            accept_multiple_files=True,
+            key="ingestion_files",
+        )
+
+    if uploaded_files:
+        st.caption(f"已选择 {len(uploaded_files)} 个文件")
+        for f in uploaded_files:
+            st.caption(f"  - {f.name}（{f.size / 1024:.1f} KB）")
+
+    st.divider()
+
+    # ── 进度 UI 回调 ──
+
+    class ExtractionProgress:
+        """入库/提取流程的阶段型进度 UI。"""
+
+        STAGE_PREPARE = 0.15
+        STAGE_UPLOAD = 0.35
+        STAGE_WORKFLOW = 0.75
+        STAGE_VALIDATE = 0.90
+        STAGE_DONE = 1.0
+
+        def __init__(self, total_files: int, title: str = "正在处理材料..."):
+            self._status = st.status(f"🚀 {title}", expanded=True)
+            self._progress = st.progress(0, text="正在准备文件")
+            self._result_container = st.empty()
+            self._total = total_files
+            self._results_log = []
+
+        def _flush_results(self):
+            if self._results_log:
+                self._result_container.markdown("\n".join(self._results_log))
+
+        def stage_prepare(self):
+            self._status.update(label="📂 正在准备文件", state="running")
+            self._progress.progress(self.STAGE_PREPARE, text="正在准备文件")
+
+        def stage_upload(self, current: int, total: int, filename: str):
+            self._status.update(
+                label=f"📤 正在上传文件到 Dify ({current}/{total})",
+                state="running",
+            )
+            upload_progress = self.STAGE_PREPARE + (
+                (current / total) * (self.STAGE_UPLOAD - self.STAGE_PREPARE)
+            )
+            self._progress.progress(
+                upload_progress,
+                text=f"正在上传第 {current}/{total} 个文件：{filename}",
+            )
+
+        def stage_workflow(self, text: str = "正在调用 Workflow 执行入库流程，请稍候..."):
+            self._status.update(label="⚙️ 正在执行 Workflow 流水线", state="running")
+            self._progress.progress(self.STAGE_WORKFLOW, text=text)
+
+        def stage_validate(self):
+            self._status.update(label="🔍 正在校验并解析结果", state="running")
+            self._progress.progress(self.STAGE_VALIDATE, text="正在解析结构化入库结果")
+
+        def file_success(self, filename: str, title: str):
+            self._results_log.append(f"✅ **{filename}** → {title}")
+            self._flush_results()
+
+        def file_failure(self, filename: str, error: str):
+            self._results_log.append(f"❌ **{filename}**：{error}")
+            self._flush_results()
+
+        def done(self, success_count: int, fail_count: int, action_name: str = "处理完成"):
+            self._progress.progress(self.STAGE_DONE, text=action_name)
+            if fail_count == 0:
+                self._status.update(
+                    label=f"✅ {action_name}（{success_count} 个文件成功）",
+                    state="complete",
+                )
+            else:
+                self._status.update(
+                    label=f"⚠️ {action_name}（{success_count} 成功，{fail_count} 失败）",
+                    state="complete",
+                )
+
+        def fail(self, error: str):
+            self._progress.progress(self.STAGE_DONE, text="执行失败")
+            self._status.update(label="❌ 执行失败", state="error")
+            self._results_log.append(f"❌ **错误**：{error}")
+            self._flush_results()
+
+    _is_processing = st.session_state.get("_ingestion_processing", False)
+    can_proceed = bool(
+        wf_key_ok
+        and wf_base_url
+        and uploaded_files
+        and contract_package
+        and (bool(ds_dataset_id) if ingestion_mode == "auto" else True)
+    )
+    btn_disabled = not can_proceed or _is_processing
+
+    # ══════════════════════════════════════════════════════════════
+    # 分支 A：⚡ 自动批量入库（推荐模式）
+    # ══════════════════════════════════════════════════════════════
+    if ingestion_mode == "auto":
+        st.markdown("#### 5. 自动批量入库")
+        st.caption("调用已发布的全流程 Workflow：自动完成 metadata 提取 + Pipeline 父子切分入库 + metadata 绑定。")
+
+        if st.button(
+            "🚀 开始自动批量入库",
+            disabled=btn_disabled,
+            key="ingestion_auto_start_btn",
+        ):
+            if not wf_key_ok:
+                st.error("Workflow Key 未配置")
+            elif not ds_dataset_id:
+                st.error("请先在上方「3. 目标知识库」中选择目标知识库（dataset_id）")
+            elif not uploaded_files:
+                st.error("请上传至少一个文件")
+            else:
+                from dify_ingestion import extract_text_from_file
+                import tempfile
+
+                st.session_state["_ingestion_processing"] = True
+                total_files = len(uploaded_files)
+                progress = ExtractionProgress(total_files, title="正在自动批量入库...")
+
+                try:
+                    progress.stage_prepare()
+                    file_ids = []
+                    upload_errors = []
+                    file_contents = {}
+                    minio_vault_records = {}
+
+                    # 1. 逐文件归档至 MinIO 并上传至 Dify 文件中心
+                    for i, f in enumerate(uploaded_files):
+                        tmp_path = None
+                        try:
+                            progress.stage_upload(i + 1, total_files, f.name)
+                            file_bytes = f.read()
+
+                            # 1.1 自动归档至 MinIO 合同资产库
+                            try:
+                                from minio_vault import upload_file_to_vault
+                                v_res = upload_file_to_vault(f.name, file_bytes)
+                                if v_res.get("success"):
+                                    minio_vault_records[f.name] = v_res
+                            except Exception:
+                                pass
+
+                            # 1.2 写入临时文件供本地解析与上传 Dify
+                            with tempfile.NamedTemporaryFile(
+                                delete=False, suffix=Path(f.name).suffix
+                            ) as tmp:
+                                tmp.write(file_bytes)
+                                tmp_path = tmp.name
+
+                            try:
+                                extracted_text = extract_text_from_file(tmp_path)
+                            except RuntimeError:
+                                extracted_text = file_bytes.decode("utf-8", errors="replace")
+                            file_contents[f.name] = extracted_text
+
+                            fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=f.name)
+                            file_ids.append({"name": f.name, "id": fid})
+                        except RuntimeError as exc:
+                            upload_errors.append({"name": f.name, "error": str(exc)})
+                            progress.file_failure(f.name, str(exc))
+                        finally:
+                            if tmp_path:
+                                try:
+                                    Path(tmp_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                    if not file_ids:
+                        progress.fail("所有文件上传失败，无法继续")
+                    else:
+                        # 2. 调用全流程 Workflow（blocking 模式）
+                        progress.stage_workflow(
+                            "Dify Workflow 正在执行：提取 metadata → 运行 Pipeline 父子切分 → 绑定 metadata..."
+                        )
+                        wf_outputs = run_auto_ingestion_workflow(
+                            wf_api_key,
+                            wf_base_url,
+                            [fid["id"] for fid in file_ids],
+                            contract_package,
+                            dataset_id=ds_dataset_id,
+                        )
+
+                        # 3. 校验与规范化结果
+                        progress.stage_validate()
+                        parsed_results = parse_auto_ingestion_outputs(
+                            wf_outputs,
+                            contract_package,
+                            file_names=[fid["name"] for fid in file_ids],
+                        )
+
+                        # 若 Workflow 未在 outputs 中返回 document_id，
+                        # 则通过 Dataset API 在目标知识库中按文件名检索已入库的 document_id 与已绑定的元数据
+                        from dify_ingestion import find_document_info_by_name
+                        for res in parsed_results:
+                            if ds_api_key and ds_base_url and ds_dataset_id:
+                                try:
+                                    doc_info = find_document_info_by_name(
+                                        ds_api_key, ds_base_url, ds_dataset_id, res["file_name"]
+                                    )
+                                    if doc_info:
+                                        found_id = doc_info.get("id", "")
+                                        if found_id:
+                                            res["document_id"] = found_id
+                                            res["success"] = True
+                                            res["error"] = ""
+                                            res["indexing_status"] = doc_info.get("indexing_status") or "completed"
+                                        # 回填知识库中保存的元数据
+                                        doc_meta = doc_info.get("doc_metadata") or {}
+                                        if isinstance(doc_meta, dict):
+                                            if doc_meta.get("document_type"):
+                                                res["document_type"] = doc_meta["document_type"]
+                                            if doc_meta.get("document_title"):
+                                                res["document_title"] = doc_meta["document_title"]
+                                            if doc_meta.get("document_language"):
+                                                res["document_language"] = doc_meta["document_language"]
+                                            if doc_meta.get("document_summary"):
+                                                res["document_summary"] = doc_meta["document_summary"]
+                                            if doc_meta.get("topics"):
+                                                t = doc_meta["topics"]
+                                                if isinstance(t, str) and t.startswith("["):
+                                                    try:
+                                                        res["topics"] = json.loads(t)
+                                                    except Exception:
+                                                        res["topics"] = [t]
+                                                elif isinstance(t, list):
+                                                    res["topics"] = t
+                                                elif isinstance(t, str):
+                                                    res["topics"] = [t]
+                                except Exception:
+                                    pass
+
+                        success_count = 0
+                        fail_count = 0
+                        auto_result_rows = []
+
+                        # 4. 逐文件记录历史并更新进度（绝不二次调用 Pipeline 或 metadata 绑定）
+                        for res in parsed_results:
+                            fname = res["file_name"]
+                            doc_id = res["document_id"]
+                            content_hash = compute_content_hash(file_contents.get(fname, ""))
+
+                            if res["success"]:
+                                success_count += 1
+                                doc_id_display = f"(ID: {doc_id[:12]}...)" if doc_id else "(已入库)"
+                                progress.file_success(
+                                    fname,
+                                    f"【{res['document_title']}】{doc_id_display} | 索引状态: {res['indexing_status']}",
+                                )
+                                record = build_ingestion_record(
+                                    dataset_id=ds_dataset_id or "default",
+                                    file_name=fname,
+                                    content_hash=content_hash,
+                                    document_id=doc_id,
+                                    metadata={
+                                        "contract_package": res["contract_package"],
+                                        "document_type": res["document_type"],
+                                        "document_title": res["document_title"],
+                                        "document_language": res["document_language"],
+                                        "document_summary": res["document_summary"],
+                                        "topics": res["topics"],
+                                    },
+                                    workflow_status="success",
+                                    ingestion_status="success",
+                                    batch=res.get("batch", ""),
+                                    indexing_status=res.get("indexing_status", "waiting"),
+                                )
+                                append_ingestion_record(record)
+                            else:
+                                fail_count += 1
+                                progress.file_failure(fname, res["error"])
+                                record = build_ingestion_record(
+                                    dataset_id=ds_dataset_id or "default",
+                                    file_name=fname,
+                                    content_hash=content_hash,
+                                    document_id=doc_id,
+                                    workflow_status="success",
+                                    ingestion_status="failed",
+                                    error_message=res["error"][:200],
+                                    batch=res.get("batch", ""),
+                                    indexing_status="error",
+                                    indexing_error=res["error"][:200],
+                                )
+                                append_ingestion_record(record)
+
+                            auto_result_rows.append(res)
+
+                        progress.done(success_count, fail_count, action_name="批量入库完成")
+                        st.session_state["ingestion_auto_results"] = auto_result_rows
+                        st.rerun()
+
+                except RuntimeError as exc:
+                    progress.fail(str(exc))
+                finally:
+                    st.session_state["_ingestion_processing"] = False
+
+        # 展示自动入库结果
+        auto_results = st.session_state.get("ingestion_auto_results", [])
+        if auto_results:
+            st.divider()
+            st.markdown("#### 5. 批量入库结果详情")
+            s_count = sum(1 for r in auto_results if r["success"])
+            f_count = sum(1 for r in auto_results if not r["success"])
+
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                st.metric("✅ 成功入库", s_count)
+            with rc2:
+                st.metric("❌ 失败", f_count)
+            with rc3:
+                st.metric("📄 总文件数", len(auto_results))
+
+            result_table_data = []
+            for r in auto_results:
+                result_table_data.append({
+                    "文件名": r["file_name"],
+                    "文档标题": r["document_title"] or "-",
+                    "文档类型": r["document_type"] or "-",
+                    "合同包": r["contract_package"],
+                    "文档 ID": (r["document_id"][:16] + "...") if r["document_id"] else "-",
+                    "索引状态": r["indexing_status"],
+                    "状态": "✅ 成功" if r["success"] else "❌ 失败",
+                    "错误信息": r["error"] or "-",
+                })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(result_table_data), use_container_width=True, hide_index=True)
+
+    # ══════════════════════════════════════════════════════════════
+    # 分支 B：🛠️ 提取后预览编辑（旧模式 / 高级模式）
+    # ══════════════════════════════════════════════════════════════
+    else:
+        st.markdown("#### 5. 提取 metadata")
+        st.caption("第一步：调用 Dify Workflow 提取结构化 metadata，供人工核对与修改。")
+
+        if st.button(
+            "🚀 开始提取",
+            disabled=btn_disabled,
+            key="ingestion_extract_btn",
+        ):
+            if not wf_key_ok:
+                st.error("Workflow Key 未配置")
+            elif not uploaded_files:
+                st.error("请上传至少一个文件")
+            else:
+                from dify_ingestion import extract_text_from_file
+                import tempfile
+
+                st.session_state["_ingestion_processing"] = True
+                total_files = len(uploaded_files)
+                progress = ExtractionProgress(total_files, title="正在提取 metadata...")
+
+                try:
+                    progress.stage_prepare()
+                    file_ids = []
+                    upload_errors = []
+                    file_contents = {}
+                    file_blobs = {}
+
+                    for i, f in enumerate(uploaded_files):
+                        tmp_path = None
+                        try:
+                            progress.stage_upload(i + 1, total_files, f.name)
+                            file_bytes = f.read()
+                            file_blobs[f.name] = file_bytes
+                            with tempfile.NamedTemporaryFile(
+                                delete=False, suffix=Path(f.name).suffix
+                            ) as tmp:
+                                tmp.write(file_bytes)
+                                tmp_path = tmp.name
+
+                            try:
+                                extracted_text = extract_text_from_file(tmp_path)
+                            except RuntimeError:
+                                extracted_text = file_bytes.decode("utf-8", errors="replace")
+                            file_contents[f.name] = extracted_text
+
+                            fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=f.name)
+                            file_ids.append({"name": f.name, "id": fid})
+                        except RuntimeError as exc:
+                            upload_errors.append({"name": f.name, "error": str(exc)})
+                            progress.file_failure(f.name, str(exc))
+                        finally:
+                            if tmp_path:
+                                try:
+                                    Path(tmp_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                    if upload_errors:
+                        for err in upload_errors:
+                            progress.file_failure(err["name"], f"上传失败: {err['error']}")
+
+                    if not file_ids:
+                        progress.fail("所有文件上传失败，无法继续")
+                    else:
+                        progress.stage_workflow()
+                        wf_outputs = run_workflow(
+                            wf_api_key, wf_base_url,
+                            [fid["id"] for fid in file_ids],
+                            contract_package,
+                        )
+
+                        progress.stage_validate()
+                        validation_results = validate_workflow_outputs(wf_outputs, contract_package)
+
+                        preview_rows = []
+                        ok_count = 0
+                        fail_count = 0
+                        for j, (fid_info, v_result) in enumerate(zip(file_ids, validation_results)):
+                            if v_result["ok"]:
+                                cleaned = v_result["cleaned"]
+                                text_content = file_contents.get(fid_info["name"], "")
+                                content_hash = compute_content_hash(text_content)
+                                preview_rows.append({
+                                    "file_name": fid_info["name"],
+                                    "file_id": fid_info["id"],
+                                    "content_hash": content_hash,
+                                    "ok": True,
+                                    "contract_package": cleaned["contract_package"],
+                                    "document_type": cleaned["document_type"],
+                                    "document_title": cleaned["document_title"],
+                                    "document_language": cleaned["document_language"],
+                                    "document_summary": cleaned["document_summary"],
+                                    "topics": json.dumps(cleaned["topics"], ensure_ascii=False),
+                                    "error": "",
+                                    "raw_cleaned": cleaned,
+                                })
+                                progress.file_success(fid_info["name"], cleaned["document_title"])
+                                ok_count += 1
+                            else:
+                                preview_rows.append({
+                                    "file_name": fid_info["name"],
+                                    "file_id": fid_info["id"],
+                                    "content_hash": "",
+                                    "ok": False,
+                                    "contract_package": "",
+                                    "document_type": "",
+                                    "document_title": "",
+                                    "document_language": "",
+                                    "document_summary": "",
+                                    "topics": "",
+                                    "error": v_result["error"],
+                                    "raw_cleaned": {},
+                                })
+                                progress.file_failure(fid_info["name"], v_result["error"])
+                                fail_count += 1
+
+                        progress.done(ok_count, fail_count, action_name="提取完成")
+                        st.session_state["ingestion_preview"] = preview_rows
+                        st.session_state["ingestion_wf_outputs"] = wf_outputs
+                        st.session_state["ingestion_file_contents"] = file_contents
+                        st.session_state["ingestion_file_blobs"] = file_blobs
+                        st.rerun()
+
+                except RuntimeError as exc:
+                    progress.fail(str(exc))
+                finally:
+                    st.session_state["_ingestion_processing"] = False
+
+        # Metadata 预览表（尚未入库）
+        preview_data = st.session_state.get("ingestion_preview", [])
+        if preview_data:
+            st.divider()
+            st.markdown("#### 6. Metadata 预览（尚未入库）")
+            st.caption("以下 metadata 由 Workflow 提取，尚未写入知识库。请检查并编辑后，点击下方「确认入库」。")
+
+            valid_rows = [r for r in preview_data if r["ok"]]
+            invalid_rows = [r for r in preview_data if not r["ok"]]
+
+            if invalid_rows:
+                st.warning(f"⚠️ {len(invalid_rows)} 个文件提取失败，将跳过入库")
+                for r in invalid_rows:
+                    st.error(f"❌ {r['file_name']}: {r['error']}")
+
+            if valid_rows:
+                edit_df_data = []
+                for r in valid_rows:
+                    edit_df_data.append({
+                        "文件名": r["file_name"],
+                        "文档类型": r["document_type"],
+                        "文档标题": r["document_title"],
+                        "语言": r["document_language"],
+                        "摘要": r["document_summary"],
+                        "Topics": r["topics"],
+                        "入库": True,
+                    })
+
+                import pandas as pd
+                edit_df = pd.DataFrame(edit_df_data)
+                edited_df = st.data_editor(
+                    edit_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "入库": st.column_config.CheckboxColumn("入库"),
+                        "摘要": st.column_config.TextColumn("摘要", width="large"),
+                        "Topics": st.column_config.TextColumn("Topics（JSON 数组）", width="medium"),
+                    },
+                    key="ingestion_edit_table",
+                    disabled=["文件名"],
+                )
+
+                for i, row in edited_df.iterrows():
+                    if i < len(valid_rows):
+                        valid_rows[i]["document_type"] = row["文档类型"]
+                        valid_rows[i]["document_title"] = row["文档标题"]
+                        valid_rows[i]["document_language"] = row["语言"]
+                        valid_rows[i]["document_summary"] = row["摘要"]
+                        valid_rows[i]["topics_raw"] = row["Topics"]
+                        valid_rows[i]["should_ingest"] = row["入库"]
+
+                st.divider()
+                st.markdown("#### 7. 确认入库")
+
+                if ds_dataset_id:
+                    for r in valid_rows:
+                        dup = check_duplicate(ds_dataset_id, r.get("content_hash", ""))
+                        r["is_duplicate"] = dup is not None
+                        r["dup_info"] = dup
+                    dup_count = sum(1 for r in valid_rows if r.get("is_duplicate"))
+                    if dup_count:
+                        st.warning(f"⚠️ 检测到 {dup_count} 个文件与已入库内容重复，默认跳过。可在预览表中勾选「入库」强制重新入库。")
+
+                meta_fields_ok = False
+                required_meta_names = {f["name"] for f in REQUIRED_METADATA_FIELDS}
+                if ds_api_key and ds_base_url and ds_dataset_id:
+                    try:
+                        existing_fields = list_metadata_fields(ds_api_key, ds_base_url, ds_dataset_id)
+                        existing_names = {f["name"] for f in existing_fields}
+                        missing_fields = required_meta_names - existing_names
+                        if missing_fields:
+                            st.warning(
+                                f"⚠️ 目标知识库缺少 {len(missing_fields)} 个 metadata 字段：\n\n"
+                                f"`{'`, `'.join(sorted(missing_fields))}`"
+                            )
+                            if st.button(
+                                f"🔧 初始化此知识库的 {len(REQUIRED_METADATA_FIELDS)} 个 metadata 字段",
+                                key="ingestion_init_meta_btn",
+                                disabled=_is_processing,
+                            ):
+                                st.session_state["_ingestion_init_confirm"] = True
+                                st.rerun()
+
+                            if st.session_state.get("_ingestion_init_confirm"):
+                                st.warning(
+                                    "⚠️ **确认操作**：这会在当前知识库中创建缺失的 metadata 字段。\n\n"
+                                    "- 仅创建缺失字段，不修改或删除已有字段\n"
+                                    "- 不会写入任何文档数据\n"
+                                    "- 字段创建后无法通过此工具删除（需在 Dify 后台操作）"
+                                )
+                                c_yes, c_no = st.columns(2)
+                                with c_yes:
+                                    if st.button("✅ 确认创建", key="ingestion_init_confirm_yes"):
+                                        try:
+                                            created, errors = ensure_required_metadata_fields(
+                                                ds_api_key, ds_base_url, ds_dataset_id
+                                            )
+                                            if created:
+                                                st.success(
+                                                    f"✅ 已创建 {len(created)} 个字段："
+                                                    f"`{'`, `'.join(f['name'] for f in created)}`"
+                                                )
+                                            if errors:
+                                                for err in errors:
+                                                    st.error(f"创建失败: {err}")
+                                            if not created and not errors:
+                                                st.info("所有字段已存在，无需创建。")
+                                            st.session_state.pop("_ingestion_init_confirm", None)
+                                            st.rerun()
+                                        except RuntimeError as exc:
+                                            st.error(f"初始化失败: {exc}")
+                                            st.session_state.pop("_ingestion_init_confirm", None)
+                                with c_no:
+                                    if st.button("❌ 取消", key="ingestion_init_confirm_no"):
+                                        st.session_state.pop("_ingestion_init_confirm", None)
+                                        st.rerun()
+                        else:
+                            meta_fields_ok = True
+                            st.success(f"✅ metadata 字段完整（共 {len(existing_fields)} 个字段）")
+                    except RuntimeError as exc:
+                        st.error(f"查询 metadata 字段失败: {exc}")
+
+                can_ingest = meta_fields_ok and ds_doc_form and any(
+                    r.get("should_ingest", not r.get("is_duplicate", False)) for r in valid_rows
+                )
+
+                if can_ingest and ds_api_key and ds_base_url and ds_dataset_id:
+                    from dify_ingestion import find_local_file_node_id as _find_node
+                    try:
+                        _find_node(ds_api_key, ds_base_url, ds_dataset_id)
+                        st.caption("入库模式：**已发布 Knowledge Pipeline**")
+                    except RuntimeError:
+                        st.caption("入库模式：**标准 Dataset API（兜底）** — 未检测到已发布 Pipeline")
+
+                if st.button(
+                    "✅ 确认入库",
+                    disabled=not can_ingest or _is_processing,
+                    key="ingestion_confirm_btn",
+                ):
+                    existing_fields = list_metadata_fields(ds_api_key, ds_base_url, ds_dataset_id)
+                    field_map = {f["name"]: f["id"] for f in existing_fields}
+
+                    ingest_progress = st.progress(0, text="正在入库...")
+                    success_count = 0
+                    skip_count = 0
+                    fail_count = 0
+                    results_detail = []
+
+                    rows_to_ingest = [
+                        r for r in valid_rows
+                        if r.get("should_ingest", not r.get("is_duplicate", False))
+                    ]
+
+                    for idx, row in enumerate(rows_to_ingest):
+                        fname = row["file_name"]
+                        try:
+                            topics_str = row.get("topics_raw", row.get("topics", "[]"))
+                            try:
+                                topics_list = json.loads(topics_str)
+                                if not isinstance(topics_list, list):
+                                    raise ValueError("topics 不是列表")
+                            except (json.JSONDecodeError, ValueError):
+                                fail_count += 1
+                                results_detail.append(f"❌ {fname}: Topics 格式错误（需 JSON 数组）")
+                                continue
+
+                            file_blobs = st.session_state.get("ingestion_file_blobs", {})
+                            file_bytes = file_blobs.get(fname)
+                            if not file_bytes:
+                                fail_count += 1
+                                results_detail.append(f"❌ {fname}: 找不到文件原始内容，无法入库")
+                                continue
+
+                            content_hash = compute_content_hash(
+                                st.session_state.get("ingestion_file_contents", {}).get(fname, "")
+                            )
+
+                            ingest_progress.progress(
+                                min(0.3, (idx + 0.2) / len(rows_to_ingest)),
+                                text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: 正在上传至 Knowledge Pipeline",
+                            )
+
+                            pipeline_ok, pipeline_result, _, pipeline_mode = \
+                                try_pipeline_ingestion(
+                                    ds_api_key, ds_base_url, ds_dataset_id,
+                                    fname, file_bytes,
+                                )
+
+                            doc_batch = ""
+                            used_pipeline = False
+
+                            if pipeline_ok:
+                                document_id = pipeline_result
+                                used_pipeline = True
+                                ingest_progress.progress(
+                                    min(0.4, (idx + 0.3) / len(rows_to_ingest)),
+                                    text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: Pipeline 执行完成",
+                                )
+                            elif pipeline_mode == "pipeline_no_doc_id":
+                                ingest_progress.progress(
+                                    min(0.4, (idx + 0.3) / len(rows_to_ingest)),
+                                    text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: 正在定位目标文档",
+                                )
+                                document_id = find_document_by_name(
+                                    ds_api_key, ds_base_url, ds_dataset_id, fname,
+                                )
+                                if document_id:
+                                    used_pipeline = True
+                                    results_detail.append(
+                                        f"⚠️ {fname}: Pipeline 已执行，通过文件名匹配到文档 {document_id[:12]}..."
+                                    )
+                                else:
+                                    results_detail.append(
+                                        f"⚠️ {fname}: Pipeline 已执行，但无法唯一确认目标文档，"
+                                        f"metadata 尚未自动绑定"
+                                    )
+                                    record = build_ingestion_record(
+                                        dataset_id=ds_dataset_id, file_name=fname,
+                                        content_hash=content_hash,
+                                        workflow_status="success",
+                                        ingestion_status="completed_no_meta",
+                                        indexing_status="pipeline_no_doc_id",
+                                    )
+                                    append_ingestion_record(record)
+                                    skip_count += 1
+                                    continue
+                            else:
+                                ingest_progress.progress(
+                                    min(0.35, (idx + 0.25) / len(rows_to_ingest)),
+                                    text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: 正在使用标准入库兜底",
+                                )
+                                try:
+                                    doc_result = create_document_by_file(
+                                        ds_api_key, ds_base_url, ds_dataset_id,
+                                        fname, file_bytes,
+                                        doc_form=ds_doc_form,
+                                    )
+                                    document_id = doc_result["document"]["id"]
+                                    doc_batch = doc_result.get("batch", "")
+                                    results_detail.append(
+                                        f"ℹ️ {fname}: 已使用标准 Dataset API 兜底"
+                                        f"（未执行自定义 Pipeline）— {pipeline_result}"
+                                    )
+                                except RuntimeError as create_exc:
+                                    fail_count += 1
+                                    results_detail.append(f"❌ {fname}: 兜底入库也失败 — {create_exc}")
+                                    record = build_ingestion_record(
+                                        dataset_id=ds_dataset_id, file_name=fname,
+                                        content_hash=content_hash,
+                                        workflow_status="success",
+                                        ingestion_status="failed",
+                                        error_message=str(create_exc)[:200],
+                                    )
+                                    append_ingestion_record(record)
+                                    continue
+
+                            ingest_progress.progress(
+                                min(0.5, (idx + 0.4) / len(rows_to_ingest)),
+                                text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: 正在绑定 metadata",
+                            )
+                            metadata_items = [
+                                {"id": field_map.get("contract_package", ""), "name": "contract_package", "value": row.get("contract_package", contract_package)},
+                                {"id": field_map.get("document_type", ""), "name": "document_type", "value": row["document_type"]},
+                                {"id": field_map.get("document_title", ""), "name": "document_title", "value": row["document_title"]},
+                                {"id": field_map.get("document_language", ""), "name": "document_language", "value": row["document_language"]},
+                                {"id": field_map.get("document_summary", ""), "name": "document_summary", "value": row["document_summary"]},
+                                {"id": field_map.get("topics", ""), "name": "topics", "value": json.dumps(topics_list, ensure_ascii=False)},
+                            ]
+                            metadata_items = [m for m in metadata_items if m["id"]]
+                            if metadata_items and document_id:
+                                try:
+                                    bind_document_metadata(
+                                        ds_api_key, ds_base_url, ds_dataset_id,
+                                        document_id, metadata_items,
+                                    )
+                                except RuntimeError as bind_exc:
+                                    results_detail.append(
+                                        f"⚠️ {fname}: metadata 绑定失败 — {bind_exc}"
+                                    )
+
+                            import time as _time
+                            final_status = "unknown"
+                            segment_count = -1
+                            idx_error = ""
+
+                            if not doc_batch and not used_pipeline:
+                                final_status = "no_batch"
+                            elif doc_batch:
+                                poll_start = _time.time()
+                                poll_timeout = 120
+                                poll_interval = 2
+                                while _time.time() - poll_start < poll_timeout:
+                                    try:
+                                        idx_info = get_document_indexing_status(
+                                            ds_api_key, ds_base_url, ds_dataset_id, doc_batch,
+                                        )
+                                        final_status = idx_info.get("indexing_status", "unknown")
+                                        idx_error = idx_info.get("error") or ""
+                                        status_label = INDEXING_STATUS_LABELS.get(
+                                            final_status, f"状态: {final_status}"
+                                        )
+                                        elapsed = int(_time.time() - poll_start)
+                                        ingest_progress.progress(
+                                            min(0.9, (idx + 0.8) / len(rows_to_ingest)),
+                                            text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: {status_label}（{elapsed}s）",
+                                        )
+                                        if final_status in ("completed", "error"):
+                                            break
+                                        _time.sleep(poll_interval)
+                                    except RuntimeError as poll_exc:
+                                        idx_error = str(poll_exc)[:100]
+                                        final_status = "poll_error"
+                                        break
+
+                                if final_status not in ("completed", "error", "poll_error"):
+                                    results_detail.append(
+                                        f"⏳ {fname}: 已提交 Dify 后台处理，当前仍未完成"
+                                        f"（状态: {final_status}）"
+                                    )
+                                    record = build_ingestion_record(
+                                        dataset_id=ds_dataset_id, file_name=fname,
+                                        content_hash=content_hash, document_id=document_id,
+                                        metadata={"contract_package": contract_package,
+                                                  "document_type": row["document_type"],
+                                                  "document_title": row["document_title"]},
+                                        workflow_status="success",
+                                        ingestion_status="processing",
+                                        batch=doc_batch, indexing_status=final_status,
+                                    )
+                                    append_ingestion_record(record)
+                                    skip_count += 1
+                                    continue
+
+                                if final_status == "error":
+                                    results_detail.append(
+                                        f"❌ {fname}: 索引失败 — {idx_error or '未知错误'}"
+                                        f"（document_id: {document_id[:12]}...）"
+                                    )
+                                    record = build_ingestion_record(
+                                        dataset_id=ds_dataset_id, file_name=fname,
+                                        content_hash=content_hash, document_id=document_id,
+                                        metadata={"contract_package": contract_package,
+                                                  "document_type": row["document_type"],
+                                                  "document_title": row["document_title"]},
+                                        workflow_status="success",
+                                        ingestion_status="failed",
+                                        error_message=idx_error[:200],
+                                        batch=doc_batch, indexing_status="error",
+                                        indexing_error=idx_error[:200],
+                                    )
+                                    append_ingestion_record(record)
+                                    fail_count += 1
+                                    continue
+
+                            elif used_pipeline and document_id:
+                                def _on_seg_progress(elapsed, seg_cnt):
+                                    ingest_progress.progress(
+                                        min(0.95, (idx + 0.8) / len(rows_to_ingest)),
+                                        text=f"[{idx + 1}/{len(rows_to_ingest)}] {fname}: "
+                                             f"Dify 正在后台解析和建立索引（已等待 {int(elapsed)}s）",
+                                    )
+
+                                seg_result = wait_for_document_segments(
+                                    ds_api_key, ds_base_url, ds_dataset_id, document_id,
+                                    timeout=120, interval=2.0,
+                                    on_progress=_on_seg_progress,
+                                )
+                                final_status = seg_result["status"]
+                                segment_count = seg_result["segment_count"]
+                                idx_error = seg_result.get("error", "")
+
+                            if final_status == "completed" and segment_count > 0:
+                                mode_label = "Knowledge Pipeline" if used_pipeline else "标准 Dataset API（兜底）"
+                                results_detail.append(
+                                    f"✅ {fname}（{len(file_bytes) / 1024:.0f} KB）"
+                                    f"→ {document_id[:12]}... | "
+                                    f"索引完成，共 {segment_count} 个分段 | {mode_label}"
+                                )
+                                record = build_ingestion_record(
+                                    dataset_id=ds_dataset_id, file_name=fname,
+                                    content_hash=content_hash, document_id=document_id,
+                                    metadata={"contract_package": contract_package,
+                                              "document_type": row["document_type"],
+                                              "document_title": row["document_title"],
+                                              "document_language": row["document_language"],
+                                              "document_summary": row["document_summary"],
+                                              "topics": topics_list},
+                                    workflow_status="success",
+                                    ingestion_status="success",
+                                    batch=doc_batch, indexing_status="completed",
+                                    segment_count=segment_count,
+                                )
+                                append_ingestion_record(record)
+                                success_count += 1
+
+                            elif final_status == "processing":
+                                results_detail.append(
+                                    f"⏳ {fname}: Pipeline 已执行，Dify 仍在后台处理，"
+                                    f"暂未检测到分段。可稍后刷新入库记录重新查询。"
+                                    f"（document_id: {document_id[:12]}...）"
+                                )
+                                record = build_ingestion_record(
+                                    dataset_id=ds_dataset_id, file_name=fname,
+                                    content_hash=content_hash, document_id=document_id,
+                                    metadata={"contract_package": contract_package,
+                                              "document_type": row["document_type"],
+                                              "document_title": row["document_title"]},
+                                    workflow_status="success",
+                                    ingestion_status="processing",
+                                    batch=doc_batch, indexing_status="processing",
+                                )
+                                append_ingestion_record(record)
+                                skip_count += 1
+
+                            elif final_status == "poll_error":
+                                results_detail.append(
+                                    f"❌ {fname}: 分段查询持续失败 — {idx_error}"
+                                    f"（document_id: {document_id[:12]}...）"
+                                )
+                                record = build_ingestion_record(
+                                    dataset_id=ds_dataset_id, file_name=fname,
+                                    content_hash=content_hash, document_id=document_id,
+                                    workflow_status="success",
+                                    ingestion_status="failed",
+                                    error_message=idx_error[:200],
+                                    batch=doc_batch, indexing_status="poll_error",
+                                    indexing_error=idx_error[:200],
+                                )
+                                append_ingestion_record(record)
+                                fail_count += 1
+
+                        except RuntimeError as exc:
+                            fail_count += 1
+                            results_detail.append(f"❌ {fname}: {exc}")
+                            record = build_ingestion_record(
+                                dataset_id=ds_dataset_id, file_name=fname,
+                                content_hash="", workflow_status="success",
+                                ingestion_status="failed",
+                                error_message=str(exc)[:200],
+                            )
+                            append_ingestion_record(record)
+
+                        ingest_progress.progress(
+                            (idx + 1) / len(rows_to_ingest),
+                            text=f"入库进度 {idx + 1}/{len(rows_to_ingest)}",
+                        )
+
+                    skip_count = len(valid_rows) - len(rows_to_ingest)
+
+                    st.markdown("---")
+                    st.markdown("#### 入库结果")
+
+                    result_c1, result_c2, result_c3 = st.columns(3)
+                    with result_c1:
+                        st.metric("✅ 成功", success_count)
+                    with result_c2:
+                        st.metric("⏭️ 跳过", skip_count)
+                    with result_c3:
+                        st.metric("❌ 失败", fail_count)
+
+                    for detail in results_detail:
+                        st.caption(detail)
+
+                    for key in ["ingestion_preview", "ingestion_wf_outputs", "ingestion_file_contents"]:
+                        st.session_state.pop(key, None)
+                    if fail_count == 0:
+                        st.session_state.pop("ingestion_file_blobs", None)
+
+    st.divider()
+
+    # ── MinIO 合同资产库 ──
+    st.markdown("#### 🗄️ MinIO 合同资产库（企业级版本归档）")
+    st.caption("所有上传的合同原件均已自动在此归档，支持历史版本追溯与一键重新灌入知识库。")
+    try:
+        from minio_vault import list_vault_documents, get_vault_file_bytes
+        vault_docs = list_vault_documents(include_versions=False)
+        if vault_docs:
+            v_data = []
+            for vd in vault_docs:
+                v_data.append({
+                    "文件名": vd["object_name"],
+                    "大小": f"{round(vd['size'] / 1024, 1)} KB" if vd.get("size") else "-",
+                    "版本 ID": (vd["version_id"][:16] + "...") if vd.get("version_id") and vd["version_id"] != "latest" else "最新版本",
+                    "归档时间": vd["last_modified"][:19].replace("T", " ") if vd.get("last_modified") else "-",
+                    "原件链接": f"[📥 点击下载/预览]({vd['presigned_url']})" if vd.get("presigned_url") else "-",
+                })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(v_data), use_container_width=True, hide_index=True)
+
+            with st.expander("🔄 从 MinIO 资产库一键拉取并重新灌入 Dify 知识库（容灾重建）", expanded=False):
+                st.write("当知识库被重置或调整了 Pipeline 切分规则时，可直接从 MinIO 资产库调取原件一键重灌：")
+                selected_v_file = st.selectbox(
+                    "选择要重新入库的 MinIO 文件",
+                    options=[d["object_name"] for d in vault_docs],
+                    key="minio_reingest_select"
+                )
+                if st.button("🚀 提取此文件并开始自动入库", key="minio_reingest_btn", disabled=_is_processing):
+                    if not ds_dataset_id:
+                        st.error("请先在上方选择目标知识库")
+                    else:
+                        st.info(f"正在从 MinIO 调取 `{selected_v_file}` 原件...")
+                        try:
+                            f_bytes = get_vault_file_bytes(selected_v_file)
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(selected_v_file).suffix) as tmp_f:
+                                tmp_f.write(f_bytes)
+                                tmp_path = tmp_f.name
+                            fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=selected_v_file)
+                            wf_outputs = run_auto_ingestion_workflow(
+                                wf_api_key, wf_base_url, [fid], contract_package, dataset_id=ds_dataset_id
+                            )
+                            st.success(f"✅ 从 MinIO 重灌成功！Workflow 返回状态正常。")
+                            st.rerun()
+                        except Exception as re_exc:
+                            st.error(f"重灌失败: {re_exc}")
+        else:
+            st.caption("MinIO 资产库中暂无合同文件。上传合同时将自动在此备份。")
+    except Exception as v_err:
+        st.caption(f"MinIO 资产库连接提示: {v_err}")
+
+    st.divider()
+
+    # ── 入库历史 ──
+    st.markdown("#### 入库历史")
+    if ds_dataset_id:
+        from dify_ingestion import load_ingestion_history
+        history = load_ingestion_history(ds_dataset_id)
+        if history:
+            history_df_data = []
+            _STATUS_ICONS = {
+                "success": "✅ 成功",
+                "completed_empty": "⚠️ 空分段",
+                "failed": "❌ 失败",
+                "processing": "⏳ 处理中",
+            }
+            for r in reversed(history):  # 最新在前
+                istatus = r.get("ingestion_status", "")
+                seg_count = r.get("segment_count", -1)
+                history_df_data.append({
+                    "时间": r.get("timestamp", ""),
+                    "文件名": r.get("file_name", ""),
+                    "文档 ID": (r.get("document_id", "")[:16] + "...") if r.get("document_id") else "",
+                    "标题": r.get("metadata", {}).get("document_title", ""),
+                    "状态": _STATUS_ICONS.get(istatus, istatus or "-"),
+                    "索引状态": r.get("indexing_status", "-") or "-",
+                    "分段数": str(seg_count) if seg_count >= 0 else "-",
+                    "错误": r.get("indexing_error", "")[:60] or r.get("error_message", "")[:60] or "",
+                })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(history_df_data), use_container_width=True, hide_index=True)
+        else:
+            st.caption("暂无入库记录")
+    else:
+        st.caption("请先选择目标知识库以查看入库历史")
+
+# --- 页面调度（只执行当前激活页面） ---
+if selected_page == "知识库探索":
+    render_kb_explorer()
+elif selected_page == "题目生成":
+    render_question_gen()
+elif selected_page == "批量提问":
+    render_batch_query()
+elif selected_page == "样本准备":
+    render_sample_prep()
+elif selected_page == "Judge 评测":
+    render_judge()
+elif selected_page == "运行看板":
+    render_dashboard()
+elif selected_page == "材料入库":
+    render_ingestion()
