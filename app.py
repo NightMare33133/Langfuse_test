@@ -10734,6 +10734,31 @@ def render_ingestion():
 
     # ── MinIO 合同资产库 ──
     st.markdown("#### 🗄️ MinIO 合同资产库（企业级版本归档）")
+
+    # 检查并确保 FastAPI 归档通信服务常驻
+    try:
+        from vault_server import is_vault_server_running, start_vault_server_background
+        api_alive = is_vault_server_running()
+        if not api_alive:
+            start_vault_server_background()
+            api_alive = is_vault_server_running()
+
+        st_c1, st_c2 = st.columns([3, 1])
+        with st_c1:
+            if api_alive:
+                st.success("🟢 **FastAPI 归档通信专线**：在线运行中 (`http://host.docker.internal:8000/api/vault/upload` 供 Dify 容器随时调用)")
+            else:
+                st.warning("🟡 **FastAPI 归档通信专线**：未激活（点击右侧按钮启动）")
+        with st_c2:
+            if not api_alive:
+                if st.button("🚀 启动 API 服务", key="start_vault_btn"):
+                    start_vault_server_background()
+                    st.rerun()
+            else:
+                st.caption("⚡ 自动随 Streamlit 后台常驻")
+    except Exception as api_err:
+        st.caption(f"API 专线状态: {api_err}")
+
     st.caption("所有上传的合同原件均已自动在此归档，支持历史版本追溯与一键重新灌入知识库。")
     try:
         from minio_vault import list_vault_documents, get_vault_file_bytes
