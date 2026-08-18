@@ -10114,12 +10114,20 @@ def render_ingestion():
                     "文档类型": r["document_type"] or "-",
                     "合同包": r["contract_package"],
                     "文档 ID": (r["document_id"][:16] + "...") if r["document_id"] else "-",
+                    "MinIO 原件": r.get("minio_url", ""),
                     "索引状态": r["indexing_status"],
                     "状态": "✅ 成功" if r["success"] else "❌ 失败",
                     "错误信息": r["error"] or "-",
                 })
             import pandas as pd
-            st.dataframe(pd.DataFrame(result_table_data), use_container_width=True, hide_index=True)
+            col_cfg = {
+                "MinIO 原件": st.column_config.LinkColumn(
+                    "MinIO 原件",
+                    display_text="📥 下载原件",
+                    help="点击直接下载或预览保存在 MinIO 中的合同正本",
+                )
+            }
+            st.dataframe(pd.DataFrame(result_table_data), column_config=col_cfg, use_container_width=True, hide_index=True)
 
     # ══════════════════════════════════════════════════════════════
     # 分支 B：🛠️ 提取后预览编辑（旧模式 / 高级模式）
@@ -10738,10 +10746,17 @@ def render_ingestion():
                     "大小": f"{round(vd['size'] / 1024, 1)} KB" if vd.get("size") else "-",
                     "版本 ID": (vd["version_id"][:16] + "...") if vd.get("version_id") and vd["version_id"] != "latest" else "最新版本",
                     "归档时间": vd["last_modified"][:19].replace("T", " ") if vd.get("last_modified") else "-",
-                    "原件链接": f"[📥 点击下载/预览]({vd['presigned_url']})" if vd.get("presigned_url") else "-",
+                    "原件链接": vd.get("presigned_url", ""),
                 })
             import pandas as pd
-            st.dataframe(pd.DataFrame(v_data), use_container_width=True, hide_index=True)
+            col_cfg = {
+                "原件链接": st.column_config.LinkColumn(
+                    "原件链接",
+                    display_text="📥 下载/预览",
+                    help="点击生成并在新标签页中打开合同正本安全直链",
+                )
+            }
+            st.dataframe(pd.DataFrame(v_data), column_config=col_cfg, use_container_width=True, hide_index=True)
 
             with st.expander("🔄 从 MinIO 资产库一键拉取并重新灌入 Dify 知识库（容灾重建）", expanded=False):
                 st.write("当知识库被重置或调整了 Pipeline 切分规则时，可直接从 MinIO 资产库调取原件一键重灌：")
