@@ -1,4 +1,4 @@
-import streamlit as st
+import sys
 from pathlib import Path
 from datetime import datetime
 import json
@@ -7,6 +7,13 @@ import os
 import re
 import time
 
+# 自动将子包目录加入 sys.path
+_ROOT_DIR = Path(__file__).resolve().parent
+for _sub in [_ROOT_DIR / "storage", _ROOT_DIR / "connectors", _ROOT_DIR / "generator", _ROOT_DIR / "evaluation"]:
+    if str(_sub) not in sys.path:
+        sys.path.insert(0, str(_sub))
+
+import streamlit as st
 import psutil
 
 import pandas as pd

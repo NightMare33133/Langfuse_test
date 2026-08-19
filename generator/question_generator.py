@@ -25,9 +25,9 @@ import pandas as pd
 
 from judge import call_llm
 
-PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt.txt"
-RETRIEVAL_PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt_retrieval.txt"
-QUESTIONS_DIR = Path(__file__).parent / "data" / "questions"
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "qgen_prompt.txt"
+RETRIEVAL_PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "qgen_prompt_retrieval.txt"
+QUESTIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "questions"
 
 # 出题模式
 MODE_RETRIEVAL = "retrieval"  # 检索评测模式

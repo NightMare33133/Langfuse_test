@@ -30,9 +30,9 @@ from pathlib import Path
 
 import requests
 
-PROJECTS_DIR = Path(__file__).parent / "data" / "langfuse_projects"
-RAW_DIR = Path(__file__).parent / "data" / "raw"
-DATA_DIR = Path(__file__).parent / "data"
+PROJECTS_DIR = Path(__file__).resolve().parent.parent / "data" / "langfuse_projects"
+RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 
 

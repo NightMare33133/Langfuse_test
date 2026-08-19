@@ -18,8 +18,8 @@ from pathlib import Path
 
 import requests
 
-BATCH_DIR = Path(__file__).parent / "data" / "batch"
-RAW_DIR = Path(__file__).parent / "data" / "raw"
+BATCH_DIR = Path(__file__).resolve().parent.parent / "data" / "batch"
+RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 
 def call_dify_query(question, api_key, base_url, timeout=60, user="batch-query"):

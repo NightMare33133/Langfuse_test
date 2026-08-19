@@ -17,8 +17,8 @@ import string
 from datetime import datetime
 from pathlib import Path
 
-CONFIG_PROFILES_DIR = Path(__file__).parent / "data" / "config_profiles"
-EXPERIMENTS_DIR = Path(__file__).parent / "data" / "experiments"
+CONFIG_PROFILES_DIR = Path(__file__).resolve().parent.parent / "data" / "config_profiles"
+EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "experiments"
 
 
 # ========== ID 生成 ==========

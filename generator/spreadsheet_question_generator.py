@@ -29,7 +29,7 @@ from question_generator import deduplicate_questions, MODE_RETRIEVAL
 
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 
-PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt_spreadsheet_retrieval.txt"
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "qgen_prompt_spreadsheet_retrieval.txt"
 _MAX_BLOCK_ROWS = 30       # 单个表格块最大行数
 _MAX_EVIDENCE_ROWS = 20    # 单个证据范围最大行数
 _MAX_EVIDENCE_COLS = 15    # 单个证据范围最大列数
@@ -96,8 +96,8 @@ class TableSchemaResult:
 
 # ─── Schema 缓存 ──────────────────────────────────────────────────────────────
 
-_SCHEMA_CACHE_DIR = Path(__file__).parent / "data" / "schema_cache"
-_SCHEMA_ANALYSIS_PROMPT_PATH = Path(__file__).parent / "prompts" / "qgen_schema_analysis_prompt.txt"
+_SCHEMA_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "schema_cache"
+_SCHEMA_ANALYSIS_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "qgen_schema_analysis_prompt.txt"
 
 # 测试/假模型标识，生产缓存中不允许出现
 _FAKE_MODEL_MARKERS = ("fake", "mock", "test", "dummy", "stub")

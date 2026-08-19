@@ -26,7 +26,7 @@ import requests
 
 # ── 常量 ─────────────────────────────────────────────────────
 
-INGESTION_HISTORY_DIR = Path(__file__).parent / "data" / "ingestion_history"
+INGESTION_HISTORY_DIR = Path(__file__).resolve().parent.parent / "data" / "ingestion_history"
 
 VALID_WORKFLOW_PACKAGES = {"baseline_2_4", "tech_platform_2_5"}
 

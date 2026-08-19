@@ -22,7 +22,7 @@ from question_generator import (
 
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 
-PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "qgen_prompt_xlsx_retrieval.txt"
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "qgen_prompt_xlsx_retrieval.txt"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _MAX_EVIDENCE_ROWS = 20  # 单个证据范围最大行数
 _MAX_EVIDENCE_COLS = 15  # 单个证据范围最大列数

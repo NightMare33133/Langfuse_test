@@ -27,7 +27,7 @@ def _load_run_samples(run_id):
     Returns:
         dict: question_id -> sample dict (不含 observations)
     """
-    proc_path = Path(__file__).parent / "data" / "processed" / "langfuse_samples.jsonl"
+    proc_path = Path(__file__).resolve().parent.parent / "data" / "processed" / "langfuse_samples.jsonl"
     by_qid = {}
     if not proc_path.exists():
         return by_qid
@@ -71,7 +71,7 @@ def _load_run_judge_results(run_id, trace_ids):
     Returns:
         dict: trace_id -> judge result dict
     """
-    judged_path = Path(__file__).parent / "data" / "judged" / "eval_results.jsonl"
+    judged_path = Path(__file__).resolve().parent.parent / "data" / "judged" / "eval_results.jsonl"
     by_tid = {}
     if not judged_path.exists():
         return by_tid

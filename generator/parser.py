@@ -438,7 +438,7 @@ def load_question_index(questions_dir=None):
     """
     from pathlib import Path as _Path
     if questions_dir is None:
-        questions_dir = _Path(__file__).parent / "data" / "questions"
+        questions_dir = _Path(__file__).resolve().parent.parent / "data" / "questions"
     else:
         questions_dir = _Path(questions_dir)
 
@@ -485,7 +485,7 @@ def load_legacy_chunk_exact_id_index(questions_dir=None):
     from pathlib import Path as _Path
 
     if questions_dir is None:
-        questions_dir = _Path(__file__).parent / "data" / "questions"
+        questions_dir = _Path(__file__).resolve().parent.parent / "data" / "questions"
     else:
         questions_dir = _Path(questions_dir)
 
@@ -529,7 +529,7 @@ def _question_set_id_for_run(run_id: str) -> str:
     """Read only the immutable manifest to scope a legacy ID recovery."""
     if not run_id:
         return ""
-    manifest_path = Path(__file__).parent / "data" / "experiments" / run_id / "manifest.json"
+    manifest_path = Path(__file__).resolve().parent.parent / "data" / "experiments" / run_id / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

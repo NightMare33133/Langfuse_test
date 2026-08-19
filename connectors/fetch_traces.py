@@ -20,7 +20,7 @@ import requests
 from dotenv import load_dotenv
 import os
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
 PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
@@ -212,7 +212,7 @@ def main():
     else:
         from datetime import datetime
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path(__file__).parent / "data" / "raw" / f"langfuse_api_export_{ts}.jsonl"
+        output_path = Path(__file__).resolve().parent.parent / "data" / "raw" / f"langfuse_api_export_{ts}.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"📥 从 {args.host} 拉取 Traces...")

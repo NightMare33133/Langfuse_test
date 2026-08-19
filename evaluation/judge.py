@@ -40,9 +40,9 @@ def compute_content_hash(sample):
     raw = "\n".join(parts)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
-PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "judge_prompt.txt"
-PROMPT_TEMPLATE_WITH_REF_PATH = Path(__file__).parent / "prompts" / "judge_prompt_with_ref.txt"
-PROMPT_TEMPLATE_RETRIEVAL_PATH = Path(__file__).parent / "prompts" / "judge_prompt_retrieval.txt"
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "judge_prompt.txt"
+PROMPT_TEMPLATE_WITH_REF_PATH = Path(__file__).resolve().parent.parent / "prompts" / "judge_prompt_with_ref.txt"
+PROMPT_TEMPLATE_RETRIEVAL_PATH = Path(__file__).resolve().parent.parent / "prompts" / "judge_prompt_retrieval.txt"
 
 
 def load_prompt_template():

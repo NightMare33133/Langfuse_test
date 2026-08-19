@@ -16,7 +16,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-CONNECTIONS_DIR = Path(__file__).parent / "data" / "dify_kb_connections"
+CONNECTIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "dify_kb_connections"
 KEYRING_SERVICE = "langfuse-rag-eval.dify-kb"
 
 VALID_PREFIX = "dataset-"
