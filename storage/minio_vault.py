@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import timedelta
 from typing import Any, BinaryIO
@@ -161,6 +162,7 @@ def get_presigned_download_url(
 def list_vault_documents(
     bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
     include_versions: bool = False,
+    filter_sidecars: bool = True,
     client: Any = None,
 ) -> list[dict[str, Any]]:
     """列出 MinIO 资产库中的所有合同文档及元数据。"""
@@ -171,6 +173,12 @@ def list_vault_documents(
     objects = cli.list_objects(bucket_name, recursive=True, include_version=include_versions)
     results = []
     for obj in objects:
+        if filter_sidecars and (
+            obj.object_name.endswith(".metadata.json")
+            or obj.object_name.endswith(".chunks.json")
+            or obj.object_name.endswith(".cleaned.txt")
+        ):
+            continue
         url = ""
         try:
             url = get_presigned_download_url(
@@ -183,16 +191,120 @@ def list_vault_documents(
         except Exception:
             pass
 
+        # 转换为本地时区时间（中国标准时间 UTC+8）
+        local_mtime = ""
+        if obj.last_modified:
+            try:
+                local_mtime = obj.last_modified.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                local_mtime = obj.last_modified.isoformat()
+
         results.append({
             "bucket": bucket_name,
             "object_name": obj.object_name,
             "version_id": getattr(obj, "version_id", "") or "latest",
             "size": obj.size,
-            "last_modified": obj.last_modified.isoformat() if obj.last_modified else "",
+            "last_modified": local_mtime,
             "is_latest": getattr(obj, "is_latest", True),
             "presigned_url": url,
         })
     return results
+
+
+def save_cleaned_text(
+    file_name: str,
+    cleaned_text: str,
+    bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
+    client: Any = None,
+) -> dict[str, Any]:
+    """在 MinIO 中保存数据清洗后但未分块的完整纯净文本（Cleaned Full Text）。
+
+    用于后续文本 Diff 差异化对比与切片效果基准分析。
+    """
+    cli = client or get_minio_client()
+    ensure_bucket(cli, bucket_name, enable_versioning=True)
+
+    cleaned_obj_name = f"{file_name}.cleaned.txt"
+    data_bytes = (cleaned_text or "").encode("utf-8")
+    stream = io.BytesIO(data_bytes)
+
+    res = cli.put_object(
+        bucket_name=bucket_name,
+        object_name=cleaned_obj_name,
+        data=stream,
+        length=len(data_bytes),
+        content_type="text/plain; charset=utf-8",
+    )
+
+    return {
+        "bucket": bucket_name,
+        "object_name": cleaned_obj_name,
+        "version_id": getattr(res, "version_id", "") or "",
+        "length": len(data_bytes),
+        "success": True,
+    }
+
+
+def get_cleaned_text(
+    file_name: str,
+    bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
+    version_id: str = None,
+    client: Any = None,
+) -> str | None:
+    """从 MinIO 读取清洗后的纯净文本（Cleaned Full Text）。"""
+    cli = client or get_minio_client()
+    cleaned_obj_name = f"{file_name}.cleaned.txt"
+    try:
+        data_bytes = get_vault_file_bytes(cleaned_obj_name, bucket_name=bucket_name, version_id=version_id, client=cli)
+        return data_bytes.decode("utf-8")
+    except Exception:
+        return None
+
+
+def save_sidecar_metadata(
+    file_name: str,
+    metadata: dict[str, Any],
+    bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
+    client: Any = None,
+) -> dict[str, Any]:
+    """在 MinIO 中同步保存一份伴生元数据 JSON 文件 (Sidecar Metadata)。"""
+    cli = client or get_minio_client()
+    ensure_bucket(cli, bucket_name, enable_versioning=True)
+
+    sidecar_name = f"{file_name}.metadata.json"
+    data_bytes = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+    stream = io.BytesIO(data_bytes)
+
+    res = cli.put_object(
+        bucket_name=bucket_name,
+        object_name=sidecar_name,
+        data=stream,
+        length=len(data_bytes),
+        content_type="application/json",
+    )
+
+    return {
+        "bucket": bucket_name,
+        "object_name": sidecar_name,
+        "version_id": getattr(res, "version_id", "") or "",
+        "success": True,
+    }
+
+
+def get_sidecar_metadata(
+    file_name: str,
+    bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
+    version_id: str = None,
+    client: Any = None,
+) -> dict[str, Any] | None:
+    """从 MinIO 获取某份合同的伴生元数据字典。"""
+    cli = client or get_minio_client()
+    sidecar_name = f"{file_name}.metadata.json"
+    try:
+        data_bytes = get_vault_file_bytes(sidecar_name, bucket_name=bucket_name, version_id=version_id, client=cli)
+        return json.loads(data_bytes.decode("utf-8"))
+    except Exception:
+        return None
 
 
 def get_vault_file_bytes(

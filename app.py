@@ -22,7 +22,13 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 from parser import parse_langfuse_jsonl, save_results
-from judge import judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash, build_judge_prompt, load_prompt_template, load_prompt_template_with_ref, build_result_status, backfill_chunk_exact_topk
+from judge import (
+    judge_all, compute_metrics, call_llm, pre_screen, compute_content_hash,
+    build_judge_prompt, load_prompt_template, load_prompt_template_with_ref,
+    build_result_status, backfill_chunk_exact_topk, classify_evaluation_track,
+    get_gold_evidence, TRACK_RETRIEVAL, TRACK_STRICT_QA, TRACK_GROUNDED_QA,
+    TRACK_NOT_EVALUABLE, TRACK_CHUNK_EXACT,
+)
 from question_generator import generate_questions, save_questions, export_csv_bytes, choose_strategy, STRATEGY_LABELS, MODE_RETRIEVAL, MODE_QA, MODE_LABELS, build_question_set_name
 from batch_query import run_batch_query, push_to_raw_dir, export_csv_bytes as batch_export_csv
 
@@ -1134,27 +1140,26 @@ def render_judge_results_list(results: list, sample_map: dict, key_prefix: str =
         render_judge_result_detail(r, sample, key_prefix)
 
 
-st.set_page_config(page_title="RAG 评测工作台", layout="wide")
-st.title("RAG 评测工作台")
+st.set_page_config(page_title="RAG 知识库与智能评测平台", layout="wide", page_icon="⚡")
+st.title("RAG 知识库与智能评测平台")
+st.caption("融合 Dify 知识库中枢 · Langfuse 全链路观测 · MinIO 资产版本归档 · LLM Judge 自动化评测")
 
 # --- Sidebar ---
 st.sidebar.markdown(
-    "一站式 RAG 质量评测平台：从知识库探索、出题、批量提问到 LLM Judge 自动评分，"
-    "覆盖检索命中与回答质量两个维度，按配置方案汇总累计指标。"
+    "**全链路 RAG 知识库与质量评测平台**：涵盖合同批量入库、MinIO 对象资产版本归档、"
+    "知识库探索、智能评测出题、Dify 并发批量提问与 LLM Judge 自动化多轨道打分。"
 )
 st.sidebar.divider()
-st.sidebar.markdown("**核心工作流**")
+st.sidebar.markdown("**核心功能体系**")
 st.sidebar.markdown(
-    "1. **题目生成** — 上传知识库文件，自动切分并调用 LLM 生成带参考答案的评测题集\n"
-    "2. **批量提问** — 选择题集与 RAG 配置方案，通过 Dify API 批量提问，收集回答和检索结果\n"
-    "3. **样本准备** — 将 Dify / Langfuse 记录解析为结构化样本，回填参考答案和运行元数据\n"
-    "4. **Judge 评测** — 自动评分：检索层看 Top1/3/5 命中，回答层看正确性/合理性"
+    "1. **📑 批量材料入库** — Dify Pipeline 自动父子切分 + Metadata 智能抽取 + MinIO 原件多版本归档\n"
+    "2. **🔍 知识库探索** — 浏览 Dify 数据集文档与分块明细，支持向量相似度检索与切片诊断\n"
+    "3. **✍️ 智能出题** — 支持 Word/PDF/Excel 及分块精准出题，生成带金标准证据的评测题库\n"
+    "4. **🚀 批量提问** — 并发调用 Dify API 批量测试提问，自动绑定配置快照\n"
+    "5. **⚖️ Judge 评测** — 三轨道自动评分（检索召回 Top1/3/5 + 严格问答 + 合理性问答）\n"
+    "6. **📊 运行看板** — 版本指标加权对比、Bad Case 归因诊断与 Excel/HTML 报告导出"
 )
-st.sidebar.divider()
-st.sidebar.markdown("**知识库探索** — 浏览知识库 → 文档 → 分块层级结构，检测重复分块，支持 chunk_exact 出题和检索诊断")
-st.sidebar.markdown("**运行看板** — 按配置方案查看累计指标、运行历史和单次运行详情")
-st.sidebar.markdown("**材料入库** — 批量上传合同文件，调用 Workflow 提取 metadata，预览确认后写入知识库")
-st.sidebar.caption("切换上方 Tab 进入对应工作区，每个 Tab 内均有详细说明和独立配置面板。")
+st.sidebar.caption("切换上方 Tab 进入对应工作区，每个模块均有独立配置面板与状态监控。")
 
 # --- 内存用量显示 ---
 _rss_log = st.session_state.get("_rss_log", [])
@@ -9367,6 +9372,11 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                 _old_qs = _old_run.get("question_set_id", "")
                 _new_qs = _new_run.get("question_set_id", "")
 
+                _diff = st.session_state.get("_xcmp_result")
+                if _diff and (_diff.get("old_run_id") != _old_rid or _diff.get("new_run_id") != _new_rid):
+                    _diff = None
+                    st.session_state.pop("_xcmp_result", None)
+
                 if _old_rid == _new_rid:
                     st.warning("请选择两个不同的运行进行对比。")
                 elif _old_qs != _new_qs:
@@ -9383,6 +9393,7 @@ run_id → processed sample（真实 Langfuse trace_id）→ Judge result
                                 st.session_state["_xcmp_result"] = _diff
                             except Exception as _diff_err:
                                 st.error(f"对比失败: {_diff_err}")
+                                _diff = None
                 if _diff and _diff.get("summary"):
                     _s = _diff["summary"]
                     _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -10069,6 +10080,30 @@ def render_ingestion():
                                     indexing_status=res.get("indexing_status", "waiting"),
                                 )
                                 append_ingestion_record(record)
+
+                                # 4.1 自动固化三元组一致性快照 (MinIO + Dify + Metadata)
+                                try:
+                                    from storage.snapshot import create_consistency_snapshot
+                                    minio_rec = minio_vault_records.get(fname, {})
+                                    create_consistency_snapshot(
+                                        file_name=fname,
+                                        content_hash=content_hash,
+                                        minio_version_id=minio_rec.get("version_id", ""),
+                                        dify_dataset_id=ds_dataset_id or "default",
+                                        dify_document_id=doc_id or "",
+                                        metadata={
+                                            "contract_package": res["contract_package"],
+                                            "document_type": res["document_type"],
+                                            "document_title": res["document_title"],
+                                            "document_language": res["document_language"],
+                                            "document_summary": res["document_summary"],
+                                            "topics": res["topics"],
+                                        },
+                                        contract_package=res["contract_package"],
+                                        indexing_status=res.get("indexing_status", "waiting"),
+                                    )
+                                except Exception:
+                                    pass
                             else:
                                 fail_count += 1
                                 progress.file_failure(fname, res["error"])
@@ -10740,7 +10775,7 @@ def render_ingestion():
     st.divider()
 
     # ── MinIO 合同资产库 ──
-    st.markdown("#### 🗄️ MinIO 合同资产库（企业级版本归档）")
+    st.markdown("#### 🗄️ MinIO 合同资产库（版本归档与快照）")
 
     # 检查并确保 FastAPI 归档通信服务常驻
     try:
@@ -10777,7 +10812,7 @@ def render_ingestion():
                     "文件名": vd["object_name"],
                     "大小": f"{round(vd['size'] / 1024, 1)} KB" if vd.get("size") else "-",
                     "版本 ID": (vd["version_id"][:16] + "...") if vd.get("version_id") and vd["version_id"] != "latest" else "最新版本",
-                    "归档时间": vd["last_modified"][:19].replace("T", " ") if vd.get("last_modified") else "-",
+                    "归档时间": vd.get("last_modified", "-"),
                     "原件链接": vd.get("presigned_url", ""),
                 })
             import pandas as pd
@@ -10790,31 +10825,102 @@ def render_ingestion():
             }
             st.dataframe(pd.DataFrame(v_data), column_config=col_cfg, use_container_width=True, hide_index=True)
 
-            with st.expander("🔄 从 MinIO 资产库一键拉取并重新灌入 Dify 知识库（容灾重建）", expanded=False):
-                st.write("当知识库被重置或调整了 Pipeline 切分规则时，可直接从 MinIO 资产库调取原件一键重灌：")
-                selected_v_file = st.selectbox(
-                    "选择要重新入库的 MinIO 文件",
-                    options=[d["object_name"] for d in vault_docs],
-                    key="minio_reingest_select"
-                )
-                if st.button("🚀 提取此文件并开始自动入库", key="minio_reingest_btn", disabled=_is_processing):
-                    if not ds_dataset_id:
-                        st.error("请先在上方选择目标知识库")
-                    else:
-                        st.info(f"正在从 MinIO 调取 `{selected_v_file}` 原件...")
-                        try:
-                            f_bytes = get_vault_file_bytes(selected_v_file)
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(selected_v_file).suffix) as tmp_f:
-                                tmp_f.write(f_bytes)
-                                tmp_path = tmp_f.name
-                            fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=selected_v_file)
-                            wf_outputs = run_auto_ingestion_workflow(
-                                wf_api_key, wf_base_url, [fid], contract_package, dataset_id=ds_dataset_id
-                            )
-                            st.success(f"✅ 从 MinIO 重灌成功！Workflow 返回状态正常。")
-                            st.rerun()
-                        except Exception as re_exc:
-                            st.error(f"重灌失败: {re_exc}")
+            # ── 一致性快照台账 (Consistency Manifest) ──
+            from storage.snapshot import list_consistency_snapshots
+            snapshots = list_consistency_snapshots()
+            if snapshots:
+                st.markdown("##### 📋 合同版本、知识库索引与 Metadata 一致性快照台账")
+                st.caption("记录每次入库的「目标知识库 ⟷ MinIO 原始版本 ⟷ Dify 文档索引 ⟷ 结构化 Metadata」强一致性绑定关系。")
+                
+                # 知识库筛选选项
+                all_ds_ids = sorted(list(set(s.get("knowledge_base", {}).get("dataset_id", "") for s in snapshots if s.get("knowledge_base", {}).get("dataset_id"))))
+                ds_filter = "全部知识库"
+                if all_ds_ids:
+                    filter_col1, _ = st.columns([2, 2])
+                    with filter_col1:
+                        ds_filter = st.selectbox("筛选知识库记录", options=["全部知识库"] + all_ds_ids, key="snap_ds_filter")
+
+                snap_rows = []
+                for s in snapshots:
+                    m = s.get("metadata", {})
+                    kb = s.get("knowledge_base", {})
+                    stg = s.get("storage", {})
+                    s_ds = kb.get("dataset_id", "")
+                    if ds_filter != "全部知识库" and s_ds != ds_filter:
+                        continue
+
+                    topics_val = m.get("topics", [])
+                    topics_str = ", ".join(topics_val) if isinstance(topics_val, list) else str(topics_val)
+                    snap_rows.append({
+                        "快照 ID": s.get("snapshot_id", ""),
+                        "目标知识库 ID": (s_ds[:12] + "...") if s_ds else "-",
+                        "合同包": s.get("contract_package", "-"),
+                        "文件名": s.get("file_name", ""),
+                        "MinIO 版本": (stg.get("version_id", "")[:12] + "...") if stg.get("version_id") and stg.get("version_id") != "latest" else "最新",
+                        "Dify 文档 ID": (kb.get("document_id", "")[:12] + "...") if kb.get("document_id") else "-",
+                        "文档标题": m.get("document_title", "-"),
+                        "文档类型": m.get("document_type", "-"),
+                        "主题词": topics_str or "-",
+                        "快照生成时间": s.get("created_at", "")[:19].replace("T", " "),
+                    })
+                import pandas as pd
+                st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+
+            with st.expander("🔄 从 MinIO 历史快照一键回滚重灌（原件 + 元数据全状态恢复）", expanded=False):
+                st.write("当知识库被重置、或需要回退到某一特定版本时，可选择历史快照一键完整恢复：")
+                if snapshots:
+                    snap_options = {
+                        f"[{s['snapshot_id']}] 库:{s.get('knowledge_base', {}).get('dataset_id', '')[:8]}.. | {s['file_name']} | 标题: {s.get('metadata', {}).get('document_title', '-')[:15]}": s
+                        for s in snapshots
+                    }
+                    selected_snap_label = st.selectbox("选择目标历史快照", options=list(snap_options.keys()), key="rollback_snap_select")
+                    target_snap = snap_options[selected_snap_label]
+                    
+                    if st.button("🚀 按照此快照执行全状态版本回滚", key="minio_rollback_btn", disabled=_is_processing):
+                        if not ds_dataset_id:
+                            st.error("请先在上方选择目标知识库")
+                        else:
+                            st.info(f"正在从 MinIO 调取快照 `{target_snap['snapshot_id']}` 的原件...")
+                            try:
+                                f_bytes = get_vault_file_bytes(
+                                    target_snap["file_name"],
+                                    version_id=target_snap.get("storage", {}).get("version_id")
+                                )
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(target_snap["file_name"]).suffix) as tmp_f:
+                                    tmp_f.write(f_bytes)
+                                    tmp_path = tmp_f.name
+                                fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=target_snap["file_name"])
+                                wf_outputs = run_auto_ingestion_workflow(
+                                    wf_api_key, wf_base_url, [fid], target_snap.get("contract_package", "baseline_2_4"), dataset_id=ds_dataset_id
+                                )
+                                st.success(f"✅ 快照全状态回滚成功！已重新灌入 Dify 知识库。")
+                                st.rerun()
+                            except Exception as re_exc:
+                                st.error(f"回滚重灌失败: {re_exc}")
+                else:
+                    selected_v_file = st.selectbox(
+                        "选择要重新入库的 MinIO 文件",
+                        options=[d["object_name"] for d in vault_docs],
+                        key="minio_reingest_select"
+                    )
+                    if st.button("🚀 提取此文件并开始自动入库", key="minio_reingest_btn", disabled=_is_processing):
+                        if not ds_dataset_id:
+                            st.error("请先在上方选择目标知识库")
+                        else:
+                            st.info(f"正在从 MinIO 调取 `{selected_v_file}` 原件...")
+                            try:
+                                f_bytes = get_vault_file_bytes(selected_v_file)
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(selected_v_file).suffix) as tmp_f:
+                                    tmp_f.write(f_bytes)
+                                    tmp_path = tmp_f.name
+                                fid = upload_file(wf_api_key, wf_base_url, tmp_path, filename_override=selected_v_file)
+                                wf_outputs = run_auto_ingestion_workflow(
+                                    wf_api_key, wf_base_url, [fid], contract_package, dataset_id=ds_dataset_id
+                                )
+                                st.success(f"✅ 从 MinIO 重灌成功！Workflow 返回状态正常。")
+                                st.rerun()
+                            except Exception as re_exc:
+                                st.error(f"重灌失败: {re_exc}")
         else:
             st.caption("MinIO 资产库中暂无合同文件。上传合同时将自动在此备份。")
     except Exception as v_err:

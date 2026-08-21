@@ -1,283 +1,191 @@
-# Langfuse RAG 评测工具
+# RAG 知识库与智能评测平台
 
-RAG 检索 + 回答质量评测工具。从知识库生成题目，通过 Dify 批量提问，解析为结构化样本后用 LLM Judge 自动评分。运行看板按配置方案汇总累计指标、运行历史和单次运行详情。
+面向 RAG 知识库的全链路自动化开发与评测系统。涵盖 **合同批量入库、MinIO 对象资产归档与多版本管理、知识库探索、智能题目生成、Dify 批量提问、LLM-as-a-Judge 裁判打分、实验对比看板与 Bad Case 调优分析**。
 
-## 功能概览
+---
 
-- **题目生成** — 上传知识库文件（.txt/.md/.docx/.xlsx），自动按章节切分后调用 LLM 生成带参考答案的评测题集
-- **批量提问** — 选择题集和 RAG 配置方案，通过 Dify Workflow API 批量提问，收集回答与检索结果
-- **样本准备** — 解析 Dify / Langfuse 记录为结构化样本，回填参考答案和运行元数据
-- **Judge 评测** — 按评测轨道自动评分：检索评测关注 Top1/3/5 命中，问答评测关注正确性/合理性
-- **运行看板** — 按配置方案查看累计结果、运行历史和单次运行详情，支持安全编辑配置描述
-- **评测优化** — 规则预筛选 + 内容级去重 + 分层 prompt 截断，减少 LLM 调用次数
-- **报告导出** — 一键下载 CSV 或 Markdown 评测报告
+## 🌟 核心能力架构
 
-## 四步工作流 + 运行看板
+```mermaid
+flowchart TD
+    subgraph Storage["1. 资产与持久化层 (Storage)"]
+        MinIO[("MinIO 资产库 (contracts-vault)<br/>多版本控制 Versioning")]
+        FastAPI["FastAPI 专线 (vault_server)<br/>端口 8000 (供 Dify 容器调用)"]
+    end
 
-```
-题目生成 → 批量提问 → 样本准备 → Judge 评测
-                                        ↓
-                                   运行看板（累计指标 + 运行历史 + 单次详情）
-```
+    subgraph Dify["2. Dify 知识库中枢 (Dify Connectors)"]
+        Pipeline["Knowledge Pipeline<br/>父子分块切分"]
+        Metadata["Metadata 智能抽取与绑定<br/>(contract_package/doc_type)"]
+        KB[("Dify 向量知识库")]
+    end
 
-| 步骤 | 模块 | 说明 |
-|------|------|------|
-| 1. 题目生成 | `question_generator.py` | 上传知识库文件，调用 LLM 生成题集，输出 question / reference_answer / source_excerpt / question_set_id |
-| 2. 批量提问 | `batch_query.py` | 选择题集 + 配置方案，通过 Dify API 批量提问，产出 raw 文件（含 run_id / config_id） |
-| 3. 样本准备 | `parser.py` | 解析 raw 文件为 processed samples（使用真实 Langfuse trace_id），回填参考答案和元数据 |
-| 4. Judge 评测 | `judge.py` | 按评测轨道（retrieval / strict_qa / grounded_qa）调用 LLM 评分 |
-| 5. 运行看板 | `experiment.py` + `app.py` | 按配置方案聚合累计指标（加权汇总），查看运行历史和单次详情 |
+    subgraph Eval["3. 评测与实验闭环 (Evaluation & Analytics)"]
+        QGen["智能出题引擎<br/>(Word/PDF/Excel/分块精准出题)"]
+        BatchQ["批量并发提问<br/>(Dify Workflow / Chatflow)"]
+        Judge["LLM Judge 智能裁判<br/>(检索召回 TopK + 问答正确性)"]
+        Exp["实验看板与调优分析<br/>(Bad Case 归因 + Excel 报告导出)"]
+    end
 
-### 数据关联链
-
-```
-run_id → processed sample（真实 Langfuse trace_id）→ Judge result
+    Storage <--> Dify
+    Dify --> Eval
 ```
 
-- `batch_qa_*` 是批量提问生成的文件标识，**不是** Langfuse trace_id
-- Judge 结果通过 processed sample 的 trace_id 关联，不通过 batch_qa_* 关联
-- 历史 Judge 结果没有 run_id 时，通过 trace_id fallback 关联
-- 运行看板累计指标按有效 Judge 样本数加权汇总，不是各 run 百分比的简单平均
+---
 
-## 评测轨道
+## 🚀 七大核心业务功能
 
-| 轨道 | 触发条件 | 核心指标 |
-|------|---------|---------|
-| **retrieval（检索评测）** | question_mode=retrieval 且有金标准证据 | Top1 / Top3 / Top5 Hit |
-| **strict_qa（严格问答）** | question_mode=qa 且有 reference_answer | Answer Correctness |
-| **grounded_qa（合理性问答）** | question_mode=qa 且无 reference_answer | Answer Groundedness |
-| **not_evaluable** | 检索评测题但缺少金标准证据 | 不纳入计算 |
+### 1. 📑 批量知识库入库（Batch Ingestion）
+- **自动流水线入库**：调用 Dify Knowledge Pipeline，自动完成文档正文提取、父子分块切分与向量索引构建；
+- **Metadata 自动化生命周期**：自动调用大模型抽取 `contract_package`、`document_type`、`document_title`、`topics` 等结构化元数据；
+- **字段检测与一键自愈**：自动核对目标知识库 Schema，若缺少必填字段支持一键初始化；
+- **文件防重与状态追踪**：基于内容哈希去重，防止重复切分索引。
 
-## 配置方案字段
+### 2. 🗄️ MinIO 合同资产保险库（Contract Vault）
+- **S3 原生对象存储**：将合同原件自动归档至 `contracts-vault` 存储桶；
+- **多版本控制（Versioning）**：同名合同再次上传自动生成唯一 UUID 版本快照，防覆盖、可回溯；
+- **安全预签名直链**：自动生成 AWS S3 加密签名的 1 小时安全预览/下载直链；
+- **FastAPI 专线桥梁**：运行在 `8000` 端口，为 Dify Docker 容器提供高可用归档接口；
+- **一键容灾重建索引（Re-indexing）**：支持直接从 MinIO 调取历史版本原件，一键批量重灌进 Dify 知识库。
 
-### 必填字段
+### 3. 🔍 知识库数据探索（KB Explorer）
+- 直连 Dify 知识库，实时浏览数据集下包含的文档清单、切片数量、分段明细；
+- 支持段落全文搜索与相似度向量检索测试。
 
-| 字段 | 说明 |
-|------|------|
-| `config_name` | 配置名称 |
-| `knowledge_base_version` | 知识库版本 / 文档版本 |
-| `workflow_version` | 工作流名称或版本 |
+### 4. ✍️ 智能评测题库生成（Question Generator）
+- **多格式智能解析**：支持 `.docx`、`.pdf`、`.xlsx`、`.txt`、`.md` 深度结构化提取；
+- **四大出题策略**：事实检索题、多跳逻辑推理题、边界负样本题、全流程问答题；
+- **分块精准出题（Chunk-Exact）**：基于物理切块目录，生成带有金标准证据位置的绝对基准题；
+- **复杂表格出题（Spreadsheet QGen）**：自动分析 Excel Schema 角色，支持数值计算题与价格锚点验证。
 
-### 可选字段
+### 5. 🚀 并发批量提问（Batch Query）
+- 多线程并发向 Dify Chatflow / Workflow API 发起批量测试提问；
+- 完整记录 Prompt、检索到的 Chunks、模型回答、Token 消耗与耗时；
+- 每次测试自动绑定 **RAG 配置方案快照（Run ID）**，支持多版本切分参数追溯。
 
-| 字段 | 说明 |
-|------|------|
-| `source_description` | 文档 / 数据来源说明 |
-| `chunk_strategy` | 分块策略 |
-| `embedding_model` | Embedding 模型 |
-| `retrieval_mode` | 检索模式（如 hybrid / semantic） |
-| `retrieval_config` | 检索配置说明 |
-| `top_k` | Top K（整数） |
-| `rerank_model` | Rerank 模型 |
-| `changed_variable` | 本次改动 |
-| `notes` | 备注 |
+### 6. ⚖️ LLM-as-a-Judge 裁判打分（Automated Evaluation）
+- **三轨道评分体系**：
+  - `retrieval`（检索评测）：Top-1 / Top-3 / Top-5 命中率判定；
+  - `strict_qa`（严格问答）：对比参考答案打分（准确率、幻觉率、完整度）；
+  - `grounded_qa`（合理性问答）：评估回答是否完全忠实于检索到的切片上下文。
+- **评测加速优化**：内置规则预筛选、内容级去重与 Token 截断，大幅降低打分成本。
 
-### 只读核心字段
+### 7. 📊 实验对比与运行看板（Dashboard & Reporting）
+- **多版本实验对比**：对比 V1（基线切分）与 V2（优化后切分）的命中率提升幅度；
+- **Bad Case 归因诊断**：自动归类未召回原因（分块过大/断句截断/语义偏离/模型误答）并生成具体调优建议；
+- **一键导出全景报告**：支持导出包含图表、指标汇总和逐题明细的 Excel 与 HTML 评测报告。
 
-`config_id`、`created_at` — 不可在 UI 编辑。
+---
 
-## 项目结构
+## 📂 项目工程架构
 
-```
+项目按照标准模块化设计，业务逻辑划分为 4 个清晰子包：
+
+```text
 Langfuse_test/
-├── app.py                    # Streamlit 主界面（5 个 Tab）
-├── experiment.py             # 运行看板模块（配置方案 + 运行记录 + 字段 schema）
-├── judge.py                  # Judge 评测模块（prompt 构建、API 调用、指标计算）
-├── parser.py                 # 样本准备模块（解析 + 回填参考答案和元数据）
-├── question_generator.py     # 题目生成模块
-├── batch_query.py            # 批量提问模块
-├── dify_connection.py        # Dify 连接配置管理（命名配置 + 安全 API Key 存储）
-├── doc_parser.py             # 统一文档解析（.txt/.md/.docx/.xlsx）
-├── fetch_traces.py           # Langfuse API Trace 拉取模块
-├── main.py                   # CLI 入口（仅解析，不含 Judge）
-├── prompts/
-│   ├── judge_prompt.txt           # Judge Prompt（合理性问答模板）
-│   ├── judge_prompt_with_ref.txt  # Judge Prompt（严格问答模板）
-│   ├── judge_prompt_retrieval.txt # Judge Prompt（检索评测模板）
-│   └── qgen_prompt.txt            # 题目生成 Prompt
-├── data/
-│   ├── raw/                  # 批量提问推送的 raw 文件（batch_qa_*.jsonl）
-│   ├── processed/            # 解析后的结构化样本
-│   │   ├── langfuse_samples.jsonl   # Judge 评测的直接输入
-│   │   └── langfuse_summary.json
-│   ├── judged/               # Judge 评测结果
-│   │   ├── eval_results.jsonl       # 最新结果（持续积累）
-│   │   └── eval_results_<时间戳>.jsonl  # 历史快照
-│   ├── questions/            # 生成的题集文件（含 question_set_id）
-│   ├── batch/                # 批量提问完整结果（含成功/失败状态）
-│   ├── config_profiles/      # 配置方案 JSON 文件
-│   ├── dify_connections/     # Dify 连接配置元数据（不含 API Key）
-│   └── experiments/          # 运行记录（每个 run 一个目录，含 manifest.json）
-├── .env.example              # 环境变量模板
-└── README.md
+├── app.py                      # 🖥️ Streamlit 交互大屏主入口
+├── main.py                     # CLI 命令行工具
+├── pytest.ini                  # 🧪 测试配置文件 (pythonpath = .)
+│
+├── storage/                    # 🗄️ 1. 资产与存储子包
+│   ├── __init__.py
+│   ├── minio_vault.py          # MinIO S3 SDK 封装、版本控制、预签名
+│   └── vault_server.py         # FastAPI 归档通信服务 (端口 8000)
+│
+├── connectors/                 # 🤖 2. 外部系统连接器子包
+│   ├── __init__.py
+│   ├── dify_connection.py      # Dify API 凭据管理
+│   ├── dify_kb_connection.py   # Dify 知识库配置管理
+│   ├── dify_knowledge.py       # Dify 知识库文档/分段探索
+│   ├── dify_ingestion.py       # Dify Pipeline 批量入库与元数据绑定
+│   ├── langfuse_connection.py  # Langfuse 认证管理
+│   ├── langfuse_project.py     # Langfuse 项目与数据集管理
+│   └── fetch_traces.py         # Langfuse 追踪数据抓取
+│
+├── generator/                  # ✍️ 3. 智能出题与文档解析子包
+│   ├── __init__.py
+│   ├── question.py             # 题目数据结构 Schema
+│   ├── question_generator.py   # LLM 核心出题引擎
+│   ├── chunk_exact_questions.py # 分块精准出题引擎
+│   ├── spreadsheet_question_generator.py # 表格精准出题引擎
+│   ├── xlsx_question_generator.py # XLSX 兼容包装层
+│   ├── doc_parser.py           # Word/PDF/Excel 文档解析与清洗
+│   └── parser.py               # 基础分块辅助工具
+│
+├── evaluation/                 # ⚖️ 4. 评测裁判与实验分析子包
+│   ├── __init__.py
+│   ├── batch_query.py          # 并发批量提问引擎
+│   ├── judge.py                # LLM-as-a-Judge 裁判打分引擎
+│   ├── experiment.py           # 评测实验与对比看板
+│   ├── optimization_analysis.py # Bad Case 归因与建议生成
+│   ├── retrieval_diff.py       # 检索 Diff 对比分析
+│   └── report_export.py        # 综合评测报告导出 (Excel/HTML)
+│
+├── prompts/                    # 📝 出题与 Judge Prompt 模板库
+├── data/                       # 💾 本地数据与缓存目录
+└── tests/                      # 🧪 单元测试集 (1250+ 测试全量覆盖)
 ```
 
-## 环境要求
+---
 
-- Python 3.13+
-- 依赖：`streamlit`、`pandas`、`plotly`、`requests`、`python-dotenv`
+## 🛠️ 环境依赖与快速启动
+
+### 1. 安装环境依赖
 
 ```bash
-pip install streamlit pandas plotly requests python-dotenv
+# Python 3.11+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# 或直接安装核心依赖:
+pip install streamlit fastapi uvicorn minio pandas plotly requests python-dotenv openpyxl python-docx
 ```
 
-## 配置
+### 2. 环境变量配置 (`.env`)
 
-复制 `.env.example` 为 `.env` 并填写对应配置：
-
+复制 `.env.example` 并填入必要信息：
 ```bash
 cp .env.example .env
 ```
 
-### 环境变量说明
+| 配置项 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `MINIO_ENDPOINT` | `localhost:9005` | 合同资产库 MinIO S3 端口 |
+| `MINIO_ACCESS_KEY` | `admin` | MinIO 账号 |
+| `MINIO_SECRET_KEY` | `password123` | MinIO 密码 |
+| `MINIO_CONTRACTS_BUCKET` | `contracts-vault` | 存储桶名称 |
+| `JUDGE_API_KEY` | - | 裁判大模型 API Key |
+| `JUDGE_API_BASE` | `https://token-plan-cn.xiaomimimo.com/v1` | 大模型 API Base URL |
+| `JUDGE_MODEL` | `mimo-v2.5-pro` | 裁判与出题模型名称 |
+| `LANGFUSE_HOST` | `http://localhost:3000` | Langfuse 服务地址 |
 
-| 变量 | 说明 |
-|------|------|
-| `LANGFUSE_HOST` | Langfuse 服务地址（默认 `http://localhost:3000`） |
-| `LANGFUSE_PUBLIC_KEY` | Langfuse Public Key（用于 API 拉取 Traces） |
-| `LANGFUSE_SECRET_KEY` | Langfuse Secret Key |
-| `JUDGE_API_KEY` | Judge LLM 的 API Key |
-| `JUDGE_API_BASE` | Judge LLM 的 Base URL（默认 `https://token-plan-cn.xiaomimimo.com/v1`） |
-| `JUDGE_MODEL` | Judge 使用的模型名称（默认 `mimo-v2.5-pro`） |
-| `DIFY_API_KEY` | Dify API Key（用于批量提问，建议通过连接配置管理） |
-
-### Dify 连接配置
-
-批量提问支持命名的 Dify 连接配置，方便切换不同 Workflow：
-- **安全存储**：API Key 通过系统凭据存储（Windows Credential Manager / macOS Keychain），元数据 JSON 不含密钥
-- **快速切换**：下拉选择已保存配置，自动填充 Base URL、超时等参数
-- **环境变量兼容**：未使用连接配置时，`.env` 中的 `DIFY_API_KEY` / `DIFY_API_BASE` 作为默认值
-
-## 使用方法
-
-### 1. 启动 Streamlit 应用
+### 3. 一键启动看板
 
 ```bash
 streamlit run app.py
 ```
+启动后在浏览器访问 `http://localhost:8501`。
+*(后台将自动常驻拉起 8000 端口的 FastAPI 归档专线服务)*。
 
-### 2. 题目生成
+---
 
-1. 在「题目生成」tab 上传知识库文件（.txt / .md）
-2. 选择出题模式（检索评测 / 全流程问答评测）
-3. 设置生成数量、难度偏好、生成策略
-4. 点击「生成题目」
-5. 题集保存到 `data/questions/`，含 question、reference_answer、source_excerpt、question_set_id 等
+## 🌐 端口与服务矩阵
 
-### 3. 批量提问
+| 服务名称 | 访问地址 | 作用说明 |
+| :--- | :--- | :--- |
+| **Streamlit 大屏** | `http://localhost:8501` | 前端用户操作与评测看板 |
+| **FastAPI 专线** | `http://localhost:8000` | 供 Dify 工作流调用的 MinIO 归档接口 |
+| **Dify Web 控制台** | `http://localhost:80` | Dify 知识库与工作流编排端 |
+| **MinIO Web 控制台** | `http://localhost:9001` | MinIO 对象存储可视化管理面板 |
+| **MinIO S3 API** | `http://localhost:9005` | S3 协议数据读写端口 |
+| **Langfuse 控制台** | `http://localhost:3000` | 大模型 Observability 与 Tracing |
 
-1. 在「批量提问」tab 选择问题来源（已生成题目 / 手动输入 / 文件加载 / 历史题集）
-2. 创建或选择 RAG 配置方案（记录知识库版本、工作流版本等描述性参数）
-3. 配置 Dify 连接配置（可命名保存、选择已有配置或临时手动填写，API Key 安全存储）
-4. 点击「开始提问」
-5. 成功结果自动推送到 `data/raw/`，同时创建运行记录（run_id + config_snapshot）
+---
 
-### 4. 样本准备
+## 🧪 自动化测试验证
 
-1. 在「样本准备」tab 选择 raw 文件（或上传 Langfuse JSONL / 从 API 拉取）
-2. 点击「开始解析」
-3. 解析结果保存到 `data/processed/langfuse_samples.jsonl`
-4. 自动从题目库回填 reference_answer，从 user_id 回填 run_id 等元数据
-5. 解析后显示回填统计
-
-### 5. Judge 评测
-
-1. 在「Judge 评测」tab 配置 API（Key、Base URL、Model）
-2. 选择评测范围和模式（跳过已有结果 / 强制重评）
-3. 可点击「预览优化策略」查看实际 LLM 调用次数
-4. 点击「运行 Judge 评测」
-5. 查看指标、可视化图表、评测详情（按评测轨道分组展示）
-
-### 6. 运行看板
-
-1. 在「运行看板」tab 选择配置方案
-2. 查看配置方案总览（累计 Judge 指标，按样本数加权汇总）
-3. 展开单次运行查看该 run 的图表和逐题明细
-4. 可编辑配置方案的描述性字段，或修正某次运行的配置快照
-5. 查看运行历史趋势图
-
-### 7. CLI 模式（仅解析）
+项目内置了完整的单元测试套件，执行命令：
 
 ```bash
-python main.py <input.jsonl> [--output PATH] [--summary PATH]
+pytest
 ```
-
-## 历史数据兼容
-
-- 旧格式 Judge 结果（无 run_id）：运行看板通过 processed trace_id fallback 正确关联
-- 旧格式配置（无新字段）：显示"未记录"，可随时补充
-- 旧格式 processed 样本（无 question_set_id）：从 user_id 解析 run_id 后从 manifest 回填
-- 数据迁移工具：在运行看板的「数据迁移工具」折叠区可执行批量回填
-
-## 常见问题
-
-### Raw / Judge 显示为 0
-
-1. 确认 batch 文件已推送到 `data/raw/`
-2. 确认样本准备已解析 raw 文件（`data/processed/langfuse_samples.jsonl` 存在且非空）
-3. 确认 Judge 使用的 trace_id 与 processed sample 的 trace_id 一致（不是 batch_qa_*）
-4. 运行看板通过 `run_id → processed trace_id → judged trace_id` 链路关联，确认链路完整
-
-### 配置方案字段不一致
-
-批量提问、运行看板编辑、运行快照修正使用同一套字段 schema（定义在 `experiment.py` 的 `CONFIG_FIELD_SCHEMA`）。
-编辑配置方案不影响历史运行的 config_snapshot；修正运行快照不影响配置方案。
-
-## 测试
-
-测试文件位于 `tests/` 目录，通过 `pytest.ini` 配置自动发现。
-
-```bash
-# 运行全部测试
-python -m pytest
-
-# 运行单个测试文件
-python -m pytest tests/test_experiment.py
-
-# 运行并显示详细输出
-python -m pytest -v
-```
-
-## 输出格式
-
-### 样本 JSONL（`data/processed/langfuse_samples.jsonl`）
-
-```json
-{
-  "trace_id": "真实 Langfuse UUID",
-  "question": "P2P借贷是什么？",
-  "retrieval_query": "P2P借贷",
-  "retrieval_results": [
-    {
-      "position": 1,
-      "score": 0.95,
-      "document_name": "P2P借贷简介.md",
-      "content": "..."
-    }
-  ],
-  "final_answer": "P2P借贷是指...",
-  "reference_answer": "P2P借贷是点对点借贷...",
-  "source_excerpt": "P2P借贷（Peer-to-Peer Lending）...",
-  "question_mode": "retrieval",
-  "question_set_id": "qs_20260713_164111_...",
-  "run_id": "run_20260713_170321_...",
-  "config_id": "cfg_20260713_170321_..."
-}
-```
-
-### 评测结果 JSONL（`data/judged/eval_results.jsonl`）
-
-```json
-{
-  "trace_id": "真实 Langfuse UUID",
-  "question": "P2P借贷是什么？",
-  "evaluation_track": "retrieval",
-  "has_reference": true,
-  "retrieval_top1_hit": 1,
-  "retrieval_top3_hit": 1,
-  "retrieval_top5_hit": 1,
-  "answer_correct": 1,
-  "reason": "Top1 检索结果包含相关内容，回答与参考答案一致",
-  "run_id": "run_20260713_170321_..."
-}
-```
+- 覆盖存储、解析、出题、提问、打分与看板模块，确保重构与更新无代码回归。

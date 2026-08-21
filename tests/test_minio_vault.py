@@ -61,6 +61,24 @@ class TestMinIOVault(unittest.TestCase):
         self.assertEqual(data, b"contract binary data")
         mock_resp.close.assert_called_once()
 
+    def test_save_and_get_cleaned_text(self):
+        from minio_vault import save_cleaned_text, get_cleaned_text
+        self.mock_client.bucket_exists.return_value = True
+        mock_put_res = MagicMock()
+        mock_put_res.version_id = "clean-v1"
+        self.mock_client.put_object.return_value = mock_put_res
+
+        res = save_cleaned_text("Appendix A.docx", "这是清洗后的纯净文本", client=self.mock_client)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["object_name"], "Appendix A.docx.cleaned.txt")
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = "这是清洗后的纯净文本".encode("utf-8")
+        self.mock_client.get_object.return_value = mock_resp
+
+        cleaned = get_cleaned_text("Appendix A.docx", client=self.mock_client)
+        self.assertEqual(cleaned, "这是清洗后的纯净文本")
+
 
 if __name__ == "__main__":
     unittest.main()
