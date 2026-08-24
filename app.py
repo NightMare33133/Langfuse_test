@@ -34,6 +34,13 @@ from batch_query import run_batch_query, push_to_raw_dir, export_csv_bytes as ba
 
 load_dotenv(Path(__file__).parent / ".env")
 
+# 启动时自动激活 MinIO Vault 通信服务（为 Dify 提供 API 专线）
+try:
+    from storage.vault_server import start_vault_server_background
+    start_vault_server_background()
+except Exception as _e:
+    print(f"[VaultServer Startup Error]: {_e}")
+
 RAW_DIR = Path(__file__).parent / "data" / "raw"
 PROCESSED_DIR = Path(__file__).parent / "data" / "processed"
 JUDGED_DIR = Path(__file__).parent / "data" / "judged"
