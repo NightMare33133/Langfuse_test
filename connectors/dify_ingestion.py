@@ -480,6 +480,7 @@ def run_auto_ingestion_workflow(
     file_ids: list[str],
     contract_package: str,
     dataset_id: str = None,
+    bucket: str = "contracts-vault",
     user: str = WORKFLOW_USER,
     timeout: int = 300,
 ) -> dict:
@@ -491,6 +492,7 @@ def run_auto_ingestion_workflow(
         file_ids: 已上传到 Dify (/files/upload) 的文件 ID 列表
         contract_package: 合同包名称（baseline_2_4 或 tech_platform_2_5）
         dataset_id: 目标知识库 ID（全流程 Workflow Start 节点必填变量）
+        bucket: 目标 MinIO 存储桶名称（默认为 contracts-vault）
         user: 终端用户标识
         timeout: 超时秒数（默认 300s，因为包含完整入库流水线）
 
@@ -520,6 +522,7 @@ def run_auto_ingestion_workflow(
         "contract_package": contract_package,
         "files": files,
         "dataset_id": str(dataset_id).strip(),
+        "bucket": str(bucket).strip() if bucket else "contracts-vault",
     }
 
     body = {

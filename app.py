@@ -9803,7 +9803,7 @@ def render_ingestion():
     st.markdown("#### 4. 上传合同文件")
     st.info("📌 **批量约束**：一次批量上传的文件必须属于同一个合同包，请勿混合上传不同合同包的文件。")
 
-    pkg_col1, pkg_col2 = st.columns(2)
+    pkg_col1, pkg_col2, pkg_col3 = st.columns([1.2, 1.2, 2])
     with pkg_col1:
         contract_package = st.selectbox(
             "合同包",
@@ -9815,6 +9815,13 @@ def render_ingestion():
             key="ingestion_pkg",
         )
     with pkg_col2:
+        minio_bucket = st.text_input(
+            "MinIO 存储桶 (Bucket)",
+            value="contracts-vault",
+            key="ingestion_bucket",
+            help="指定文件归档与绑定的目标 MinIO 存储桶名称",
+        )
+    with pkg_col3:
         uploaded_files = st.file_uploader(
             "选择合同文件（支持批量）",
             type=None,
@@ -9956,7 +9963,7 @@ def render_ingestion():
                             # 1.1 自动归档至 MinIO 合同资产库
                             try:
                                 from minio_vault import upload_file_to_vault
-                                v_res = upload_file_to_vault(f.name, file_bytes)
+                                v_res = upload_file_to_vault(f.name, file_bytes, bucket_name=minio_bucket)
                                 if v_res.get("success"):
                                     minio_vault_records[f.name] = v_res
                             except Exception:
@@ -10000,6 +10007,7 @@ def render_ingestion():
                             [fid["id"] for fid in file_ids],
                             contract_package,
                             dataset_id=ds_dataset_id,
+                            bucket=minio_bucket,
                         )
 
                         # 3. 校验与规范化结果

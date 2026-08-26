@@ -316,6 +316,14 @@ async def fetch_cleaned_text(
     if not target_name:
         raise HTTPException(status_code=400, detail="缺少 file_name 参数，请指定要拉取的基线合同文件名")
 
+    # 智能解析可能的全局前缀: "s3://bucket/file" 或 "bucket/file"
+    clean_target = target_name.replace("s3://", "").replace("minio://", "").strip()
+    if "/" in clean_target:
+        parsed_bucket, parsed_file = clean_target.split("/", 1)
+        if parsed_bucket and parsed_file:
+            bucket = parsed_bucket
+            target_name = parsed_file
+
     # 去除可能自带的 .cleaned.txt 后缀以保持一致性
     base_name = target_name.replace(".cleaned.txt", "")
 
@@ -373,6 +381,17 @@ async def fetch_cleaned_text(
             detail=f"在 MinIO 存储桶 [{bucket}] 中未找到基线文本 [{target_name}.cleaned.txt]"
         )
 
+    # 同步生成该基线原件（.docx）的 15 分钟临时预签名下载链接
+    presigned_url = ""
+    try:
+        presigned_url = get_presigned_download_url(
+            object_name=base_name,
+            bucket_name=bucket,
+            expires_hours=0.25, # 15分钟
+        )
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "file_name": base_name,
@@ -380,6 +399,7 @@ async def fetch_cleaned_text(
         "cleaned_text": text,
         "length": len(text),
         "minio_bucket": bucket,
+        "presigned_url": presigned_url,
     }
 
 
@@ -392,24 +412,58 @@ def list_documents(bucket: str = DEFAULT_CONTRACTS_BUCKET):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/api/vault/presigned_url")
-def get_file_presigned_url(
-    file_name: str,
+@app.api_route("/api/vault/presigned_url", methods=["GET", "POST"])
+async def get_file_presigned_url(
+    request: Request,
+    file_name: Optional[str] = None,
     bucket: str = DEFAULT_CONTRACTS_BUCKET,
     expires_minutes: int = 15,
 ):
-    """生成带有时效性（默认15分钟）的安全预签名临时下载链接。"""
+    """生成带有时效性（默认15分钟、严格GET只读权限）的安全预签名临时下载链接。"""
+    target_file = file_name or ""
+    target_bucket = bucket
+    exp_mins = expires_minutes
+
+    if request.method == "POST":
+        try:
+            content_type = request.headers.get("content-type", "")
+            if "json" in content_type:
+                body = await request.json()
+                target_file = body.get("file_name", target_file)
+                target_bucket = body.get("bucket", target_bucket)
+                exp_mins = int(body.get("expires_minutes", exp_mins))
+            elif "form" in content_type:
+                form = await request.form()
+                target_file = str(form.get("file_name") or target_file)
+                target_bucket = str(form.get("bucket") or target_bucket)
+                if form.get("expires_minutes"):
+                    exp_mins = int(form.get("expires_minutes"))
+        except Exception:
+            pass
+
+    if not target_file:
+        raise HTTPException(status_code=400, detail="缺少 file_name 参数")
+
+    # 智能解析可能的全局前缀: "s3://bucket/file" 或 "bucket/file"
+    clean_target = target_file.replace("s3://", "").replace("minio://", "").strip()
+    if "/" in clean_target:
+        parsed_b, parsed_k = clean_target.split("/", 1)
+        if parsed_b and parsed_k:
+            target_bucket = parsed_b
+            target_file = parsed_k
+
     try:
         url = get_presigned_download_url(
-            object_name=file_name,
-            bucket_name=bucket,
-            expires_hours=max(expires_minutes / 60.0, 0.1),
+            object_name=target_file,
+            bucket_name=target_bucket,
+            expires_hours=max(exp_mins / 60.0, 0.1),
         )
         return {
             "status": "success",
-            "file_name": file_name,
-            "bucket": bucket,
-            "expires_in_minutes": expires_minutes,
+            "file_name": target_file,
+            "bucket": target_bucket,
+            "permission": "READ_ONLY",
+            "expires_in_minutes": exp_mins,
             "presigned_url": url,
         }
     except Exception as exc:
