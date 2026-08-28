@@ -34,3 +34,11 @@ data/dify_connections/.credentials
 
 # Local Langfuse project cache: raw traces, observations, snapshots, provenance
 data/langfuse_projects/
+
+# Logs
+*.log
+storage/*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db

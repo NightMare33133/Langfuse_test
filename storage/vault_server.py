@@ -6,23 +6,31 @@
 
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Optional
+
+# 确保项目根目录位于 sys.path 首位，兼容所有子模块导入
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import uvicorn
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    from .minio_vault import (
+    from storage.minio_vault import (
         DEFAULT_CONTRACTS_BUCKET,
         get_cleaned_text,
+        get_minio_client,
         get_presigned_download_url,
         list_vault_documents,
         save_cleaned_text,
         save_sidecar_metadata,
         upload_file_to_vault,
     )
-    from .snapshot import (
+    from storage.snapshot import (
         create_consistency_snapshot,
         list_consistency_snapshots,
     )
@@ -30,6 +38,7 @@ except ImportError:
     from minio_vault import (
         DEFAULT_CONTRACTS_BUCKET,
         get_cleaned_text,
+        get_minio_client,
         get_presigned_download_url,
         list_vault_documents,
         save_cleaned_text,
@@ -165,20 +174,31 @@ async def archive_contract(
 @app.post("/api/vault/archive_chunks")
 async def archive_chunks(payload: dict[str, Any] = Body(...)):
     """接收 Dify 知识库分块切片或自动拉取切片并归档至 MinIO 伴生文件。"""
-    file_name = payload.get("file_name", "")
+    raw_file_name = payload.get("file_name", "")
     dataset_id = payload.get("dataset_id", "")
     document_id = payload.get("document_id", "")
     bucket = payload.get("bucket", DEFAULT_CONTRACTS_BUCKET)
     raw_chunks = payload.get("chunks", [])
 
-    if not file_name:
+    if not raw_file_name:
         raise HTTPException(status_code=400, detail="缺少 file_name 参数")
+
+    # 智能解析全局路径: "contracts-vault/Appendix A.docx"
+    clean_name = raw_file_name.replace("s3://", "").replace("minio://", "").strip()
+    if "/" in clean_name:
+        parsed_b, parsed_k = clean_name.split("/", 1)
+        if parsed_b and parsed_k:
+            bucket = parsed_b
+            file_name = parsed_k
+        else:
+            file_name = clean_name
+    else:
+        file_name = clean_name
 
     try:
         # 如果未直接传入 chunks，尝试从 Dify 知识库 API 拉取
         if not raw_chunks and dataset_id and document_id:
             try:
-                import os
                 from connectors.dify_kb_connection import list_kb_profiles, load_kb_profile, get_kb_api_key
                 profiles = list_kb_profiles()
                 api_key = ""
@@ -214,7 +234,6 @@ async def archive_chunks(payload: dict[str, Any] = Body(...)):
 
         # 写入 MinIO 伴生切片文件: {file_name}.chunks.json
         import io
-        from storage.minio_vault import get_minio_client
         cli = get_minio_client()
         chunks_bytes = json.dumps(chunks_data, ensure_ascii=False, indent=2).encode("utf-8")
         sidecar_name = f"{file_name}.chunks.json"
@@ -300,14 +319,23 @@ async def fetch_cleaned_text(
             content_type = request.headers.get("content-type", "")
             if "form" in content_type:
                 form = await request.form()
-                target_name = str(form.get("file_name") or "")
+                target_name = str(form.get("file_path") or form.get("file_name") or "")
                 bucket = str(form.get("bucket") or bucket)
                 version_id = str(form.get("version_id") or version_id) if form.get("version_id") else None
             else:
                 body_bytes = await request.body()
                 if body_bytes:
-                    payload = json.loads(body_bytes.decode("utf-8", errors="ignore"), strict=False)
-                    target_name = payload.get("file_name", "")
+                    raw_str = body_bytes.decode("utf-8", errors="ignore").replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+                    try:
+                        payload = json.loads(raw_str, strict=False)
+                    except Exception:
+                        # 正则兜底提取 file_path 或 file_name
+                        payload = {}
+                        import re
+                        m = re.search(r'["\']?(?:file_path|file_name)["\']?\s*:\s*["\']?([^"\'}\n\r]+)', raw_str)
+                        if m:
+                            payload["file_path"] = m.group(1).strip()
+                    target_name = payload.get("file_path") or payload.get("file_name", "")
                     bucket = payload.get("bucket", bucket)
                     version_id = payload.get("version_id", version_id)
         except Exception:
@@ -429,12 +457,12 @@ async def get_file_presigned_url(
             content_type = request.headers.get("content-type", "")
             if "json" in content_type:
                 body = await request.json()
-                target_file = body.get("file_name", target_file)
+                target_file = body.get("file_path") or body.get("file_name", target_file)
                 target_bucket = body.get("bucket", target_bucket)
                 exp_mins = int(body.get("expires_minutes", exp_mins))
             elif "form" in content_type:
                 form = await request.form()
-                target_file = str(form.get("file_name") or target_file)
+                target_file = str(form.get("file_path") or form.get("file_name") or target_file)
                 target_bucket = str(form.get("bucket") or target_bucket)
                 if form.get("expires_minutes"):
                     exp_mins = int(form.get("expires_minutes"))
@@ -442,7 +470,7 @@ async def get_file_presigned_url(
             pass
 
     if not target_file:
-        raise HTTPException(status_code=400, detail="缺少 file_name 参数")
+        raise HTTPException(status_code=400, detail="缺少 file_path 或 file_name 参数")
 
     # 智能解析可能的全局前缀: "s3://bucket/file" 或 "bucket/file"
     clean_target = target_file.replace("s3://", "").replace("minio://", "").strip()
