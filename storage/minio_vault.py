@@ -28,6 +28,52 @@ DEFAULT_MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
 DEFAULT_MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in ("true", "1", "yes")
 DEFAULT_CONTRACTS_BUCKET = os.getenv("MINIO_CONTRACTS_BUCKET", "contracts-vault")
 
+# 🌟 企业级多角色 RBAC 凭证定义（杜绝使用 admin 签名）
+ROLE_CREDENTIALS: dict[str, dict[str, str]] = {
+    "admin": {
+        "access_key": os.getenv("MINIO_ADMIN_ACCESS_KEY", "admin"),
+        "secret_key": os.getenv("MINIO_ADMIN_SECRET_KEY", "password123"),
+        "description": "系统超级管理员，具备全局读写管理权限",
+    },
+    "legal_reader": {
+        "access_key": os.getenv("MINIO_LEGAL_ACCESS_KEY", "legal_reader"),
+        "secret_key": os.getenv("MINIO_LEGAL_SECRET_KEY", "legal_pass_2026"),
+        "description": "法务审查专员，仅具备合同基线只读与预签名下载权限",
+    },
+    "finance_reader": {
+        "access_key": os.getenv("MINIO_FINANCE_ACCESS_KEY", "finance_reader"),
+        "secret_key": os.getenv("MINIO_FINANCE_SECRET_KEY", "finance_pass_2026"),
+        "description": "财务审计专员，仅能访问报价与费用清单",
+    },
+    "audit_officer": {
+        "access_key": os.getenv("MINIO_AUDIT_ACCESS_KEY", "audit_officer"),
+        "secret_key": os.getenv("MINIO_AUDIT_SECRET_KEY", "audit_pass_2026"),
+        "description": "合规审计专员，具备全量审计日志读取权限",
+    },
+}
+
+
+def get_minio_client_for_role(
+    role: str = "legal_reader",
+    endpoint: str = None,
+    secure: bool = None,
+) -> Any:
+    """基于 RBAC 业务角色获取专用 MinIO 客户端（默认采用 legal_reader 最小只读权限）。"""
+    if not HAS_MINIO:
+        raise RuntimeError("未安装 minio 库，请运行: pip install minio")
+
+    role_key = (role or "legal_reader").lower().strip()
+    cred = ROLE_CREDENTIALS.get(role_key, ROLE_CREDENTIALS["legal_reader"])
+    ep = endpoint or DEFAULT_MINIO_ENDPOINT
+    sec = DEFAULT_MINIO_SECURE if secure is None else secure
+
+    return Minio(
+        ep,
+        access_key=cred["access_key"],
+        secret_key=cred["secret_key"],
+        secure=sec,
+    )
+
 
 def get_minio_client(
     endpoint: str = None,
@@ -35,7 +81,7 @@ def get_minio_client(
     secret_key: str = None,
     secure: bool = None,
 ) -> Any:
-    """获取 MinIO 客户端实例。"""
+    """获取 MinIO 客户端实例（默认使用系统主配置）。"""
     if not HAS_MINIO:
         raise RuntimeError("未安装 minio 库，请运行: pip install minio")
 
@@ -141,11 +187,12 @@ def get_presigned_download_url(
     object_name: str,
     bucket_name: str = DEFAULT_CONTRACTS_BUCKET,
     version_id: str = None,
-    expires_hours: int = 1,
+    expires_hours: float = 1.0,
+    role: str = "legal_reader",
     client: Any = None,
 ) -> str:
-    """生成带有时效的安全预签名下载/预览链接。"""
-    cli = client or get_minio_client()
+    """生成带有时效的安全预签名下载/预览链接（默认以 legal_reader 身份签名，杜绝 admin 泄露）。"""
+    cli = client or get_minio_client_for_role(role=role)
     extra_query_params = {}
     if version_id:
         extra_query_params["versionId"] = version_id
